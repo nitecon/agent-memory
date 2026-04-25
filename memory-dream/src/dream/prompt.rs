@@ -39,12 +39,15 @@ no markdown fences, no commentary:
 
 1. The single word:  skip
    Use when the memory is already concise, useful, and correctly scoped.
-   No changes needed.
+   No changes needed. If it already explains HOW to act or WHY a
+   constraint matters, keep it as-is unless it is truly too verbose.
 
 2. The single word:  forget
-   Use when the memory is noise with no lasting insight — pure status
-   updates (CI events, release notifications, webhook deliveries with
-   no re-usable instruction), or content that has become irrelevant.
+   Use when the memory is noise with no lasting insight: pure state
+   observable from git history, repository files, CI/release systems,
+   task/comms surfaces, or gateway pattern records. Examples: CI events,
+   release notifications, webhook deliveries, commit/tag/deploy status,
+   or "created/updated pattern X" notes with no re-usable instruction.
 
 3. A rewritten condensed memory in plain text with bullets.
    Use when the memory has value but is bloated, verbose, or lacks
@@ -70,6 +73,13 @@ RULES
 - Preserve every path, number, date, proper noun, and exact quote
   verbatim when you rewrite.
 - Do not invent details not present in the input.
+- Keep memories that encode reusable guidance, a preference, an
+  operational procedure, a non-obvious constraint, a failure cause, or
+  a pointer to canonical guidance plus why to use it.
+- Forget memories that merely record state an agent can recover from
+  current systems: git, repository inspection, CI, releases, task/comms,
+  or `agent-tools patterns`. A gateway-pattern locator is useful only
+  when it tells future agents which canonical pattern to consult and why.
 - If you are uncertain whether the memory is worth keeping, default
   to `skip`. "When in doubt, keep" applies ONLY to the forget decision.
   Do NOT default to `skip` when the memory is clearly bloated and
@@ -261,6 +271,36 @@ mod tests {
         assert!(
             p.contains("Aim to be\n   shorter"),
             "rewrite must still prefer shorter output"
+        );
+    }
+
+    #[test]
+    fn prompt_carries_memory_quality_gate() {
+        let p = build_condense_prompt(&inputs_for("x"));
+        assert!(
+            p.contains("pure state\n   observable from git history"),
+            "forget branch must target observable state"
+        );
+        assert!(
+            p.contains("reusable guidance"),
+            "prompt must preserve durable guidance"
+        );
+        assert!(
+            p.contains("agent-tools patterns"),
+            "prompt must distinguish gateway pattern locators from audit notes"
+        );
+    }
+
+    #[test]
+    fn prompt_says_keep_existing_how_why_memories() {
+        let p = build_condense_prompt(&inputs_for("x"));
+        assert!(
+            p.contains("explains HOW to act or WHY a\n   constraint matters"),
+            "prompt must skip useful how/why memories"
+        );
+        assert!(
+            p.contains("unless it is truly too verbose"),
+            "prompt must not rewrite good memories just for style"
         );
     }
 

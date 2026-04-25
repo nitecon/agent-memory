@@ -213,6 +213,8 @@ Avoid:
 
 If a user refers to "patterns", they likely mean gateway-backed `agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful memory says to inspect the current CLI with `agent-tools patterns --help`, then use `agent-tools patterns get/update/check` as appropriate. Do not save a memory that only says a pattern was updated; save the reusable workflow and the reason it matters.
 
+Short locator memories for canonical gateway patterns are allowed when they help a cold agent quickly find and reuse non-obvious guidance. For example, a memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an `agent-tools patterns` record and should be looked up before designing a new pipeline. Keep the memory to the locator, reuse instruction, and why the pattern matters; do not record "created/updated pattern X" as an audit event.
+
 ### Rule A -- Pre-action behavior recall (MANDATORY)
 
 Before starting any user-requested task, run one `memory context "<task>"` call first. A single call returns both global directives (1.25× boost) and project-specific directives (1.5× boost). Do not skip for "quick" tasks: directives the user has already stated must never need to be re-stated. If the `hint` field flags zero global-scope matches, pause and reflect — or ask before acting.

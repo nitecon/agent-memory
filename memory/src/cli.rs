@@ -466,6 +466,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 attrs.push(("project", p.to_string()));
             }
             println!("{}", render::render_action_result("stored", &attrs));
+            println!("{}", render::render_hint(store_quality_hint()));
             // Reflection hint: nudge the agent to reconsider scope only when
             // the memory type is most likely to be cross-cutting (user or
             // feedback) AND the user didn't pick a scope deliberately. No
@@ -1028,6 +1029,10 @@ fn store_scope_hint() -> String {
     "Stored as project-scoped. If this preference applies across all projects, re-run with `--scope global` — a silent mis-classification means future sessions in other projects won't see it.".to_string()
 }
 
+fn store_quality_hint() -> &'static str {
+    "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, or failure cause. If it only records state visible in git, repo files, CI, releases, tasks, comms, or gateway patterns, forget or rewrite it."
+}
+
 /// Treat empty strings as "no project" for the move/copy `--from`/`--to` flags.
 /// Lets users explicitly target or assign a NULL project without a second flag.
 fn empty_to_none(s: &str) -> Option<&str> {
@@ -1370,6 +1375,15 @@ mod tests {
         let h = store_scope_hint();
         assert!(h.contains("--scope global"));
         assert!(h.contains("silent mis-classification"));
+    }
+
+    #[test]
+    fn store_quality_hint_reminds_agents_to_validate_content() {
+        let h = store_quality_hint();
+        assert!(h.contains("quality gate"));
+        assert!(h.contains("reusable guidance"));
+        assert!(h.contains("visible in git"));
+        assert!(h.contains("gateway patterns"));
     }
 
     #[test]

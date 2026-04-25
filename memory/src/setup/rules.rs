@@ -188,6 +188,13 @@ use `agent-tools patterns get/update/check` as appropriate. Do not save a
 memory that only says a pattern was updated; save the reusable workflow and the
 reason it matters.
 
+Short locator memories for canonical gateway patterns are allowed when they
+help a cold agent quickly find and reuse non-obvious guidance. For example, a
+memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an
+`agent-tools patterns` record and should be looked up before designing a new
+pipeline. Keep the memory to the locator, reuse instruction, and why the pattern
+matters; do not record "created/updated pattern X" as an audit event.
+
 ### Retrieval strategy
 
 1. **Pre-Task**: run `memory context "<task>"` before reading code. If a similar
@@ -1030,6 +1037,14 @@ mod tests {
         assert!(
             b.contains("agent-tools patterns --help"),
             "block must include the agent-tools patterns workflow example"
+        );
+        assert!(
+            b.contains("Short locator memories for canonical gateway patterns are allowed"),
+            "block must allow gateway pattern locator memories"
+        );
+        assert!(
+            b.contains("do not record \"created/updated pattern X\" as an audit event"),
+            "block must distinguish locator memories from pattern audit events"
         );
     }
 

@@ -18,6 +18,7 @@ Your job:
    - Do not store routine deployment status, version numbers, release events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed version X" memories.
    - Store deployment/version facts only when they explain a failure mode or encode a reusable procedure that prevents future mistakes.
    - Do not store "updated pattern X" notes. If a user refers to "patterns", they likely mean gateway-backed `agent-tools patterns`; useful memories should describe the `agent-tools patterns --help` / get / update / check workflow and why it matters.
+   - Short locator memories for canonical gateway patterns are allowed when they help a cold agent quickly find and reuse non-obvious guidance. Keep them to the locator, reuse instruction, and why the pattern matters; do not record "created/updated pattern X" as an audit event.
 3. Choose the appropriate memory_type:
    - "user" — facts about the user (role, preferences, expertise)
    - "feedback" — guidance on how to approach work (corrections, confirmations)

@@ -28,6 +28,7 @@ const GLOBAL_BOOST: f32 = 1.25;
 /// cross-imported so the MCP surface stays independent of the CLI module's
 /// public API shape.
 const GLOBAL_PROJECT_IDENT: &str = "__global__";
+const STORE_QUALITY_HINT: &str = "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, or failure cause. If it only records state visible in git, repo files, CI, releases, tasks, comms, or gateway patterns, forget or rewrite it.";
 
 #[derive(Clone)]
 pub struct MemoryServer {
@@ -170,7 +171,7 @@ impl MemoryServer {
     /// Store a memory with auto-embedding and BM25 indexing. Use this to save important context,
     /// user preferences, project decisions, feedback, or reference information for future retrieval.
     /// The project tag is auto-derived from the server's working directory unless overridden.
-    /// Returns a <result status="stored" .../> light-XML line.
+    /// Returns a <result status="stored" .../> light-XML line plus a quality-gate hint.
     #[tool(name = "memory_store")]
     fn store(&self, Parameters(args): Parameters<StoreArgs>) -> String {
         let tag_list = args
@@ -226,7 +227,11 @@ impl MemoryServer {
         if let Some(p) = memory.project.as_deref() {
             attrs.push(("project", p.to_string()));
         }
-        render::render_action_result("stored", &attrs)
+        format!(
+            "{}\n{}",
+            render::render_action_result("stored", &attrs),
+            render::render_hint(STORE_QUALITY_HINT)
+        )
     }
 
     /// Hybrid BM25 + vector search across all memories. Combines keyword matching with semantic
