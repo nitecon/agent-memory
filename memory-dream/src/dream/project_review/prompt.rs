@@ -113,12 +113,19 @@ const RULES: &str = r#"RULES
    non-obvious constraints, failure causes, or short pointers to
    canonical guidance plus why to use it. Drop memories that merely
    record state recoverable from git, repository inspection, CI,
-   releases, task/comms surfaces, or gateway pattern records. A
-   gateway-pattern locator can stay when it tells agents which canonical
-   `agent-tools patterns` record to consult and why; "created/updated
-   pattern X" audit notes should drop.
+   releases, task/comms surfaces, repo notes/Markdown, or gateway
+   pattern records. A locator can stay when it tells agents which
+   canonical project note, doc, or `agent-tools patterns` record to
+   consult and why; copied note content and "created/updated pattern X"
+   audit notes should drop.
 
-3. HOW/WHY MEMORIES. If a memory already explains how to act or why a
+3. UPDATE-BEFORE-CREATE RULE. Prefer one stronger existing memory over a
+   new overlapping memory. Merge duplicates when they cover the same
+   workflow, subsystem, failure mode, user preference, or reusable
+   pattern. Create/extract only distinct reusable knowledge that should
+   be retrieved independently.
+
+4. HOW/WHY MEMORIES. If a memory already explains how to act or why a
    constraint matters, keep it as-is unless it is truly too verbose,
    duplicated, or needs a self-contained headline. Do not rewrite just
    for style.
@@ -247,7 +254,17 @@ mod tests {
         assert!(p.contains("reusable guidance"));
         assert!(p.contains("state recoverable from git"));
         assert!(p.contains("agent-tools patterns"));
-        assert!(p.contains("created/updated\n   pattern X"));
+        assert!(p.contains("repo notes/Markdown"));
+        assert!(p.contains("canonical project note"));
+        assert!(p.contains("created/updated pattern X"));
+    }
+
+    #[test]
+    fn prompt_prefers_updating_existing_memories() {
+        let p = build_project_review_prompt(Some("proj"), &[mk("aaa", "x")]);
+        assert!(p.contains("UPDATE-BEFORE-CREATE RULE"));
+        assert!(p.contains("Prefer one stronger existing memory"));
+        assert!(p.contains("Merge duplicates"));
     }
 
     #[test]

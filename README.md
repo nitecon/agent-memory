@@ -196,6 +196,10 @@ memory prune --max-age-days 90 [--dry-run]
 
 Store memories only when they will help a future agent work faster. A good memory captures reusable patterns, operational procedures, user preferences, non-obvious constraints, failure causes, or "how to / why" guidance. Write for a cold agent who has not seen this session: the memory should tell them what to do next, which tool or system to use, and why that path is correct.
 
+Prefer updating an existing memory over creating a new one. Before storing, search/recall for related memories in the same project and in global scope. If the new learning refines the same workflow, subsystem, failure mode, user preference, or reusable pattern, update or rewrite the existing memory instead of adding another row. New memories are for distinct reusable knowledge that a future agent should retrieve independently.
+
+Use project files for project state and notes. Git history already records timeline-specific implementation details, and repo Markdown/TODO/ADR files are the right place for evolving design notes, status, and open questions. Memory should primarily increase knowledge about **how and why** work is done, or point to the canonical project note that contains live details. For example, a useful memory may say "filesystem replication design notes live at `TODO/foo.md`; consult that file before changing replication behavior because it captures the current constraints and open decisions." Do not copy the full note into memory.
+
 Do **not** store facts that can be recovered from git history, repository inspection, CI/release systems, or the agent-tools task/comms surfaces. In particular, do not store routine deployment status, version numbers, release events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed version X" memories.
 
 Exception: store deployment/version facts only when they explain a failure mode or encode a reusable procedure that prevents future mistakes.
@@ -214,6 +218,8 @@ Avoid:
 If a user refers to "patterns", they likely mean gateway-backed `agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful memory says to inspect the current CLI with `agent-tools patterns --help`, then use `agent-tools patterns get/update/check` as appropriate. Do not save a memory that only says a pattern was updated; save the reusable workflow and the reason it matters.
 
 Short locator memories for canonical gateway patterns are allowed when they help a cold agent quickly find and reuse non-obvious guidance. For example, a memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an `agent-tools patterns` record and should be looked up before designing a new pipeline. Keep the memory to the locator, reuse instruction, and why the pattern matters; do not record "created/updated pattern X" as an audit event.
+
+When you notice duplicated, stale, or nonsensical memories in the current project, naturally consolidate them as part of the work: merge clear duplicates, rewrite bloated memories into one stronger entry, or forget entries that fail this quality gate. Keep cleanup local and conservative — do not launch broad memory-cleanup sweeps unless the user asks.
 
 ### Rule A -- Pre-action behavior recall (MANDATORY)
 

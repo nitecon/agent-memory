@@ -161,6 +161,22 @@ non-obvious constraints, failure causes, or "how to / why" guidance. Write for
 a cold agent who has not seen this session: the memory should tell them what to
 do next, which tool or system to use, and why that path is correct.
 
+Prefer updating an existing memory over creating a new one. Before storing,
+search/recall for related memories in the same project and in global scope. If
+the new learning refines the same workflow, subsystem, failure mode, user
+preference, or reusable pattern, update or rewrite the existing memory instead
+of adding another row. New memories are for distinct reusable knowledge that a
+future agent should retrieve independently.
+
+Use project files for project state and notes. Git history already records
+timeline-specific implementation details, and repo Markdown/TODO/ADR files are
+the right place for evolving design notes, status, and open questions. Memory
+should primarily increase knowledge about **how and why** work is done, or point
+to the canonical project note that contains live details. For example, a useful
+memory may say "filesystem replication design notes live at `TODO/foo.md`;
+consult that file before changing replication behavior because it captures the
+current constraints and open decisions." Do not copy the full note into memory.
+
 Do **not** store facts that can be recovered from git history, repository
 inspection, CI/release systems, or the agent-tools task/comms surfaces. In
 particular, do not store routine deployment status, version numbers, release
@@ -195,6 +211,12 @@ memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an
 pipeline. Keep the memory to the locator, reuse instruction, and why the pattern
 matters; do not record "created/updated pattern X" as an audit event.
 
+When you notice duplicated, stale, or nonsensical memories in the current
+project, naturally consolidate them as part of the work: merge clear duplicates,
+rewrite bloated memories into one stronger entry, or forget entries that fail
+this quality gate. Keep cleanup local and conservative — do not launch broad
+memory-cleanup sweeps unless the user asks.
+
 ### Retrieval strategy
 
 1. **Pre-Task**: run `memory context "<task>"` before reading code. If a similar
@@ -206,9 +228,11 @@ matters; do not record "created/updated pattern X" as an audit event.
 4. **Global-scope hits**: the `hint` field also surfaces the count of
    global-scope preferences in your top-K. Treat them as directives, not
    suggestions — they encode rules the user has already stated once.
-5. **Post-Task**: run `memory store` for any non-obvious decisions, user
-   preferences, reusable patterns, or failure causes that pass the quality
-   gate. Audit-ready descriptions — explain the "why," not just the "what."
+5. **Post-Task**: update an existing memory when the learning belongs with an
+   existing rule/workflow/pattern; otherwise run `memory store` for any
+   non-obvious decisions, user preferences, reusable patterns, or failure causes
+   that pass the quality gate. Audit-ready descriptions — explain the "why,"
+   not just the "what."
 
 ### Rule A — Pre-action behavior recall (MANDATORY)
 

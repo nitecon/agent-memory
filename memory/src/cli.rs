@@ -1030,7 +1030,7 @@ fn store_scope_hint() -> String {
 }
 
 fn store_quality_hint() -> &'static str {
-    "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, or failure cause. If it only records state visible in git, repo files, CI, releases, tasks, comms, or gateway patterns, forget or rewrite it."
+    "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, failure cause, or a pointer to canonical notes/docs plus why they matter. Prefer updating an existing related memory over creating a new one; if this only records state visible in git, repo files, CI, releases, tasks, comms, notes, or gateway patterns, forget or rewrite it."
 }
 
 /// Treat empty strings as "no project" for the move/copy `--from`/`--to` flags.
