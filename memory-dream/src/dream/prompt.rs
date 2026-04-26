@@ -45,7 +45,8 @@ no markdown fences, no commentary:
 2. The single word:  forget
    Use when the memory is noise with no lasting insight: pure state
    observable from git history, repository files, CI/release systems,
-   task/comms surfaces, gateway pattern records, or project notes.
+   task/comms surfaces, gateway pattern records, or user/project state
+   systems.
    Examples: CI events, release notifications, webhook deliveries,
    commit/tag/deploy status, copied note content, or "created/updated
    pattern X" notes with no re-usable instruction.
@@ -79,9 +80,10 @@ RULES
   a pointer to canonical guidance plus why to use it.
 - Forget memories that merely record state an agent can recover from
   current systems: git, repository inspection, CI, releases, task/comms,
-  repo notes/Markdown, or `agent-tools patterns`. A locator is useful
-  only when it tells future agents which canonical project note, doc, or
-  pattern to consult and why.
+  user-approved notes/docs/task systems, or configured pattern systems. A
+  locator is useful only when it tells future agents which canonical
+  system, doc, task thread, or pattern to consult under the applicable
+  user/repo/tool guidance, and why.
 - Memory should increase knowledge about how and why to work, not act as
   a scratchpad. Prefer one strong memory over several overlapping notes.
 - If you are uncertain whether the memory is worth keeping, default
@@ -290,8 +292,8 @@ mod tests {
             "prompt must preserve durable guidance"
         );
         assert!(
-            p.contains("agent-tools patterns"),
-            "prompt must distinguish gateway pattern locators from audit notes"
+            p.contains("configured pattern systems"),
+            "prompt must distinguish configured pattern locators from audit notes"
         );
     }
 

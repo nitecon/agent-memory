@@ -28,7 +28,7 @@ const GLOBAL_BOOST: f32 = 1.25;
 /// cross-imported so the MCP surface stays independent of the CLI module's
 /// public API shape.
 const GLOBAL_PROJECT_IDENT: &str = "__global__";
-const STORE_QUALITY_HINT: &str = "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, failure cause, or a pointer to canonical notes/docs plus why they matter. Prefer updating an existing related memory over creating a new one; if this only records state visible in git, repo files, CI, releases, tasks, comms, notes, or gateway patterns, forget or rewrite it.";
+const STORE_QUALITY_HINT: &str = "Before relying on this memory, verify it passes the quality gate: it should preserve reusable guidance, a preference, procedure, non-obvious constraint, failure cause, or a pointer to the canonical system specified by user/repo/tool guidance plus why it matters. Prefer updating an existing related memory over creating a new one; if this only records state visible in git, repo files, CI, releases, tasks, comms, notes, or configured pattern systems, forget or rewrite it.";
 
 #[derive(Clone)]
 pub struct MemoryServer {

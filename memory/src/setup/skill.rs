@@ -135,17 +135,22 @@ preference, or reusable pattern, update or rewrite the existing memory instead
 of adding another row. New memories are for distinct reusable knowledge that a
 future agent should retrieve independently.
 
-Use project files for project state and notes. Git history already records
-timeline-specific implementation details, and repo Markdown/TODO/ADR files are
-the right place for evolving design notes, status, and open questions. Memory
-should primarily increase knowledge about **how and why** work is done, or point
-to the canonical project note that contains live details. For example, a useful
-memory may say "filesystem replication design notes live at `TODO/foo.md`;
-consult that file before changing replication behavior because it captures the
-current constraints and open decisions." Do not copy the full note into memory.
+Use the applicable overall guidance for state, notes, and tasks: explicit user
+instructions, AGENTS.md or other repo instructions, project conventions, and
+the tools actually available in the environment. Git history already records
+timeline-specific implementation details; canonical docs, issue trackers, task
+boards, or other user-approved surfaces are the right place for evolving design
+notes, status, and open questions. Do not invent a note location, create
+TODO/ADR files, or assume a specific task tool if the user's guidance points
+elsewhere. Memory should primarily increase knowledge about **how and why** work
+is done, or point to the canonical system that contains live details. For
+example, a useful memory may say "filesystem replication decisions are tracked
+in the project task board; check the active task thread before changing
+replication behavior because it captures current constraints and open
+decisions." Do not copy the full note/task content into memory.
 
 Do **not** store facts recoverable from git history, repository inspection,
-CI/release systems, or agent-tools tasks/comms. Avoid routine deployment status,
+CI/release systems, or configured task/comms surfaces. Avoid routine deployment status,
 version numbers, release events, commit SHAs, branch state, "CI passed", "tag
 was pushed", or "deployed version X" memories.
 

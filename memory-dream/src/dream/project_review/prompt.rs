@@ -113,11 +113,11 @@ const RULES: &str = r#"RULES
    non-obvious constraints, failure causes, or short pointers to
    canonical guidance plus why to use it. Drop memories that merely
    record state recoverable from git, repository inspection, CI,
-   releases, task/comms surfaces, repo notes/Markdown, or gateway
-   pattern records. A locator can stay when it tells agents which
-   canonical project note, doc, or `agent-tools patterns` record to
-   consult and why; copied note content and "created/updated pattern X"
-   audit notes should drop.
+   releases, task/comms surfaces, user-approved notes/docs/task systems,
+   or configured pattern records. A locator can stay when it tells agents
+   which canonical system, doc, task thread, or pattern record to consult
+   under the applicable user/repo/tool guidance, and why; copied note/task
+   content and "created/updated pattern X" audit notes should drop.
 
 3. UPDATE-BEFORE-CREATE RULE. Prefer one stronger existing memory over a
    new overlapping memory. Merge duplicates when they cover the same
@@ -253,9 +253,9 @@ mod tests {
         assert!(p.contains("MEMORY QUALITY GATE"));
         assert!(p.contains("reusable guidance"));
         assert!(p.contains("state recoverable from git"));
-        assert!(p.contains("agent-tools patterns"));
-        assert!(p.contains("repo notes/Markdown"));
-        assert!(p.contains("canonical project note"));
+        assert!(p.contains("configured pattern records"));
+        assert!(p.contains("user-approved notes/docs/task systems"));
+        assert!(p.contains("applicable user/repo/tool guidance"));
         assert!(p.contains("created/updated pattern X"));
     }
 
