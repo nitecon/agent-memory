@@ -85,200 +85,84 @@ on the next update.
 "#;
 
 const MEMORY_SECTION: &str = r#"
-### Memory Operations (MANDATORY)
+### Operations
 
-**Binary:** `memory` (installed at `/opt/agentic/bin/memory` on Linux/macOS,
-`%USERPROFILE%\.agentic\bin\memory.exe` on Windows) — call directly via Bash.
-Do NOT use MCP or skills for memory during normal workflow.
-
-**The "Memory First/Last" Rule:** Every task must begin with a `context` or
-`search` call and end with a `store` call if functionality changed.
-
-### Scope tiers
-
-Every memory is stored under one of two scopes; retrieval boosts both:
-
-| Scope                      | Boost  | When to use                                    |
-|----------------------------|--------|------------------------------------------------|
-| **Current project** (cwd)  | 1.5×   | Repo-specific decisions, patterns, bugs        |
-| **Global** (`__global__`)  | 1.25×  | Universal user preferences / directives        |
-| Other project              | 1.0×   | Surfaces only as prior art via the `hint` field |
-
-`store`, `search`, and `context` auto-detect the current project from the
-cwd's git remote (reduced to the repo shortname). A single `context` call
-returns both current-project and global hits — no second query needed.
+`memory` binary at `/opt/agentic/bin/memory` (Linux/macOS) or
+`%USERPROFILE%\.agentic\bin\memory.exe` (Windows). Call directly via Bash —
+not through MCP or skills.
 
 ```bash
-# Context — top-K relevant memories for a task (boost cwd + global)
-memory context "<task description>" -k <limit>
-
-# Search — hybrid BM25 + vector search (boost cwd + global)
-memory search "<query>" -k <limit>
-
-# Store — save a new project-scoped memory (cwd auto-detected)
-memory store "<content>" -m <type> -t "<tags>"
-
-# Store — save a universal preference (applies across every repo)
-memory store "<content>" -m <type> --scope global -t "<tags>"
-# types: user, feedback, project, reference
-
-# Get — fetch full content for specific IDs (pair with brief search)
-memory get <uuid> [<uuid>...]
-
-# Recall — filter by project/agent/tags/type
-memory recall -m <type> -t "<tags>" -p "<project>" -k <limit>
-
-# List — list all memories (optionally filtered)
-memory list -k 50 --project <proj>
-
-# Projects — list distinct project idents (spot alias mismatches)
-memory projects
-
-# Move — reassign the project ident on one or many memories
-memory move --from "<old>" --to "<new>" [--dry-run]
-memory move --id <uuid> --to "<proj>"
-
-# Copy — duplicate memories under a new project ident
-memory copy --from "<old>" --to "<new>" [--dry-run]
-memory copy --id <uuid> --to "<proj>"
-
-# Forget — remove a memory by ID (or by search query)
-memory forget --id <uuid>
-memory forget --query "<query>"
-
-# Prune — decay stale/low-access memories
-memory prune --max-age-days 90 [--dry-run]
-
-# Update — check for and install the latest version
-memory update
+memory context "<task>" -k <limit>           # pre-task recall (cwd + global)
+memory search "<query>" -k <limit>           # hybrid BM25 + vector search
+memory store "<content>" -m <type> -t "<tags>"                 # project scope (default)
+memory store "<content>" -m <type> --scope global -t "<tags>"  # universal preference
+memory get <uuid> [<uuid>...]                # full content for IDs from search
 ```
 
-### Memory quality gate (MANDATORY)
-
-Store memories only when they will help a future agent work faster. A good
-memory captures reusable patterns, operational procedures, user preferences,
-non-obvious constraints, failure causes, or "how to / why" guidance. Write for
-a cold agent who has not seen this session: the memory should tell them what to
-do next, which tool or system to use, and why that path is correct.
-
-Prefer updating an existing memory over creating a new one. Before storing,
-search/recall for related memories in the same project and in global scope. If
-the new learning refines the same workflow, subsystem, failure mode, user
-preference, or reusable pattern, update or rewrite the existing memory instead
-of adding another row. New memories are for distinct reusable knowledge that a
-future agent should retrieve independently.
-
-Use the applicable overall guidance for state, notes, and tasks: explicit user
-instructions, AGENTS.md or other repo instructions, project conventions, and
-the tools actually available in the environment. Git history already records
-timeline-specific implementation details; canonical docs, issue trackers, task
-boards, or other user-approved surfaces are the right place for evolving design
-notes, status, and open questions. Do not invent a note location, create
-TODO/ADR files, or assume a specific task tool if the user's guidance points
-elsewhere. Memory should primarily increase knowledge about **how and why** work
-is done, or point to the canonical system that contains live details. For
-example, a useful memory may say "filesystem replication decisions are tracked
-in the project task board; check the active task thread before changing
-replication behavior because it captures current constraints and open
-decisions." Do not copy the full note/task content into memory.
-
-Do **not** store facts that can be recovered from git history, repository
-inspection, CI/release systems, or the configured task/comms surfaces. In
-particular, do not store routine deployment status, version numbers, release
-events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed
-version X" memories.
-
-Exception: store deployment/version facts only when they explain a failure mode
-or encode a reusable procedure that prevents future mistakes. Prefer:
-
-- "Dev server `https://foo-dev.nitecon.org` is deployed by Eventic on main
-  branch push; do not manually deploy. Average deploy time is about 2 minutes,
-  so set a timer before checking."
-
-Avoid:
-
-- "Deployed version 1.2.0."
-- "Tag v1.2.0 was pushed."
-- "Commit abc123 passed CI."
-- "Updated pattern 019dc55f with a Mumble/Murmur example."
-
-If a user refers to "patterns", they likely mean gateway-backed
-`agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful
-memory says to inspect the current CLI with `agent-tools patterns --help`, then
-use `agent-tools patterns get/update/check` as appropriate. Do not save a
-memory that only says a pattern was updated; save the reusable workflow and the
-reason it matters.
-
-Short locator memories for canonical gateway patterns are allowed when they
-help a cold agent quickly find and reuse non-obvious guidance. For example, a
-memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an
-`agent-tools patterns` record and should be looked up before designing a new
-pipeline. Keep the memory to the locator, reuse instruction, and why the pattern
-matters; do not record "created/updated pattern X" as an audit event.
-
-When you notice duplicated, stale, or nonsensical memories in the current
-project, naturally consolidate them as part of the work: merge clear duplicates,
-rewrite bloated memories into one stronger entry, or forget entries that fail
-this quality gate. Keep cleanup local and conservative — do not launch broad
-memory-cleanup sweeps unless the user asks.
-
-### Retrieval strategy
-
-1. **Pre-Task**: run `memory context "<task>"` before reading code. If a similar
-   pattern exists, refactor or extend it rather than re-inventing.
-2. **Two-stage fetch**: default `brief` output returns previews; follow up with
-   `memory get <id>` for the handful you actually want to read in full.
-3. **Cross-project hits**: when the response includes a `hint` field, treat
-   those memories as prior-art or general guidance, not direct context.
-4. **Global-scope hits**: the `hint` field also surfaces the count of
-   global-scope preferences in your top-K. Treat them as directives, not
-   suggestions — they encode rules the user has already stated once.
-5. **Post-Task**: update an existing memory when the learning belongs with an
-   existing rule/workflow/pattern; otherwise run `memory store` for any
-   non-obvious decisions, user preferences, reusable patterns, or failure causes
-   that pass the quality gate. Audit-ready descriptions — explain the "why,"
-   not just the "what."
+Types: `user`, `feedback`, `project`, `reference`. Project scope auto-detects
+from the cwd's git remote. Run `memory --help` for admin verbs (`recall`,
+`list`, `projects`, `move`, `copy`, `forget`, `prune`, `update`) — agents
+rarely need these mid-task.
 
 ### Rule A — Pre-action behavior recall (MANDATORY)
 
-Before starting **any** user-requested task — development, SRE, writing,
-design, research, any domain — run **one** `memory context "<task>"` call
-first. A single call returns both general directives (global scope, 1.25×
-boost) and project-specific directives (current-project, 1.5× boost). Do
-not skip this step for "quick" tasks: directives the user has already
-stated must never need to be re-stated.
-
-If the response's `hint` field flags zero global-scope matches, pause and
-reflect: has the user stated a preference relevant to this task's domain
-that you simply aren't finding? If unsure, ask them directly before acting.
+Run **one** `memory context "<task>"` call before any user-requested task —
+development, SRE, writing, design, research, any domain. The single call
+returns both global directives and project-scoped context. Do not skip this
+for "quick" tasks: directives the user already stated must never need to be
+re-stated. If the response's `hint` flags zero global-scope matches and you
+suspect a relevant preference exists, ask before acting. After functionality
+changes, search/update/store reusable non-obvious learning that passes the
+quality gate.
 
 ### Rule B — Post-action scope classification (MANDATORY)
 
-After completing an action, if the user stated or implied any directive,
-preference, or corrective rule during the session, you **MUST** store it —
-and you **MUST** classify its scope.
+If the user stated or implied any directive, preference, or corrective rule
+during the session, store it — and classify its scope:
 
-Classification rules:
+- **Global** (`--scope global`) — universal preference. Signals: "I always",
+  "I never", "from now on", "I prefer", "don't ever", "whenever we",
+  "in general" — anything sounding like a personal policy or work style.
+- **Project** (default) — specific to this repo, service, or codebase.
+  Signals: "in this repo", "for this service", "on this project", "here we"
+  — anything tied to the current codebase or stack.
+- **Ambiguous** — phrasing could reasonably apply either way.
+  You **MUST ask** the user before storing: *"Is this a general preference
+  (applies across all projects) or specific to this project?"* Do not
+  silently default to either scope — a silent mis-classification costs more
+  than one question.
 
-- **Global** (`--scope global`) — universal preference. Signals include:
-  "I always", "I never", "from now on", "I prefer", "don't ever",
-  "whenever we", "in general", any phrasing that sounds like a personal
-  policy or work style.
-- **Project** (`--scope project`, the default) — specific to this repo,
-  service, or codebase. Signals include: "in this repo", "for this
-  service", "on this project", "here we", any phrasing tied to the
-  current codebase or stack.
-- **Ambiguous** — phrasing could reasonably apply either way. You
-  **MUST ask** the user before storing: *"Is this a general preference
-  (applies across all projects) or specific to this project?"* Do
-  **not** silently default to either scope. Do **not** skip the ask to
-  save tokens — a silent mis-classification costs more than one question.
-
-Example:
 ```bash
 memory store "User never wants PRs opened unless they explicitly ask" \
   -m feedback --scope global -t "workflow,pr"
 ```
+
+### Memory quality gate
+
+Store a memory only when it will help a future cold agent work faster:
+reusable patterns, operational procedures, user preferences, non-obvious
+constraints, failure causes, or *how/why* guidance. Tell the cold agent what
+to do, which tool to use, and why that path is correct.
+
+- **Update before adding.** Search first; if the learning refines an existing
+  workflow, subsystem, failure mode, or preference, rewrite that entry rather
+  than adding another row. New memories are for distinct knowledge a future
+  agent should retrieve independently.
+- **Don't duplicate canonical state.**
+  Do **not** store facts that can be recovered from git history, repository
+  inspection, CI/release systems, or the configured task/comms surfaces — no
+  deployment status, version numbers, commit SHAs, "CI passed", "tag pushed",
+  "Deployed version 1.2.0" memories. Memory captures *how/why*; canonical
+  surfaces capture *what/when*. A locator memory ("replication decisions
+  live on the project task board — read the active thread before changing
+  behavior") is fine; copying that content is not.
+  Exception: deployment/version facts only when they explain a failure mode
+  or encode a procedure that prevents future mistakes — e.g. "Dev server
+  `https://foo-dev.nitecon.org` is auto-deployed by Eventic on main push;
+  do not deploy manually; deploy takes ~2min."
+- **Consolidate in passing.** Merge or forget duplicated, stale, or
+  nonsensical memories you notice during normal work. No broad sweeps unless
+  asked.
 "#;
 
 /// Entry point invoked from `cli.rs` for `memory setup rules`.
@@ -985,20 +869,41 @@ mod tests {
         let b = build_block();
         assert!(b.starts_with(OPEN_MARKER));
         assert!(b.trim_end().ends_with(CLOSE_MARKER));
+        // Hot-path commands the agent runs every task.
         assert!(b.contains("memory context"));
         assert!(b.contains("memory store"));
         assert!(b.contains("memory get"));
-        assert!(b.contains("memory projects"));
-        assert!(b.contains("memory move"));
-        assert!(b.contains("memory copy"));
         // Markers appear exactly once each.
         assert_eq!(b.matches(OPEN_MARKER).count(), 1);
         assert_eq!(b.matches(CLOSE_MARKER).count(), 1);
     }
 
-    /// The new scope/rules additions must appear verbatim so a regression
-    /// that drops the mandatory-ask clause is caught at build time rather
-    /// than discovered in the wild.
+    /// Anti-bloat regression: admin commands must not creep back as inline
+    /// CLI examples. They live behind `memory --help` so the injected block
+    /// stays focused on the hot path agents actually use mid-task.
+    #[test]
+    fn build_block_keeps_admin_commands_out_of_inline_examples() {
+        let b = build_block();
+        assert!(
+            b.contains("memory --help"),
+            "block must point at `memory --help` for admin commands"
+        );
+        // Each admin verb may be named once (in the --help reference list)
+        // but must not be inlined as a runnable example.
+        for verb in [
+            "recall", "list", "projects", "move", "copy", "forget", "prune", "update",
+        ] {
+            let inline = format!("memory {verb}");
+            assert!(
+                b.matches(&inline).count() <= 1,
+                "admin verb `{verb}` must not appear as an inline example"
+            );
+        }
+    }
+
+    /// The load-bearing scope/rules behavior must appear verbatim so a
+    /// regression that drops the mandatory-ask clause is caught at build
+    /// time rather than discovered in the wild.
     #[test]
     fn build_block_documents_scope_and_new_rules() {
         let b = build_block();
@@ -1006,21 +911,6 @@ mod tests {
         assert!(
             b.contains("--scope global"),
             "block must show the --scope global CLI example"
-        );
-        // Scope tier table references both boost values.
-        assert!(
-            b.contains("1.5×"),
-            "block must reference the 1.5× project boost"
-        );
-        assert!(
-            b.contains("1.25×"),
-            "block must reference the 1.25× global boost"
-        );
-        // The sentinel must be named so users inspecting the DB aren't
-        // confused by stray `__global__` rows.
-        assert!(
-            b.contains("__global__"),
-            "block must name the sentinel project ident"
         );
         // Rule headings — exact strings the agent learns to look for.
         assert!(
@@ -1062,18 +952,6 @@ mod tests {
         assert!(
             b.contains("cold agent"),
             "block must instruct agents to write for cold-start retrieval"
-        );
-        assert!(
-            b.contains("agent-tools patterns --help"),
-            "block must include the agent-tools patterns workflow example"
-        );
-        assert!(
-            b.contains("Short locator memories for canonical gateway patterns are allowed"),
-            "block must allow gateway pattern locator memories"
-        );
-        assert!(
-            b.contains("do not record \"created/updated pattern X\" as an audit event"),
-            "block must distinguish locator memories from pattern audit events"
         );
     }
 
