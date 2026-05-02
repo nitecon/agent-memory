@@ -43,9 +43,21 @@ if (-not $LatestTag) {
 
 Info "Latest version: $LatestTag"
 
-# Release 2 asset name format: `agent-memory-<tag>-windows-x86_64.zip`.
-$ArchiveName = "agent-memory-$LatestTag-windows-x86_64.zip"
-$DownloadUrl = "https://github.com/$Repo/releases/download/$LatestTag/$ArchiveName"
+# Release 2 asset name format: `agent-memory-windows-x86_64.zip`.
+# Accept the earlier documented tagged form too so the installer works across
+# releases produced by either convention.
+$escapedTag = [regex]::Escape($LatestTag)
+$asset = $release.assets |
+    Where-Object { $_.name -match "^agent-memory-($escapedTag-)?windows-x86_64\.zip$" } |
+    Select-Object -First 1
+
+if (-not $asset) {
+    $available = ($release.assets | ForEach-Object { $_.name }) -join ", "
+    Fail "Could not find a Windows x86_64 release archive for $LatestTag. Available assets: $available"
+}
+
+$ArchiveName = $asset.name
+$DownloadUrl = $asset.browser_download_url
 
 # --- Check existing installation --------------------------------------------
 
