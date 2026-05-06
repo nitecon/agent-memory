@@ -467,6 +467,9 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             }
             println!("{}", render::render_action_result("stored", &attrs));
             println!("{}", render::render_hint(store_quality_hint()));
+            if let Some(canonical) = canonical_state_hint(&content) {
+                println!("{}", render::render_hint(canonical));
+            }
             // Reflection hint: nudge the agent to reconsider scope only when
             // the memory type is most likely to be cross-cutting (user or
             // feedback) AND the user didn't pick a scope deliberately. No
@@ -499,7 +502,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_boost_factor: boosts.global_boost,
             };
             let results = search::hybrid_search(conn, &query, opts, &config.model_cache_dir)?;
-            print_ranked(&results, &boosts);
+            print_ranked(&results, &boosts, &query);
         }
         Cli::Context {
             description,
@@ -521,7 +524,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_boost_factor: boosts.global_boost,
             };
             let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
-            print_ranked(&results, &boosts);
+            print_ranked(&results, &boosts, &description);
         }
         Cli::Recall {
             project,
@@ -764,7 +767,11 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
 /// the output (short-ID semantics, section meanings, how to fetch full
 /// content). The legend ships unconditionally — even on zero-result runs —
 /// because that's when a new caller most needs the guidance.
-fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
+///
+/// `query` is the original task/search string; it is inspected for
+/// canonical-state intent (commit/tag/version/push/etc.) so the hint can
+/// remind the agent to use git rather than memory for those facts.
+fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>, query: &str) {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
     let cross = if boosts.current_project.is_some() {
@@ -772,7 +779,7 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
     } else {
         0
     };
-    let hint = results_hint(cross, globals, total, boosts.current_project);
+    let hint = results_hint(cross, globals, total, boosts.current_project, query);
     let rendered = render::render_search_results(results, boosts.current_project, hint.as_deref());
     // Empty input yields an empty render; emit an explicit empty marker so
     // callers can tell "query ran, zero hits" from a silent failure.
@@ -960,7 +967,7 @@ fn resolve_boosts<'a>(
 
 /// Assemble the reflection `hint` string for `context`/`search` responses.
 ///
-/// Three independent conditions, each additive:
+/// Four independent conditions, each additive:
 ///
 /// 1. **Cross-project results present** — original behavior: prefix the hint
 ///    with the cross-project ratio so the agent knows to treat them as
@@ -972,14 +979,20 @@ fn resolve_boosts<'a>(
 ///    silence here is the dangerous case, not noise.
 /// 3. **Global-scope matches present** — surface the count so the agent
 ///    treats them as directives rather than suggestions.
+/// 4. **Canonical-state intent in the query** — the task mentions git, a
+///    version, a tag, a release, etc. Memory does not store git history,
+///    so nudge the agent to consult git/release tooling for those facts
+///    and to use memory for *how/why/what* knowledge instead.
 ///
 /// Returns `None` when nothing useful would be said (no current-project
-/// context AND no global hits AND no cross-project hits).
+/// context AND no global hits AND no cross-project hits AND no canonical
+/// intent).
 fn results_hint(
     cross: usize,
     globals: usize,
     total: usize,
     current: Option<&str>,
+    query: &str,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
@@ -1011,11 +1024,78 @@ fn results_hint(
         );
     }
 
+    if let Some(h) = canonical_state_hint(query) {
+        parts.push(h.to_string());
+    }
+
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(" "))
     }
+}
+
+/// Return the canonical-state nudge when `text` reads like a git/release/
+/// version lookup, otherwise `None`. Used by both the search/context hint
+/// path and the store path so an agent both *seeking* and *saving* such
+/// facts gets the same reminder.
+fn canonical_state_hint(text: &str) -> Option<&'static str> {
+    if has_canonical_state_intent(text) {
+        Some(
+            "This looks like a git/version/release lookup. Memory does not store git history, version numbers, commit SHAs, or release tags — use `git log`, `git tag`, `git show`, or your release tooling for those facts. Memory is for the *how/why/what* a cold agent needs to ramp up: project layout, workflows, decisions, gotchas, and reusable procedures.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Cheap word-level scan for canonical-state vocabulary. Splits on
+/// non-alphanumeric and checks tokens against a curated keyword set so
+/// `committing`, `tagged`, `versions`, etc. all match. The keyword list is
+/// deliberately broad — false positives only print an informational hint;
+/// false negatives let bad memories slip through.
+fn has_canonical_state_intent(text: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "git",
+        "commit",
+        "commits",
+        "committed",
+        "committing",
+        "tag",
+        "tags",
+        "tagged",
+        "tagging",
+        "version",
+        "versions",
+        "versioned",
+        "versioning",
+        "semver",
+        "release",
+        "releases",
+        "released",
+        "releasing",
+        "changelog",
+        "push",
+        "pushed",
+        "pushing",
+        "rebase",
+        "merge",
+        "branch",
+        "sha",
+    ];
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        // Lowercase comparison without allocating per token: tokens are short.
+        if KEYWORDS
+            .iter()
+            .any(|k| k.len() == token.len() && k.eq_ignore_ascii_case(token))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn scope_label(scope: MemoryScope) -> &'static str {
@@ -1331,7 +1411,7 @@ mod tests {
     /// and suppress the zero-global reflection prompt.
     #[test]
     fn results_hint_global_present_emits_directive_count() {
-        let h = results_hint(0, 2, 5, Some("agent-memory")).expect("hint should be present");
+        let h = results_hint(0, 2, 5, Some("agent-memory"), "what does the project do").expect("hint should be present");
         assert!(h.contains("2 of 5 results are global-scope preferences"));
         assert!(!h.contains("No global-scope preferences matched"));
     }
@@ -1340,7 +1420,8 @@ mod tests {
     /// reflection prompt asking the agent to pause.
     #[test]
     fn results_hint_zero_global_fires_reflection_prompt() {
-        let h = results_hint(0, 0, 3, Some("agent-memory")).expect("hint should be present");
+        let h = results_hint(0, 0, 3, Some("agent-memory"), "what does the project do")
+            .expect("hint should be present");
         assert!(h.contains("No global-scope preferences matched"));
     }
 
@@ -1348,7 +1429,8 @@ mod tests {
     /// prior-art warning and the reflection prompt.
     #[test]
     fn results_hint_combines_cross_project_and_zero_global() {
-        let h = results_hint(3, 0, 5, Some("agent-memory")).expect("hint should be present");
+        let h = results_hint(3, 0, 5, Some("agent-memory"), "what does the project do")
+            .expect("hint should be present");
         assert!(h.contains("cross-project"));
         assert!(h.contains("No global-scope preferences matched"));
     }
@@ -1357,14 +1439,15 @@ mod tests {
     /// at all (nothing useful to say).
     #[test]
     fn results_hint_flat_ranking_no_globals_emits_nothing() {
-        assert!(results_hint(0, 0, 5, None).is_none());
+        assert!(results_hint(0, 0, 5, None, "ramp up notes").is_none());
     }
 
     /// Hint: flat retrieval with globals still surfaces the directive-count
     /// — universal preferences are always worth flagging.
     #[test]
     fn results_hint_flat_ranking_with_globals_surfaces_count() {
-        let h = results_hint(0, 1, 3, None).expect("hint should be present");
+        let h =
+            results_hint(0, 1, 3, None, "ramp up notes").expect("hint should be present");
         assert!(h.contains("global-scope preferences"));
     }
 
@@ -1375,6 +1458,50 @@ mod tests {
         let h = store_scope_hint();
         assert!(h.contains("--scope global"));
         assert!(h.contains("silent mis-classification"));
+    }
+
+    /// Canonical-state intent: a query mentioning git/version/tag fires the
+    /// reminder regardless of project context.
+    #[test]
+    fn canonical_state_hint_fires_on_version_query() {
+        let h = results_hint(
+            0,
+            1,
+            3,
+            Some("agent-memory"),
+            "commit push and create new minor version patch tag for TraderX",
+        )
+        .expect("hint should be present");
+        assert!(h.contains("git/version/release lookup"));
+        assert!(h.contains("git log"));
+        assert!(h.contains("how/why/what"));
+    }
+
+    /// Plain prose without canonical-state vocabulary must not trip the
+    /// nudge — false positives degrade the signal.
+    #[test]
+    fn canonical_state_hint_silent_on_unrelated_query() {
+        let h = results_hint(0, 1, 3, Some("agent-memory"), "how does the embedding cache work")
+            .expect("hint should be present");
+        assert!(!h.contains("git/version/release lookup"));
+    }
+
+    /// Inflected forms (committing, tagged, versions) all match — the keyword
+    /// scan compares whole tokens case-insensitively.
+    #[test]
+    fn canonical_state_intent_matches_inflections() {
+        assert!(has_canonical_state_intent("we are tagging the release"));
+        assert!(has_canonical_state_intent("Versions of the API"));
+        assert!(has_canonical_state_intent("rebase onto main and push"));
+    }
+
+    /// Tokens that merely contain a keyword as a substring must not match —
+    /// e.g. "stagger" should not be read as "tag".
+    #[test]
+    fn canonical_state_intent_requires_whole_token() {
+        assert!(!has_canonical_state_intent("stagger the requests"));
+        assert!(!has_canonical_state_intent("commitment to the user"));
+        assert!(!has_canonical_state_intent("conversion of formats"));
     }
 
     #[test]
