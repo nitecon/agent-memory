@@ -703,6 +703,20 @@ mod tests {
         assert_eq!(summary.forgot, 0);
     }
 
+    #[test]
+    fn working_context_rows_do_not_create_dream_candidates() {
+        let mut conn = open_mem_db();
+        q::set_working_context(&conn, "p1", "transient handoff").unwrap();
+
+        let inf = FixedInference::new("skip");
+        let tmp = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+
+        assert_eq!(summary.total_walked, 0);
+        assert!(q::get_working_context(&conn, "p1").unwrap().is_some());
+    }
+
     /// Incremental filter: after a successful pass, re-running with no new
     /// writes should yield zero candidates.
     #[test]
@@ -811,7 +825,10 @@ mod tests {
             summary_skip.total_walked, 0,
             "precondition: incremental gate must hide the memory by default"
         );
-        assert_eq!(summary_skip.review_kept, 0, "Stage 0 must not fire by default");
+        assert_eq!(
+            summary_skip.review_kept, 0,
+            "Stage 0 must not fire by default"
+        );
 
         // With --refresh the memory re-enters the pipeline and Stage 0
         // sees it.
@@ -888,8 +905,10 @@ mod tests {
         // Without --refresh: incremental gate hides both → no dedup work.
         let cfg_skip = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary_skip = run(&mut conn, &inf, &cfg_skip).expect("dream ok");
-        assert_eq!(summary_skip.superseded, 0,
-            "precondition: Stage A must not fire by default on pre-stamped rows");
+        assert_eq!(
+            summary_skip.superseded, 0,
+            "precondition: Stage A must not fire by default on pre-stamped rows"
+        );
 
         // With --refresh: Stage A fires and supersedes the older row.
         let mut cfg_refresh = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);

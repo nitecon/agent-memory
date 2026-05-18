@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::{io::Read, path::PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::db::models::Memory;
+use crate::db::models::{Memory, WorkingContext};
 use crate::db::queries::{self, ResolvedId};
 use crate::embedding;
 use crate::error::MemoryError;
@@ -221,6 +221,8 @@ pub enum Cli {
     /// Common use: migrate memories that were tagged under a legacy project
     /// name (e.g. `trading-platform-sre`) to the canonical git-remote ident
     /// (e.g. `github.com/nitecon/SRE.git`) the cwd-resolver returns now.
+    /// Project-wide moves also transfer the source WorkingContext to the
+    /// target project; moving to `--to ""` clears it.
     ///
     /// Selectors:
     ///   --id <ID>        move a single memory
@@ -246,9 +248,10 @@ pub enum Cli {
     },
     /// Duplicate one or more memories under a new project ident.
     ///
-    /// Content, tags, agent, source_file, memory_type, and the cached
-    /// embedding are all preserved on the copy. A new UUID is minted and
-    /// timestamps reset; the source row is left untouched.
+    /// WorkingContext is not copied. Content, tags, agent, source_file,
+    /// memory_type, and the cached embedding are all preserved on the copy.
+    /// A new UUID is minted and timestamps reset; the source row is left
+    /// untouched.
     ///
     /// Selectors mirror `memory move`:
     ///   --id <ID>        copy a single memory
@@ -269,11 +272,16 @@ pub enum Cli {
         #[arg(long)]
         dry_run: bool,
     },
-    /// List distinct project idents with memory counts.
+    /// List distinct durable-memory project idents with memory counts.
     ///
     /// Useful for spotting alias mismatches (e.g. `trading-platform-sre` vs
     /// `github.com/nitecon/SRE.git`) before running `memory move --from … --to …`.
     Projects,
+    /// Manage the current project's live WorkingContext handoff.
+    Working {
+        #[command(subcommand)]
+        command: WorkingCommands,
+    },
     /// Start MCP stdio server.
     Serve,
     /// Dual-mode command:
@@ -313,6 +321,33 @@ pub enum Cli {
     Setup {
         #[command(subcommand)]
         command: Option<SetupCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkingCommands {
+    /// Print the current project's WorkingContext, if any.
+    Get {
+        /// Project identifier (defaults to cwd-derived ident).
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Replace the current project's WorkingContext.
+    Set {
+        /// WorkingContext body. Use "-" to read from stdin.
+        content: Option<String>,
+        /// Read WorkingContext body from a file.
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+        /// Project identifier (defaults to cwd-derived ident).
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Clear the current project's WorkingContext.
+    Clear {
+        /// Project identifier (defaults to cwd-derived ident).
+        #[arg(short, long)]
+        project: Option<String>,
     },
 }
 
@@ -502,7 +537,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_boost_factor: boosts.global_boost,
             };
             let results = search::hybrid_search(conn, &query, opts, &config.model_cache_dir)?;
-            print_ranked(&results, &boosts, &query);
+            print_ranked(&results, &boosts, &query, None, false);
         }
         Cli::Context {
             description,
@@ -524,7 +559,18 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_boost_factor: boosts.global_boost,
             };
             let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
-            print_ranked(&results, &boosts, &description);
+            let working_context = if let Some(project) = boosts.current_project {
+                queries::get_working_context(conn, project)?
+            } else {
+                None
+            };
+            print_ranked(
+                &results,
+                &boosts,
+                &description,
+                working_context.as_ref(),
+                true,
+            );
         }
         Cli::Recall {
             project,
@@ -718,6 +764,44 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             let rows = queries::list_projects(conn)?;
             println!("{}", render::render_projects(&rows, cwd_project.as_deref()));
         }
+        Cli::Working { command } => match command {
+            WorkingCommands::Get { project } => {
+                let project = resolve_working_project(project, cwd_project.as_deref())?;
+                let ctx = queries::get_working_context(conn, &project)?;
+                println!("{}", render::render_working_context(ctx.as_ref(), &project));
+            }
+            WorkingCommands::Set {
+                project,
+                content,
+                file,
+            } => {
+                let project = resolve_working_project(project, cwd_project.as_deref())?;
+                let content = read_working_content(content, file)?;
+                let ctx = queries::set_working_context(conn, &project, &content)?;
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "working_context_set",
+                        &[
+                            ("project", ctx.project),
+                            ("version", ctx.version.to_string()),
+                            ("updated_at", ctx.updated_at),
+                        ],
+                    )
+                );
+            }
+            WorkingCommands::Clear { project } => {
+                let project = resolve_working_project(project, cwd_project.as_deref())?;
+                let deleted = queries::clear_working_context(conn, &project)?;
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "working_context_cleared",
+                        &[("project", project), ("deleted", deleted.to_string())],
+                    )
+                );
+            }
+        },
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
         }
@@ -771,7 +855,13 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
 /// `query` is the original task/search string; it is inspected for
 /// canonical-state intent (commit/tag/version/push/etc.) so the hint can
 /// remind the agent to use git rather than memory for those facts.
-fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>, query: &str) {
+fn print_ranked(
+    results: &[SearchResult],
+    boosts: &BoostConfig<'_>,
+    query: &str,
+    working_context: Option<&WorkingContext>,
+    include_working_absence_hint: bool,
+) {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
     let cross = if boosts.current_project.is_some() {
@@ -779,8 +869,20 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>, query: &str)
     } else {
         0
     };
-    let hint = results_hint(cross, globals, total, boosts.current_project, query);
-    let rendered = render::render_search_results(results, boosts.current_project, hint.as_deref());
+    let hint = combine_hints(
+        results_hint(cross, globals, total, boosts.current_project, query),
+        working_absence_hint(
+            boosts.current_project,
+            working_context,
+            include_working_absence_hint,
+        ),
+    );
+    let rendered = render::render_search_results(
+        results,
+        boosts.current_project,
+        working_context,
+        hint.as_deref(),
+    );
     // Empty input yields an empty render; emit an explicit empty marker so
     // callers can tell "query ran, zero hits" from a silent failure.
     if rendered.is_empty() {
@@ -789,6 +891,31 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>, query: &str)
         println!("{rendered}");
     }
     println!("{}", render::render_usage_legend());
+}
+
+fn combine_hints(primary: Option<String>, secondary: Option<String>) -> Option<String> {
+    match (primary, secondary) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn working_absence_hint(
+    current_project: Option<&str>,
+    working_context: Option<&WorkingContext>,
+    include: bool,
+) -> Option<String> {
+    if include && working_context.is_none() {
+        current_project.map(|project| {
+            format!(
+                "No WorkingContext is set for project '{project}'. If pausing substantial active work, use `memory working set` to leave a handoff."
+            )
+        })
+    } else {
+        None
+    }
 }
 
 /// Resolve a user-supplied `--id` argument for move/copy subcommands through
@@ -1123,6 +1250,90 @@ fn empty_to_none(s: &str) -> Option<&str> {
     }
 }
 
+fn resolve_working_project(
+    explicit: Option<String>,
+    cwd_project: Option<&str>,
+) -> Result<String, MemoryError> {
+    let project = explicit
+        .or_else(|| cwd_project.map(str::to_string))
+        .ok_or_else(|| {
+            MemoryError::Config(
+                "WorkingContext requires a project ident; run from a project or pass --project"
+                    .to_string(),
+            )
+        })?;
+
+    if project.trim().is_empty() {
+        return Err(MemoryError::Config(
+            "WorkingContext requires a non-empty project ident".to_string(),
+        ));
+    }
+    if project == GLOBAL_PROJECT_IDENT {
+        return Err(MemoryError::Config(format!(
+            "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories; \
+             WorkingContext is per-project only"
+        )));
+    }
+
+    Ok(project)
+}
+
+fn read_working_content(
+    content: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<String, MemoryError> {
+    match (content, file) {
+        (Some(_), Some(_)) => Err(MemoryError::Config(
+            "`memory working set` accepts either inline content or --file, not both".to_string(),
+        )),
+        (Some(raw), None) if raw == "-" => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+        (Some(raw), None) => Ok(raw),
+        (None, Some(path)) => Ok(std::fs::read_to_string(path)?),
+        (None, None) => Err(MemoryError::Config(
+            "`memory working set` requires content, '-' for stdin, or --file PATH".to_string(),
+        )),
+    }
+}
+
+fn working_context_move_preview(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<&'static str, MemoryError> {
+    let Some(from) = from else {
+        return Ok("none");
+    };
+    if from == GLOBAL_PROJECT_IDENT || queries::get_working_context(conn, from)?.is_none() {
+        return Ok("none");
+    }
+
+    match to {
+        Some(target) if target == from => Ok("none"),
+        Some(target) if queries::get_working_context(conn, target)?.is_some() => {
+            Ok("target_exists")
+        }
+        Some(_) => Ok("would_move"),
+        None => Ok("would_delete"),
+    }
+}
+
+fn move_working_context_for_project_move(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<queries::WorkingContextProjectMove, MemoryError> {
+    match from {
+        Some(project) if project != GLOBAL_PROJECT_IDENT => {
+            queries::move_working_context_project(conn, project, to)
+        }
+        _ => Ok(queries::WorkingContextProjectMove::None),
+    }
+}
+
 /// Execute a `memory move` and print a light-XML `<result>` line.
 ///
 /// `id` may be `None` (use `from`), `Some(full_uuid)`, or `Some("")` — the
@@ -1167,19 +1378,23 @@ fn run_move(
             let from_opt = empty_to_none(from);
             if dry_run {
                 let mems = queries::list_memories_by_project(conn, from_opt)?;
+                let working_context = working_context_move_preview(conn, from_opt, to)?;
                 let mut attrs: Vec<(&str, String)> = vec![
                     ("would_move", mems.len().to_string()),
                     ("from_project", from_opt.unwrap_or("").to_string()),
+                    ("working_context", working_context.to_string()),
                 ];
                 if let Some(t) = to {
                     attrs.push(("to_project", t.to_string()));
                 }
                 println!("{}", render::render_action_result("dry_run", &attrs));
             } else {
+                let working_context = move_working_context_for_project_move(conn, from_opt, to)?;
                 let count = queries::move_memories_by_project(conn, from_opt, to)?;
                 let mut attrs: Vec<(&str, String)> = vec![
                     ("count", count.to_string()),
                     ("from_project", from_opt.unwrap_or("").to_string()),
+                    ("working_context", working_context.as_str().to_string()),
                 ];
                 if let Some(t) = to {
                     attrs.push(("to_project", t.to_string()));
@@ -1378,6 +1593,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_working_get_project() {
+        let cli =
+            Cli::try_parse_from(["memory", "working", "get", "--project", "agent-memory"]).unwrap();
+        match cli {
+            Cli::Working {
+                command: WorkingCommands::Get { project },
+            } => assert_eq!(project.as_deref(), Some("agent-memory")),
+            _ => panic!("expected Working::Get variant"),
+        }
+    }
+
+    #[test]
+    fn parse_working_set_stdin() {
+        let cli =
+            Cli::try_parse_from(["memory", "working", "set", "-", "-p", "agent-memory"]).unwrap();
+        match cli {
+            Cli::Working {
+                command:
+                    WorkingCommands::Set {
+                        content,
+                        file,
+                        project,
+                    },
+            } => {
+                assert_eq!(content.as_deref(), Some("-"));
+                assert!(file.is_none());
+                assert_eq!(project.as_deref(), Some("agent-memory"));
+            }
+            _ => panic!("expected Working::Set variant"),
+        }
+    }
+
+    #[test]
+    fn parse_working_clear_project() {
+        let cli =
+            Cli::try_parse_from(["memory", "working", "clear", "-p", "agent-memory"]).unwrap();
+        match cli {
+            Cli::Working {
+                command: WorkingCommands::Clear { project },
+            } => assert_eq!(project.as_deref(), Some("agent-memory")),
+            _ => panic!("expected Working::Clear variant"),
+        }
+    }
+
     /// `resolve_boosts` with the normal path returns both current-project and
     /// global sentinel wired up with their respective multipliers.
     #[test]
@@ -1411,7 +1671,8 @@ mod tests {
     /// and suppress the zero-global reflection prompt.
     #[test]
     fn results_hint_global_present_emits_directive_count() {
-        let h = results_hint(0, 2, 5, Some("agent-memory"), "what does the project do").expect("hint should be present");
+        let h = results_hint(0, 2, 5, Some("agent-memory"), "what does the project do")
+            .expect("hint should be present");
         assert!(h.contains("2 of 5 results are global-scope preferences"));
         assert!(!h.contains("No global-scope preferences matched"));
     }
@@ -1446,9 +1707,24 @@ mod tests {
     /// — universal preferences are always worth flagging.
     #[test]
     fn results_hint_flat_ranking_with_globals_surfaces_count() {
-        let h =
-            results_hint(0, 1, 3, None, "ramp up notes").expect("hint should be present");
+        let h = results_hint(0, 1, 3, None, "ramp up notes").expect("hint should be present");
         assert!(h.contains("global-scope preferences"));
+    }
+
+    #[test]
+    fn working_absence_hint_only_for_context_with_project() {
+        let h = working_absence_hint(Some("agent-memory"), None, true).expect("hint");
+        assert!(h.contains("No WorkingContext is set for project 'agent-memory'"));
+        assert!(working_absence_hint(Some("agent-memory"), None, false).is_none());
+        assert!(working_absence_hint(None, None, true).is_none());
+
+        let ctx = WorkingContext {
+            project: "agent-memory".to_string(),
+            content: "handoff".to_string(),
+            version: 1,
+            updated_at: "2026-05-18T15:00:00Z".to_string(),
+        };
+        assert!(working_absence_hint(Some("agent-memory"), Some(&ctx), true).is_none());
     }
 
     /// `store_scope_hint` mentions both `--scope global` and the silent
@@ -1481,8 +1757,14 @@ mod tests {
     /// nudge — false positives degrade the signal.
     #[test]
     fn canonical_state_hint_silent_on_unrelated_query() {
-        let h = results_hint(0, 1, 3, Some("agent-memory"), "how does the embedding cache work")
-            .expect("hint should be present");
+        let h = results_hint(
+            0,
+            1,
+            3,
+            Some("agent-memory"),
+            "how does the embedding cache work",
+        )
+        .expect("hint should be present");
         assert!(!h.contains("git/version/release lookup"));
     }
 

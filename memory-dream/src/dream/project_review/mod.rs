@@ -512,10 +512,7 @@ fn apply_decisions(
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     for mem in batch {
-        let decision = decisions
-            .get(&mem.id)
-            .cloned()
-            .unwrap_or(Decision::Keep);
+        let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
 
         match decision {
             Decision::Keep => {
@@ -544,7 +541,11 @@ fn apply_decisions(
                 println!(
                     "{}",
                     render::render_action_result(
-                        if apply { "review_drop" } else { "review_would_drop" },
+                        if apply {
+                            "review_drop"
+                        } else {
+                            "review_would_drop"
+                        },
                         &[
                             ("id", render::short_id(&mem.id).to_string()),
                             ("project", project_label.to_string()),
@@ -565,7 +566,11 @@ fn apply_decisions(
                 println!(
                     "{}",
                     render::render_action_result(
-                        if apply { "review_merge" } else { "review_would_merge" },
+                        if apply {
+                            "review_merge"
+                        } else {
+                            "review_would_merge"
+                        },
                         &[
                             ("id", render::short_id(&mem.id).to_string()),
                             ("target", render::short_id(&target_id).to_string()),
@@ -750,9 +755,7 @@ mod tests {
     #[test]
     fn parse_merge_into_dangling_target_downgrades_to_keep() {
         // Target id "zzz" isn't in the batch → merge must downgrade.
-        let batch = vec![
-            mk_memory("aaa", "first", &["t1"], "2026-04-20T00:00:00Z"),
-        ];
+        let batch = vec![mk_memory("aaa", "first", &["t1"], "2026-04-20T00:00:00Z")];
         let raw = r#"{
             "decisions": {
                 "aaa": {"action": "merge_into", "target_id": "zzz"}

@@ -2,7 +2,7 @@
 name: remember
 description: Store a memory for future retrieval. Use when the user says "remember this", wants to save context, preferences, decisions, or any information that should persist across conversations.
 argument-hint: "[memory text or description of what to remember]"
-allowed-tools: mcp__agent-memory__memory_store, mcp__agent-memory__memory_search
+allowed-tools: mcp__agent-memory__memory_store, mcp__agent-memory__memory_search, mcp__agent-memory__memory_working_set
 ---
 
 The user wants to store a memory. The input is:
@@ -13,6 +13,7 @@ Your job:
 1. Parse the input to determine what should be stored
 2. Apply the memory quality gate:
    - Store only information that will help a future agent work faster: reusable patterns, operational procedures, user preferences, non-obvious constraints, failure causes, or "how to / why" guidance.
+   - Use `memory_working_set` instead when the content is transient active-project handoff rather than durable knowledge.
    - Write for a cold agent who has not seen this session: explain what to do next, which tool or system to use, and why that path is correct.
    - Do not store facts recoverable from git history, repository inspection, CI/release systems, or agent-tools tasks/comms.
    - Do not store routine deployment status, version numbers, release events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed version X" memories.

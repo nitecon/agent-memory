@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 
-use crate::db::models::{blob_to_embedding, embedding_to_blob, Memory};
+use crate::db::models::{blob_to_embedding, embedding_to_blob, Memory, WorkingContext};
 use crate::error::MemoryError;
 
 /// Minimum length accepted by [`resolve_id_prefix`].
@@ -10,6 +10,8 @@ use crate::error::MemoryError;
 /// rare. Shorter prefixes are rejected with `MemoryError::Config` so callers
 /// don't accidentally trigger massive candidate-list returns on 2-char input.
 pub const MIN_ID_PREFIX_LEN: usize = 4;
+pub const WORKING_CONTEXT_MAX_CHARS: usize = 65_536;
+pub const GLOBAL_PROJECT_IDENT: &str = "__global__";
 
 /// Column list used by every SELECT that materializes a full [`Memory`].
 ///
@@ -57,6 +59,40 @@ fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         condenser_version: row.get(13)?,
         embedding_model: row.get(14)?,
     })
+}
+
+fn map_working_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkingContext> {
+    Ok(WorkingContext {
+        project: row.get(0)?,
+        content: row.get(1)?,
+        version: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn validate_working_project(project: &str) -> Result<(), MemoryError> {
+    if project.trim().is_empty() {
+        return Err(MemoryError::Config(
+            "WorkingContext requires a non-empty project ident".to_string(),
+        ));
+    }
+    if project == GLOBAL_PROJECT_IDENT {
+        return Err(MemoryError::Config(format!(
+            "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories; \
+             WorkingContext is per-project only"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_working_content(content: &str) -> Result<(), MemoryError> {
+    let len = content.chars().count();
+    if len > WORKING_CONTEXT_MAX_CHARS {
+        return Err(MemoryError::Config(format!(
+            "WorkingContext content is {len} characters; maximum is {WORKING_CONTEXT_MAX_CHARS}"
+        )));
+    }
+    Ok(())
 }
 
 /// Result of a short-ID prefix lookup.
@@ -165,6 +201,123 @@ pub fn insert_memory(conn: &Connection, memory: &Memory) -> Result<(), MemoryErr
         ],
     )?;
     Ok(())
+}
+
+pub fn get_working_context(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<WorkingContext>, MemoryError> {
+    validate_working_project(project)?;
+    let res = conn.query_row(
+        "SELECT project, content, version, updated_at
+         FROM project_working_context
+         WHERE project = ?1",
+        params![project],
+        map_working_context_row,
+    );
+    match res {
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+pub fn set_working_context(
+    conn: &Connection,
+    project: &str,
+    content: &str,
+) -> Result<WorkingContext, MemoryError> {
+    validate_working_project(project)?;
+    validate_working_content(content)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO project_working_context (project, content, version, updated_at)
+         VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(project) DO UPDATE SET
+             content = excluded.content,
+             version = project_working_context.version + 1,
+             updated_at = excluded.updated_at",
+        params![project, content, now],
+    )?;
+
+    get_working_context(conn, project)?.ok_or_else(|| {
+        MemoryError::NotFound(format!(
+            "WorkingContext for project {project} not found after set"
+        ))
+    })
+}
+
+pub fn clear_working_context(conn: &Connection, project: &str) -> Result<bool, MemoryError> {
+    validate_working_project(project)?;
+    let changed = conn.execute(
+        "DELETE FROM project_working_context WHERE project = ?1",
+        params![project],
+    )?;
+    Ok(changed > 0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingContextProjectMove {
+    None,
+    Moved,
+    Deleted,
+}
+
+impl WorkingContextProjectMove {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Moved => "moved",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+/// Reassign the WorkingContext row for a project-wide memory move.
+///
+/// WorkingContext is project-only, so moving a project to the unscoped/NULL
+/// bucket deletes the source row rather than leaving an unreachable handoff.
+pub fn move_working_context_project(
+    conn: &Connection,
+    from: &str,
+    new_project: Option<&str>,
+) -> Result<WorkingContextProjectMove, MemoryError> {
+    validate_working_project(from)?;
+    if let Some(to) = new_project {
+        validate_working_project(to)?;
+    }
+
+    if get_working_context(conn, from)?.is_none() {
+        return Ok(WorkingContextProjectMove::None);
+    }
+
+    match new_project {
+        Some(to) => {
+            if to == from {
+                return Ok(WorkingContextProjectMove::None);
+            }
+            if get_working_context(conn, to)?.is_some() {
+                return Err(MemoryError::Config(format!(
+                    "WorkingContext already exists for target project `{to}`; \
+                     clear it before moving `{from}`"
+                )));
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE project_working_context
+                 SET project = ?1, version = version + 1, updated_at = ?2
+                 WHERE project = ?3",
+                params![to, now, from],
+            )?;
+            Ok(WorkingContextProjectMove::Moved)
+        }
+        None => {
+            clear_working_context(conn, from)?;
+            Ok(WorkingContextProjectMove::Deleted)
+        }
+    }
 }
 
 pub fn get_memory_by_id(conn: &Connection, id: &str) -> Result<Memory, MemoryError> {
@@ -1218,6 +1371,190 @@ mod resolve_id_tests {
         );
         // Null-project state does not leak to a named project key.
         assert!(get_last_dream_at(&conn, Some("other")).unwrap().is_none());
+    }
+
+    #[test]
+    fn working_context_round_trip_replace_and_clear_delete() {
+        let conn = fresh_db();
+        assert!(get_working_context(&conn, "agent-memory")
+            .unwrap()
+            .is_none());
+
+        let first = set_working_context(&conn, "agent-memory", "first handoff").unwrap();
+        assert_eq!(first.project, "agent-memory");
+        assert_eq!(first.content, "first handoff");
+        assert_eq!(first.version, 1);
+
+        let second = set_working_context(&conn, "agent-memory", "updated handoff").unwrap();
+        assert_eq!(second.content, "updated handoff");
+        assert_eq!(second.version, 2);
+
+        assert!(clear_working_context(&conn, "agent-memory").unwrap());
+        assert!(get_working_context(&conn, "agent-memory")
+            .unwrap()
+            .is_none());
+        assert!(!clear_working_context(&conn, "agent-memory").unwrap());
+
+        let after_clear = set_working_context(&conn, "agent-memory", "new handoff").unwrap();
+        assert_eq!(after_clear.version, 1);
+    }
+
+    #[test]
+    fn working_context_project_move_transfers_row() {
+        let conn = fresh_db();
+        set_working_context(&conn, "legacy-project", "current handoff").unwrap();
+
+        let action =
+            move_working_context_project(&conn, "legacy-project", Some("agent-memory")).unwrap();
+        assert_eq!(action, WorkingContextProjectMove::Moved);
+
+        assert!(get_working_context(&conn, "legacy-project")
+            .unwrap()
+            .is_none());
+        let moved = get_working_context(&conn, "agent-memory")
+            .unwrap()
+            .expect("moved working context");
+        assert_eq!(moved.project, "agent-memory");
+        assert_eq!(moved.content, "current handoff");
+        assert_eq!(moved.version, 2);
+    }
+
+    #[test]
+    fn working_context_project_move_deletes_when_target_is_unscoped() {
+        let conn = fresh_db();
+        set_working_context(&conn, "legacy-project", "current handoff").unwrap();
+
+        let action = move_working_context_project(&conn, "legacy-project", None).unwrap();
+        assert_eq!(action, WorkingContextProjectMove::Deleted);
+        assert!(get_working_context(&conn, "legacy-project")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn working_context_project_move_rejects_existing_target() {
+        let conn = fresh_db();
+        set_working_context(&conn, "legacy-project", "old handoff").unwrap();
+        set_working_context(&conn, "agent-memory", "target handoff").unwrap();
+
+        let err = move_working_context_project(&conn, "legacy-project", Some("agent-memory"))
+            .expect_err("target conflict rejected");
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(
+            get_working_context(&conn, "legacy-project")
+                .unwrap()
+                .expect("source retained")
+                .content,
+            "old handoff"
+        );
+        assert_eq!(
+            get_working_context(&conn, "agent-memory")
+                .unwrap()
+                .expect("target retained")
+                .content,
+            "target handoff"
+        );
+    }
+
+    #[test]
+    fn working_context_project_move_rejects_global_target() {
+        let conn = fresh_db();
+        set_working_context(&conn, "legacy-project", "old handoff").unwrap();
+
+        let err = move_working_context_project(&conn, "legacy-project", Some(GLOBAL_PROJECT_IDENT))
+            .expect_err("global target rejected");
+        assert!(err.to_string().contains("per-project only"));
+        assert!(get_working_context(&conn, "legacy-project")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn working_context_project_move_returns_none_without_source_or_same_target() {
+        let conn = fresh_db();
+        assert_eq!(
+            move_working_context_project(&conn, "missing-project", Some("agent-memory")).unwrap(),
+            WorkingContextProjectMove::None
+        );
+
+        set_working_context(&conn, "agent-memory", "handoff").unwrap();
+        assert_eq!(
+            move_working_context_project(&conn, "agent-memory", Some("agent-memory")).unwrap(),
+            WorkingContextProjectMove::None
+        );
+        assert_eq!(
+            get_working_context(&conn, "agent-memory")
+                .unwrap()
+                .expect("retained")
+                .version,
+            1
+        );
+    }
+
+    #[test]
+    fn working_context_is_project_isolated() {
+        let conn = fresh_db();
+        set_working_context(&conn, "agent-memory", "memory work").unwrap();
+        set_working_context(&conn, "agent-tools", "tools work").unwrap();
+
+        let memory = get_working_context(&conn, "agent-memory")
+            .unwrap()
+            .expect("agent-memory context");
+        let tools = get_working_context(&conn, "agent-tools")
+            .unwrap()
+            .expect("agent-tools context");
+
+        assert_eq!(memory.content, "memory work");
+        assert_eq!(tools.content, "tools work");
+    }
+
+    #[test]
+    fn working_context_rejects_invalid_projects() {
+        let conn = fresh_db();
+        let global = set_working_context(&conn, GLOBAL_PROJECT_IDENT, "handoff")
+            .expect_err("global sentinel rejected");
+        assert!(global.to_string().contains("per-project only"));
+
+        let empty = set_working_context(&conn, "", "handoff").expect_err("empty rejected");
+        assert!(empty.to_string().contains("non-empty project"));
+    }
+
+    #[test]
+    fn working_context_enforces_character_cap() {
+        let conn = fresh_db();
+        let at_limit = "x".repeat(WORKING_CONTEXT_MAX_CHARS);
+        set_working_context(&conn, "agent-memory", &at_limit).expect("limit accepted");
+
+        let too_long = "x".repeat(WORKING_CONTEXT_MAX_CHARS + 1);
+        let err =
+            set_working_context(&conn, "agent-memory", &too_long).expect_err("over limit rejected");
+        assert!(err.to_string().contains("maximum is 65536"));
+    }
+
+    #[test]
+    fn working_context_db_constraints_reject_null_global_and_too_large() {
+        let conn = fresh_db();
+        let null_project = conn.execute(
+            "INSERT INTO project_working_context (project, content, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![Option::<String>::None, "body", "2026-01-01T00:00:00Z"],
+        );
+        assert!(null_project.is_err());
+
+        let global_project = conn.execute(
+            "INSERT INTO project_working_context (project, content, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![GLOBAL_PROJECT_IDENT, "body", "2026-01-01T00:00:00Z"],
+        );
+        assert!(global_project.is_err());
+
+        let too_long = "x".repeat(WORKING_CONTEXT_MAX_CHARS + 1);
+        let too_large = conn.execute(
+            "INSERT INTO project_working_context (project, content, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params!["agent-memory", too_long, "2026-01-01T00:00:00Z"],
+        );
+        assert!(too_large.is_err());
     }
 
     #[test]

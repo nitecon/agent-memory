@@ -47,6 +47,14 @@ pub struct Memory {
     pub embedding_model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingContext {
+    pub project: String,
+    pub content: String,
+    pub version: i64,
+    pub updated_at: String,
+}
+
 impl Memory {
     pub fn new(
         content: String,

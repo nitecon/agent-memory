@@ -115,6 +115,13 @@ suspect a relevant preference exists, ask before acting. After functionality
 changes, search/update/store reusable non-obvious learning that passes the
 quality gate.
 
+### WorkingContext (per-project handoff)
+
+- `memory context` renders the current project's WorkingContext before
+  project_memories. Treat it as the authoritative handoff state.
+- Use `memory working set` when pausing substantial active work; `memory working clear`
+  when the project thread completes. Durable lessons still go through `memory store`.
+
 ### Rule B — Post-action scope classification (MANDATORY)
 
 If the user stated or implied any directive, preference, or corrective rule
@@ -927,6 +934,41 @@ mod tests {
         assert!(
             b.contains("MUST ask"),
             "Rule B must include the mandatory-ask clause for ambiguous phrasing"
+        );
+    }
+
+    #[test]
+    fn build_block_documents_working_context_tersely() {
+        let b = build_block();
+        assert!(
+            b.contains("WorkingContext (per-project handoff)"),
+            "block must include terse WorkingContext guidance"
+        );
+        assert!(
+            b.contains("memory working set"),
+            "block must mention the set command"
+        );
+        assert!(
+            b.contains("memory working clear"),
+            "block must mention the clear command"
+        );
+        assert!(
+            b.contains("authoritative handoff state"),
+            "block must explain how agents should treat WorkingContext"
+        );
+
+        let section = b
+            .split("### WorkingContext (per-project handoff)")
+            .nth(1)
+            .and_then(|tail| tail.split("### Rule B").next())
+            .expect("WorkingContext section");
+        let non_empty_lines = section
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert!(
+            non_empty_lines <= 5,
+            "WorkingContext setup guidance should stay terse, got {non_empty_lines} lines:\n{section}"
         );
     }
 

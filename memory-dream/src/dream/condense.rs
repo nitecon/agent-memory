@@ -132,10 +132,7 @@ fn detect_refusal(raw: &str) -> Option<&'static str> {
 ///   time).
 ///
 /// Returns a [`Decision`] on success.
-pub fn parse_response(
-    raw_response: &str,
-    baseline_input: &str,
-) -> Result<Decision, CondenseError> {
+pub fn parse_response(raw_response: &str, baseline_input: &str) -> Result<Decision, CondenseError> {
     let body = strip_code_fence(raw_response).trim();
     if body.is_empty() {
         return Err(CondenseError::ParseFailed(
@@ -229,10 +226,7 @@ pub fn run_per_memory(
     // (i.e. this memory has been condensed before) so re-condensations
     // can't chain +REWRITE_CHAR_SLACK each pass. Falls back to the current
     // content for first-time dreams where content_raw is still NULL.
-    let baseline = source
-        .content_raw
-        .as_deref()
-        .unwrap_or(&source.content);
+    let baseline = source.content_raw.as_deref().unwrap_or(&source.content);
     parse_response(&response, baseline)
 }
 
@@ -357,8 +351,7 @@ mod tests {
         // One char past the slack ceiling must still be rejected so the
         // corpus can't drift indefinitely.
         let raw = "abcdefghij"; // 10 chars
-        let over_by_one: String =
-            std::iter::repeat_n('x', 10 + REWRITE_CHAR_SLACK + 1).collect();
+        let over_by_one: String = std::iter::repeat_n('x', 10 + REWRITE_CHAR_SLACK + 1).collect();
         let err = parse_response(&over_by_one, raw).unwrap_err();
         assert!(matches!(err, CondenseError::TooLong { .. }));
     }

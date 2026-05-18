@@ -58,7 +58,13 @@ fn tmp_cache() -> std::path::PathBuf {
 fn dropped_memories_are_deleted_in_apply_mode() {
     let mut conn = open_mem_db();
     let id = "aaaaaaaa-0000-1111-2222-000000000001";
-    let mem = insert(&conn, id, "ndesign v0.1.0 shipped", "ndesign", &["milestone"]);
+    let mem = insert(
+        &conn,
+        id,
+        "ndesign v0.1.0 shipped",
+        "ndesign",
+        &["milestone"],
+    );
 
     let canned = format!(
         r#"{{"decisions": {{"{id}": {{"action": "drop"}}}}}}"#,

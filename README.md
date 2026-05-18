@@ -78,6 +78,30 @@ This means on a shared Linux/macOS machine, all agents share `/opt/agentic/memor
 
 Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command — it bundles an interactive checklist that injects the rules block into your agent rule files and installs a Claude Code skill that auto-advertises the CLI to every session.
 
+### WorkingContext handoff
+
+WorkingContext is transient per-project handoff state. `memory context` renders
+the current project's WorkingContext before ranked memories; durable lessons
+still belong in `memory store`.
+
+```bash
+# Read the current handoff; absent state is present="false".
+memory working get
+
+# Replace the handoff. Use "-" for multiline stdin.
+memory working set "Current state and exact next step"
+memory working set - < handoff.md
+
+# Delete the handoff when the project thread completes.
+memory working clear
+```
+
+WorkingContext is project-only, rejects `__global__`, and is capped at 65,536
+characters so every future `memory context` call stays bounded.
+Project-wide `memory move --from X --to Y` transfers the handoff to `Y`;
+moving to an empty target clears it. `memory copy` does not duplicate
+WorkingContext, and `memory projects` lists durable-memory projects only.
+
 ### Auto-install the agent protocol
 
 `memory setup` is now a small subcommand family:

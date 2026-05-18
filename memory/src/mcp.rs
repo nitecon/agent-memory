@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::db::models::Memory;
+use crate::db::models::{Memory, WorkingContext};
 use crate::db::queries::{self, ResolvedId};
 use crate::embedding;
 use crate::error::MemoryError;
@@ -116,6 +116,26 @@ pub struct ContextArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkingGetArgs {
+    /// Project identifier. Defaults to the cwd-derived project ident if omitted.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkingSetArgs {
+    /// WorkingContext body to set for the project.
+    pub content: String,
+    /// Project identifier. Defaults to the cwd-derived project ident if omitted.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkingClearArgs {
+    /// Project identifier. Defaults to the cwd-derived project ident if omitted.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetArgs {
     /// Memory IDs to fetch (full UUIDs or 4+ char short prefixes).
     pub ids: Vec<String>,
@@ -163,6 +183,31 @@ impl MemoryServer {
     /// MCP-specific concept.
     fn err_xml(e: MemoryError) -> String {
         render::render_action_result("error", &[("message", e.to_string())])
+    }
+
+    fn resolve_working_project(explicit: Option<String>) -> Result<String, MemoryError> {
+        let project = explicit
+            .or_else(|| project::project_ident_from_cwd().ok())
+            .ok_or_else(|| {
+                MemoryError::Config(
+                    "WorkingContext requires a project ident; run from a project or pass project"
+                        .to_string(),
+                )
+            })?;
+
+        if project.trim().is_empty() {
+            return Err(MemoryError::Config(
+                "WorkingContext requires a non-empty project ident".to_string(),
+            ));
+        }
+        if project == GLOBAL_PROJECT_IDENT {
+            return Err(MemoryError::Config(format!(
+                "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories; \
+                 WorkingContext is per-project only"
+            )));
+        }
+
+        Ok(project)
     }
 }
 
@@ -265,7 +310,7 @@ impl MemoryServer {
                 Err(e) => return Self::err_xml(e),
             };
 
-        render_ranked_xml(&results, boosts.current_project)
+        render_ranked_xml(&results, boosts.current_project, None, false)
     }
 
     /// Filter memories by project, agent, tags, or memory type. Use for structured retrieval
@@ -410,7 +455,79 @@ impl MemoryServer {
             Err(e) => return Self::err_xml(e),
         };
 
-        render_ranked_xml(&results, boosts.current_project)
+        let working_context = match boosts.current_project {
+            Some(project) => match queries::get_working_context(&conn, project) {
+                Ok(ctx) => ctx,
+                Err(e) => return Self::err_xml(e),
+            },
+            None => None,
+        };
+
+        render_ranked_xml(
+            &results,
+            boosts.current_project,
+            working_context.as_ref(),
+            true,
+        )
+    }
+
+    /// Return the current project's WorkingContext handoff. The response always succeeds for a
+    /// valid project: present="true" includes full content, present="false" means no handoff row
+    /// exists.
+    #[tool(name = "memory_working_get")]
+    fn working_get(&self, Parameters(args): Parameters<WorkingGetArgs>) -> String {
+        let project = match Self::resolve_working_project(args.project) {
+            Ok(project) => project,
+            Err(e) => return Self::err_xml(e),
+        };
+
+        let conn = self.conn.lock().unwrap();
+        match queries::get_working_context(&conn, &project) {
+            Ok(ctx) => render::render_working_context(ctx.as_ref(), &project),
+            Err(e) => Self::err_xml(e),
+        }
+    }
+
+    /// Replace the current project's WorkingContext handoff. The content limit is 65,536
+    /// characters.
+    #[tool(name = "memory_working_set")]
+    fn working_set(&self, Parameters(args): Parameters<WorkingSetArgs>) -> String {
+        let project = match Self::resolve_working_project(args.project) {
+            Ok(project) => project,
+            Err(e) => return Self::err_xml(e),
+        };
+
+        let conn = self.conn.lock().unwrap();
+        match queries::set_working_context(&conn, &project, &args.content) {
+            Ok(ctx) => render::render_action_result(
+                "working_context_set",
+                &[
+                    ("project", ctx.project),
+                    ("version", ctx.version.to_string()),
+                    ("updated_at", ctx.updated_at),
+                ],
+            ),
+            Err(e) => Self::err_xml(e),
+        }
+    }
+
+    /// Clear the current project's WorkingContext handoff by deleting the row. Idempotent when no
+    /// row exists.
+    #[tool(name = "memory_working_clear")]
+    fn working_clear(&self, Parameters(args): Parameters<WorkingClearArgs>) -> String {
+        let project = match Self::resolve_working_project(args.project) {
+            Ok(project) => project,
+            Err(e) => return Self::err_xml(e),
+        };
+
+        let conn = self.conn.lock().unwrap();
+        match queries::clear_working_context(&conn, &project) {
+            Ok(deleted) => render::render_action_result(
+                "working_context_cleared",
+                &[("project", project), ("deleted", deleted.to_string())],
+            ),
+            Err(e) => Self::err_xml(e),
+        }
     }
 
     /// Fetch full content for one or more memory IDs. Each ID can be a full UUID or a 4+ char
@@ -464,8 +581,9 @@ impl MemoryServer {
     /// Reassign the project ident on one or more memories. Use this to migrate memories
     /// tagged under a legacy project name to the canonical git-remote ident the cwd resolver
     /// returns now. Pass `id` for a single memory (full UUID or short prefix) or `from` to
-    /// bulk-rename. Empty strings on `from`/`to` target or assign a NULL project. Set
-    /// `dry_run: true` to preview without writing.
+    /// bulk-rename. A project-wide move transfers that project's WorkingContext to the target;
+    /// moving to an empty target clears it. Empty strings on `from`/`to` target or assign a
+    /// NULL project. Set `dry_run: true` to preview without writing.
     #[tool(name = "memory_move")]
     fn move_tool(&self, Parameters(args): Parameters<MoveArgs>) -> String {
         // Mirror the CLI guard: reassigning into the global sentinel via
@@ -512,7 +630,8 @@ impl MemoryServer {
         )
     }
 
-    /// Duplicate one or more memories under a new project ident. Preserves content, tags,
+    /// Duplicate one or more memories under a new project ident. WorkingContext is not copied.
+    /// Preserves content, tags,
     /// agent, source_file, memory_type, and the cached embedding; a new UUID is minted and
     /// timestamps reset. Pass `id` for a single memory (full UUID or short prefix) or `from`
     /// to bulk-copy. Empty strings on `from`/`to` target or assign a NULL project. Set
@@ -546,8 +665,8 @@ impl MemoryServer {
         )
     }
 
-    /// List distinct project idents with memory counts. Useful for spotting alias mismatches
-    /// before running memory_move. The current cwd-derived project is marked with `*`.
+    /// List distinct durable-memory project idents with memory counts. Useful for spotting alias
+    /// mismatches before running memory_move. The current cwd-derived project is marked with `*`.
     /// Returns a <projects count=".."/> light-XML block.
     #[tool(name = "memory_projects")]
     fn projects(&self) -> String {
@@ -566,6 +685,41 @@ fn empty_to_none_owned(s: &str) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+fn working_context_move_preview(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<&'static str, MemoryError> {
+    let Some(from) = from else {
+        return Ok("none");
+    };
+    if from == GLOBAL_PROJECT_IDENT || queries::get_working_context(conn, from)?.is_none() {
+        return Ok("none");
+    }
+
+    match to {
+        Some(target) if target == from => Ok("none"),
+        Some(target) if queries::get_working_context(conn, target)?.is_some() => {
+            Ok("target_exists")
+        }
+        Some(_) => Ok("would_move"),
+        None => Ok("would_delete"),
+    }
+}
+
+fn move_working_context_for_project_move(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<queries::WorkingContextProjectMove, MemoryError> {
+    match from {
+        Some(project) if project != GLOBAL_PROJECT_IDENT => {
+            queries::move_working_context_project(conn, project, to)
+        }
+        _ => Ok(queries::WorkingContextProjectMove::None),
     }
 }
 
@@ -618,9 +772,15 @@ fn run_move(
             if dry_run {
                 match queries::list_memories_by_project(conn, from_opt) {
                     Ok(mems) => {
+                        let working_context = match working_context_move_preview(conn, from_opt, to)
+                        {
+                            Ok(state) => state,
+                            Err(e) => return MemoryServer::err_xml(e),
+                        };
                         let mut attrs: Vec<(&str, String)> = vec![
                             ("would_move", mems.len().to_string()),
                             ("from_project", from_opt.unwrap_or("").to_string()),
+                            ("working_context", working_context.to_string()),
                         ];
                         if let Some(t) = to {
                             attrs.push(("to_project", t.to_string()));
@@ -630,11 +790,17 @@ fn run_move(
                     Err(e) => MemoryServer::err_xml(e),
                 }
             } else {
+                let working_context =
+                    match move_working_context_for_project_move(conn, from_opt, to) {
+                        Ok(state) => state,
+                        Err(e) => return MemoryServer::err_xml(e),
+                    };
                 match queries::move_memories_by_project(conn, from_opt, to) {
                     Ok(count) => {
                         let mut attrs: Vec<(&str, String)> = vec![
                             ("count", count.to_string()),
                             ("from_project", from_opt.unwrap_or("").to_string()),
+                            ("working_context", working_context.as_str().to_string()),
                         ];
                         if let Some(t) = to {
                             attrs.push(("to_project", t.to_string()));
@@ -778,7 +944,12 @@ fn resolve_boosts<'a>(
 /// Also appends the `<usage>` legend at the bottom so MCP callers get the
 /// same short-ID / section-tag guidance the CLI emits — ships unconditionally
 /// (even on zero-result runs) because that's when new callers need it most.
-fn render_ranked_xml(results: &[SearchResult], current_project: Option<&str>) -> String {
+fn render_ranked_xml(
+    results: &[SearchResult],
+    current_project: Option<&str>,
+    working_context: Option<&WorkingContext>,
+    include_working_absence_hint: bool,
+) -> String {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
     let cross = if current_project.is_some() {
@@ -786,14 +957,47 @@ fn render_ranked_xml(results: &[SearchResult], current_project: Option<&str>) ->
     } else {
         0
     };
-    let hint = results_hint(cross, globals, total, current_project);
-    let rendered = render::render_search_results(results, current_project, hint.as_deref());
+    let hint = combine_hints(
+        results_hint(cross, globals, total, current_project),
+        working_absence_hint(
+            current_project,
+            working_context,
+            include_working_absence_hint,
+        ),
+    );
+    let rendered =
+        render::render_search_results(results, current_project, working_context, hint.as_deref());
     let body = if rendered.is_empty() {
         "<results count=\"0\"/>".to_string()
     } else {
         rendered
     };
     format!("{body}\n{}", render::render_usage_legend())
+}
+
+fn combine_hints(primary: Option<String>, secondary: Option<String>) -> Option<String> {
+    match (primary, secondary) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn working_absence_hint(
+    current_project: Option<&str>,
+    working_context: Option<&WorkingContext>,
+    include: bool,
+) -> Option<String> {
+    if include && working_context.is_none() {
+        current_project.map(|project| {
+            format!(
+                "No WorkingContext is set for project '{project}'. If pausing substantial active work, use memory_working_set to leave a handoff."
+            )
+        })
+    } else {
+        None
+    }
 }
 
 /// See `crate::cli::results_hint` for the full doc; kept in sync verbatim.
@@ -837,6 +1041,134 @@ fn results_hint(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use std::path::PathBuf;
+
+    fn test_server() -> MemoryServer {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        run_migrations(&conn).expect("migrate");
+        MemoryServer::new(
+            Config {
+                data_dir: PathBuf::from("/tmp/agent-memory-test"),
+                db_path: PathBuf::from("/tmp/agent-memory-test/memory.db"),
+                model_cache_dir: PathBuf::from("/tmp/agent-memory-test/models"),
+            },
+            conn,
+        )
+    }
+
+    #[test]
+    fn working_get_absent_returns_present_false() {
+        let server = test_server();
+        let out = server.working_get(Parameters(WorkingGetArgs {
+            project: Some("agent-memory".to_string()),
+        }));
+        assert_eq!(
+            out,
+            r#"<working_context project="agent-memory" present="false"/>"#
+        );
+    }
+
+    #[test]
+    fn working_set_get_clear_round_trip() {
+        let server = test_server();
+        let set = server.working_set(Parameters(WorkingSetArgs {
+            project: Some("agent-memory".to_string()),
+            content: "handoff body".to_string(),
+        }));
+        assert!(set.contains("status=\"working_context_set\""));
+        assert!(set.contains("project=\"agent-memory\""));
+
+        let get = server.working_get(Parameters(WorkingGetArgs {
+            project: Some("agent-memory".to_string()),
+        }));
+        assert!(get.contains("present=\"true\""));
+        assert!(get.contains("handoff body"));
+
+        let clear = server.working_clear(Parameters(WorkingClearArgs {
+            project: Some("agent-memory".to_string()),
+        }));
+        assert!(clear.contains("status=\"working_context_cleared\""));
+        assert!(clear.contains("deleted=\"true\""));
+
+        let absent = server.working_get(Parameters(WorkingGetArgs {
+            project: Some("agent-memory".to_string()),
+        }));
+        assert!(absent.contains("present=\"false\""));
+    }
+
+    #[test]
+    fn working_set_rejects_global_and_size_cap() {
+        let server = test_server();
+        let global = server.working_set(Parameters(WorkingSetArgs {
+            project: Some(GLOBAL_PROJECT_IDENT.to_string()),
+            content: "handoff".to_string(),
+        }));
+        assert!(global.contains("status=\"error\""));
+        assert!(global.contains("per-project only"));
+
+        let too_long = "x".repeat(queries::WORKING_CONTEXT_MAX_CHARS + 1);
+        let large = server.working_set(Parameters(WorkingSetArgs {
+            project: Some("agent-memory".to_string()),
+            content: too_long,
+        }));
+        assert!(large.contains("status=\"error\""));
+        assert!(large.contains("maximum is 65536"));
+    }
+
+    #[test]
+    fn project_move_transfers_working_context() {
+        let server = test_server();
+        {
+            let conn = server.conn.lock().unwrap();
+            let memory = Memory::new(
+                "legacy content".to_string(),
+                None,
+                Some("legacy-project".to_string()),
+                None,
+                None,
+                Some("project".to_string()),
+            );
+            queries::insert_memory(&conn, &memory).unwrap();
+            queries::set_working_context(&conn, "legacy-project", "handoff").unwrap();
+        }
+
+        let dry_run = server.move_tool(Parameters(MoveArgs {
+            id: None,
+            from: Some("legacy-project".to_string()),
+            to: "agent-memory".to_string(),
+            dry_run: Some(true),
+        }));
+        assert!(dry_run.contains("status=\"dry_run\""));
+        assert!(dry_run.contains("working_context=\"would_move\""));
+
+        let moved = server.move_tool(Parameters(MoveArgs {
+            id: None,
+            from: Some("legacy-project".to_string()),
+            to: "agent-memory".to_string(),
+            dry_run: Some(false),
+        }));
+        assert!(moved.contains("status=\"moved\""));
+        assert!(moved.contains("count=\"1\""));
+        assert!(moved.contains("working_context=\"moved\""));
+
+        let conn = server.conn.lock().unwrap();
+        assert!(queries::get_working_context(&conn, "legacy-project")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            queries::get_working_context(&conn, "agent-memory")
+                .unwrap()
+                .expect("moved handoff")
+                .content,
+            "handoff"
+        );
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
@@ -849,9 +1181,11 @@ impl ServerHandler for MemoryServer {
                  sections; fetch full content via memory_get. \
                  memory_recall filters by project/agent/tags/type, \
                  memory_forget deletes by id (short prefix supported) or query, \
-                 memory_prune cleans stale memories. memory_projects lists distinct project \
+                 memory_prune cleans stale memories. memory_working_get/set/clear manages the \
+                 current project's transient WorkingContext handoff. memory_projects lists distinct durable-memory \
                  idents (spot aliases), memory_move reassigns the project ident on memories \
-                 (single id or bulk from/to), memory_copy duplicates memories under a new ident.",
+                 (project-wide moves also transfer or clear WorkingContext), memory_copy duplicates memories \
+                 under a new ident without copying WorkingContext.",
         )
     }
 }

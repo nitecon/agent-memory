@@ -1,0 +1,211 @@
+app: memory
+title: Agent Memory CLI and MCP context
+summary: Persistent project/global memory and per-project WorkingContext handoff for AI coding agents.
+kind: agent_context
+source_format: agent_context
+source_ref: .agent/api/memory.yaml
+labels:
+  - agent-memory
+  - memory
+  - cli
+  - mcp
+  - working-context
+content:
+  purpose: >
+    The memory binary stores durable project/global memories and exposes
+    ranked context retrieval for AI agents. WorkingContext is a separate
+    per-project handoff row for transient active-work state; it is not a
+    durable memory and does not participate in ranking or dream curation.
+  workflows:
+    - name: Start a task
+      steps:
+        - Run memory context "<task>" from the project directory.
+        - Read any leading <working_context present="true"> block as the authoritative active handoff.
+        - Treat project_memories as durable project knowledge and general_knowledge as global user directives.
+    - name: Leave a handoff
+      steps:
+        - Replace the current handoff with memory working set "current state and next step".
+        - Use memory working set - < handoff.md for multiline stdin bodies.
+        - Keep durable decisions and reusable lessons in memory store, not only in WorkingContext.
+    - name: Clear a completed handoff
+      steps:
+        - Run memory working clear when the project thread completes or the user directs cleanup.
+        - Confirm memory working get returns present="false".
+    - name: Publish this API context
+      steps:
+        - Validate with agent-tools docs validate --file .agent/api/memory.yaml.
+        - Publish with agent-tools docs publish --file .agent/api/memory.yaml.
+  cli:
+    commands:
+      - name: memory store
+        purpose: Store a durable memory with embedding and lexical index rows.
+        args:
+          required:
+            - content
+          optional:
+            - --tags
+            - --project
+            - --agent
+            - --source-file
+            - --memory-type user|feedback|project|reference
+            - --no-project
+            - --scope project|global
+        output: <result status="stored" id="..." scope="..." project="..."/>
+      - name: memory search
+        purpose: Hybrid BM25/vector search with current-project and global boosts.
+        args:
+          required:
+            - query
+          optional:
+            - -k/--limit
+            - --project
+            - --only
+            - --no-project-boost
+        output: Grouped light-XML sections project_memories, general_knowledge, other_projects.
+      - name: memory context
+        purpose: Task-start retrieval. Includes active WorkingContext before ranked memories.
+        args:
+          required:
+            - description
+          optional:
+            - -k/--limit
+            - --project
+            - --only
+            - --no-project-boost
+        output: Optional <working_context present="true"> block, grouped memory sections, hints, and usage.
+      - name: memory recall
+        purpose: Structured filtering by project, agent, tags, and memory type.
+      - name: memory get
+        purpose: Fetch full content for one or more full UUIDs or 4+ character ID prefixes.
+      - name: memory list
+        purpose: List recent memories, optionally by project or memory type.
+      - name: memory forget
+        purpose: Delete memories by ID or by top search matches.
+      - name: memory prune
+        purpose: Delete stale/low-access memories, with dry-run support.
+      - name: memory move
+        purpose: Reassign project idents on one memory or all memories from a project.
+        behavior:
+          - Project-wide moves transfer the source WorkingContext row to the target project when one exists.
+          - Moving a project to the unscoped empty-string target deletes the source WorkingContext row.
+          - If the target project already has WorkingContext, the project-wide move fails before moving durable memories.
+          - Single-memory moves do not affect WorkingContext.
+      - name: memory copy
+        purpose: Duplicate one memory or all memories from a project under another project ident.
+        behavior:
+          - Does not copy WorkingContext; copied handoffs require an explicit memory working set.
+      - name: memory projects
+        purpose: List distinct project idents and memory counts.
+        behavior:
+          - Lists durable memory projects only; WorkingContext-only projects are omitted.
+      - name: memory update
+        purpose: With no ID, run the self-updater; with ID plus --content, re-author a memory.
+      - name: memory setup
+        purpose: Install or remove injected agent rules and bundled skill guidance.
+      - name: memory working get
+        purpose: Read the current project's WorkingContext.
+        args:
+          optional:
+            - --project
+        output:
+          present: <working_context project="..." version="..." updated_at="..." present="true">full content</working_context>
+          absent: <working_context project="..." present="false"/>
+        behavior:
+          - Exits successfully for valid projects even when no row exists.
+      - name: memory working set
+        purpose: Replace the current project's WorkingContext.
+        args:
+          required_one_of:
+            - inline content
+            - "-"
+            - --file PATH
+          optional:
+            - --project
+        output: <result status="working_context_set" project="..." version="..." updated_at="..."/>
+        behavior:
+          - Content arg "-" reads stdin.
+          - Enforces a 65536 character cap.
+          - Rejects missing project idents and __global__.
+      - name: memory working clear
+        purpose: Delete the current project's WorkingContext row.
+        args:
+          optional:
+            - --project
+        output: <result status="working_context_cleared" project="..." deleted="true|false"/>
+        behavior:
+          - Idempotent when no row exists.
+  mcp:
+    tools:
+      - name: memory_store
+        purpose: Store a durable memory. Mirrors memory store except MCP currently rejects explicit project="__global__".
+      - name: memory_search
+        purpose: Hybrid ranked memory search.
+      - name: memory_context
+        purpose: Task-start retrieval with optional leading WorkingContext block.
+      - name: memory_recall
+        purpose: Structured memory filtering.
+      - name: memory_get
+        purpose: Fetch full memory bodies by full UUID or 4+ character prefix.
+      - name: memory_forget
+        purpose: Delete memories by ID or search query.
+      - name: memory_prune
+        purpose: Prune stale/low-access memories.
+      - name: memory_move
+        purpose: Reassign memory project idents; project-wide moves also transfer or delete WorkingContext.
+      - name: memory_copy
+        purpose: Duplicate memory rows under another project ident; WorkingContext is not copied.
+      - name: memory_projects
+        purpose: List distinct durable-memory project idents.
+      - name: memory_working_get
+        purpose: Read WorkingContext; returns present="true" with full content or present="false" when absent.
+      - name: memory_working_set
+        purpose: Replace WorkingContext; enforces the 65536 character cap and project-only scope.
+      - name: memory_working_clear
+        purpose: Delete WorkingContext; idempotent when absent.
+  contracts:
+    durable_memory:
+      scopes:
+        project: Default; cwd-derived project ident unless overridden.
+        global: Stored under reserved project ident __global__ via memory store --scope global.
+      retrieval:
+        current_project_boost: 1.5
+        global_boost: 1.25
+        cross_project_results: Allowed and labeled as prior art.
+    working_context:
+      storage: project_working_context table keyed by project.
+      scope: Project-only; __global__ is invalid.
+      size_limit: 65536 characters using SQLite LENGTH(content) semantics.
+      clear_semantics: Delete the row; no tombstone in v1.
+      ranking: Never part of BM25/vector search and never consumes top-k.
+      context_output: Active row renders before project_memories with full content.
+      absent_output: memory working get returns present="false"; memory context adds only a hint.
+      project_ident_maintenance:
+        move_from_to: memory move --from X --to Y transfers X's row to Y.
+        move_from_to_empty: memory move --from X --to "" deletes X's row because WorkingContext cannot be unscoped.
+        move_target_conflict: If Y already has a row, the move fails before durable memories are moved.
+        copy: memory copy never duplicates WorkingContext.
+        projects: memory projects lists durable memory rows only, not WorkingContext-only projects.
+      omitted_v1:
+        - append command
+        - status command/tool
+        - CAS or --expect-version
+        - updated_by column
+        - cleared_at tombstone
+        - hardcoded stale hints
+  safety:
+    - WorkingContext is transient handoff. Store durable lessons with memory store.
+    - Do not write huge handoffs; the 65536 character cap protects every future memory context call.
+    - Do not use __global__ for WorkingContext; cross-project handoff state is intentionally unsupported.
+    - Do not rely on memory for git history, releases, tags, CI state, or version facts.
+  examples:
+    - name: Read task context
+      command: memory context "continue WorkingContext implementation" -k 8
+    - name: Set multiline handoff
+      command: memory working set - --project agent-memory < handoff.md
+    - name: Clear handoff
+      command: memory working clear --project agent-memory
+    - name: MCP set handoff
+      tool: memory_working_set
+      arguments:
+        project: agent-memory
+        content: "Current state and next step."

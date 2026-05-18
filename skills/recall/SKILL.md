@@ -2,7 +2,7 @@
 name: recall
 description: Search and retrieve stored memories. Use when the user asks to recall, remember, look up past context, or when you need to find relevant information from previous conversations.
 argument-hint: "[search query or topic]"
-allowed-tools: mcp__agent-memory__memory_search, mcp__agent-memory__memory_context, mcp__agent-memory__memory_recall
+allowed-tools: mcp__agent-memory__memory_search, mcp__agent-memory__memory_context, mcp__agent-memory__memory_recall, mcp__agent-memory__memory_working_get
 ---
 
 The user wants to retrieve memories. The query is:
@@ -14,6 +14,7 @@ Your job:
    - **Semantic search** (`memory_search`): use when the query is natural language or conceptual — "what does the user prefer for testing?", "anything about auth?"
    - **Filtered recall** (`memory_recall`): use when the query targets a specific project, agent, tag, or memory type — "all feedback memories", "memories tagged auth"
    - **Task context** (`memory_context`): use when loading context for a specific task — "I'm about to refactor the auth middleware"
+   - **WorkingContext** (`memory_working_get`): use when the user asks what is currently in progress or how to resume the active project handoff.
 2. Execute the appropriate MCP tool call(s)
 3. Present results clearly:
    - Show the most relevant memories first

@@ -170,6 +170,26 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         )?;
     }
 
+    if version < 5 {
+        // Schema v5 — per-project WorkingContext handoff state.
+        //
+        // This is intentionally separate from durable memories: it is live
+        // handoff state for the current project, not ranked knowledge for
+        // search/dream. One row means an active WorkingContext; no row means
+        // no handoff has been set. `clear` deletes the row.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_working_context (
+                 project TEXT PRIMARY KEY NOT NULL
+                     CHECK (project <> '__global__'),
+                 content TEXT NOT NULL
+                     CHECK (LENGTH(content) <= 65536),
+                 version INTEGER NOT NULL DEFAULT 1,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO schema_version (version) VALUES (5);",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -224,16 +244,16 @@ mod migration_tests {
         )
         .expect("seed v2 db");
 
-        // Apply migrations — should run v3 and v4 steps in sequence.
-        run_migrations(&conn).expect("migrate to v4");
+        // Apply migrations — should run v3, v4, and v5 steps in sequence.
+        run_migrations(&conn).expect("migrate to latest");
 
-        // Schema version advanced to latest (v4).
+        // Schema version advanced to latest.
         let max_v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 4);
+        assert_eq!(max_v, 5);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -266,7 +286,7 @@ mod migration_tests {
     }
 
     /// Fresh DB path: no prior schema_version rows, run_migrations should
-    /// apply every step (1, 2, 3, 4) and leave an empty but well-formed DB.
+    /// apply every step (1 through latest) and leave an empty but well-formed DB.
     #[test]
     fn fresh_database_applies_all_migrations() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -276,7 +296,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 4);
+        assert_eq!(max_v, 5);
     }
 
     /// v4 migration from a v3 fixture DB must create the `project_state`
@@ -310,7 +330,7 @@ mod migration_tests {
         )
         .expect("seed v3 db");
 
-        run_migrations(&conn).expect("migrate to v4");
+        run_migrations(&conn).expect("migrate to latest");
 
         // project_state now exists and is empty (no backfill).
         let row_count: i64 = conn
@@ -318,15 +338,85 @@ mod migration_tests {
             .expect("query project_state");
         assert_eq!(row_count, 0);
 
-        // Schema version advanced exactly one step.
+        // Schema version advanced to latest.
         let max_v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 4);
+        assert_eq!(max_v, 5);
 
         // Existing memory row survived untouched.
+        let existing: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id = 'existing-row'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("select existing row");
+        assert_eq!(existing, "body");
+    }
+
+    /// v5 migration from a v4 fixture DB must create the WorkingContext table
+    /// without disturbing `project_state` or existing memory rows.
+    #[test]
+    fn v4_database_upgrades_to_v5_creating_working_context() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                 tags TEXT, project TEXT, agent TEXT, source_file TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 access_count INTEGER DEFAULT 0, embedding BLOB, memory_type TEXT,
+                 content_raw TEXT, superseded_by TEXT,
+                 condenser_version TEXT, embedding_model TEXT
+             );
+             CREATE VIRTUAL TABLE memories_fts USING fts5(
+                 content, content='memories', content_rowid='rowid',
+                 tokenize='porter unicode61'
+             );
+             CREATE TABLE project_state (
+                 project TEXT PRIMARY KEY,
+                 last_dream_at TEXT NOT NULL
+             );
+             INSERT INTO schema_version (version) VALUES (1);
+             INSERT INTO schema_version (version) VALUES (2);
+             INSERT INTO schema_version (version) VALUES (3);
+             INSERT INTO schema_version (version) VALUES (4);
+             INSERT INTO memories (id, content, project, created_at, updated_at)
+                 VALUES ('existing-row', 'body', 'agent-memory', '2026-01-01', '2026-01-01');
+             INSERT INTO project_state (project, last_dream_at)
+                 VALUES ('agent-memory', '2026-04-23T00:00:00Z');",
+        )
+        .expect("seed v4 db");
+
+        run_migrations(&conn).expect("migrate to latest");
+
+        let working_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_working_context", [], |row| {
+                row.get(0)
+            })
+            .expect("query project_working_context");
+        assert_eq!(working_count, 0);
+
+        let dream_ts: String = conn
+            .query_row(
+                "SELECT last_dream_at FROM project_state WHERE project = 'agent-memory'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query project_state");
+        assert_eq!(dream_ts, "2026-04-23T00:00:00Z");
+
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("query schema_version");
+        assert_eq!(max_v, 5);
+
         let existing: String = conn
             .query_row(
                 "SELECT content FROM memories WHERE id = 'existing-row'",

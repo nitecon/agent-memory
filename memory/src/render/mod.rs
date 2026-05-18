@@ -49,7 +49,7 @@
 //! Multi-memory reads (context/search/recall/list) append a `<usage>` legend
 //! so a cold agent knows how to interpret the short IDs and section tags.
 
-use crate::db::models::Memory;
+use crate::db::models::{Memory, WorkingContext};
 use crate::search::SearchResult;
 
 /// Number of leading hex characters shown for UUIDs in agent-visible output.
@@ -89,6 +89,7 @@ pub fn short_id(id: &str) -> &str {
 pub fn render_search_results(
     results: &[SearchResult],
     current_project: Option<&str>,
+    working_context: Option<&WorkingContext>,
     hint: Option<&str>,
 ) -> String {
     // Bucket results into the three section categories. Keep references
@@ -118,6 +119,10 @@ pub fn render_search_results(
     }
 
     let mut out = String::new();
+    if let Some(ctx) = working_context {
+        out.push_str(&render_working_context(Some(ctx), &ctx.project));
+        out.push('\n');
+    }
     append_section(
         &mut out,
         "project_memories",
@@ -306,6 +311,24 @@ pub fn render_memory(m: &Memory) -> String {
     }
 
     format!("<memory {attrs}>\n{}\n</memory>", m.content)
+}
+
+pub fn render_working_context(ctx: Option<&WorkingContext>, project: &str) -> String {
+    match ctx {
+        Some(ctx) => format!(
+            r#"<working_context project="{}" version="{}" updated_at="{}" present="true">
+{}
+</working_context>"#,
+            escape_attr(&ctx.project),
+            ctx.version,
+            escape_attr(&ctx.updated_at),
+            ctx.content
+        ),
+        None => format!(
+            r#"<working_context project="{}" present="false"/>"#,
+            escape_attr(project)
+        ),
+    }
 }
 
 /// Render a single-line mutation result, e.g.:
@@ -617,6 +640,33 @@ mod tests {
     }
 
     #[test]
+    fn render_working_context_active_full_content() {
+        let ctx = WorkingContext {
+            project: "agent-memory".to_string(),
+            content: "Current goal\n- next step with <path>".to_string(),
+            version: 3,
+            updated_at: "2026-05-18T15:00:00Z".to_string(),
+        };
+
+        let s = render_working_context(Some(&ctx), "agent-memory");
+        assert!(s.starts_with("<working_context project=\"agent-memory\""));
+        assert!(s.contains("version=\"3\""));
+        assert!(s.contains("updated_at=\"2026-05-18T15:00:00Z\""));
+        assert!(s.contains("present=\"true\""));
+        assert!(s.contains("Current goal\n- next step with <path>"));
+        assert!(s.ends_with("</working_context>"));
+    }
+
+    #[test]
+    fn render_working_context_absent_is_machine_readable() {
+        let s = render_working_context(None, "agent-memory");
+        assert_eq!(
+            s,
+            r#"<working_context project="agent-memory" present="false"/>"#
+        );
+    }
+
+    #[test]
     fn render_hint_passes_angle_brackets_through_raw() {
         // The live hint text includes back-ticked snippets like
         // `memory get <id>` — these MUST render raw, not as `&lt;id&gt;`.
@@ -672,7 +722,7 @@ mod tests {
             mk_result(global, false, true),
             mk_result(other, false, false),
         ];
-        let out = render_search_results(&results, Some("agent-memory"), None);
+        let out = render_search_results(&results, Some("agent-memory"), None, None);
         assert!(out.contains("<project_memories>"));
         // Per-line tags no longer present (v1.5.0).
         assert!(!out.contains("[local]"), "per-line tag marker must be gone");
@@ -704,7 +754,7 @@ mod tests {
             Some(vec!["mmm", "arch"]),
         );
         let results = vec![mk_result(a, true, false), mk_result(b, true, false)];
-        let out = render_search_results(&results, Some("p"), None);
+        let out = render_search_results(&results, Some("p"), None, None);
         // Expected alphabetical order (case-insensitive): arch, mmm, zzz.
         // First-seen casing wins for `arch` (lowercase wins over `ARCH`
         // because the first occurrence was lowercase).
@@ -718,7 +768,7 @@ mod tests {
     fn render_search_results_elides_empty_sections() {
         let only_global = mk_memory("dddddddd-1111", "only global", Some("__global__"), None);
         let results = vec![mk_result(only_global, false, true)];
-        let out = render_search_results(&results, Some("agent-memory"), None);
+        let out = render_search_results(&results, Some("agent-memory"), None, None);
         assert!(!out.contains("<project_memories>"));
         assert!(!out.contains("<other_projects>"));
         assert!(out.contains("<general_knowledge>"));
@@ -734,14 +784,39 @@ mod tests {
     fn render_search_results_appends_hint() {
         let m = mk_memory("eeeeeeee-2222", "x", Some("p"), None);
         let results = vec![mk_result(m, false, false)];
-        let out = render_search_results(&results, None, Some("Check global prefs."));
+        let out = render_search_results(&results, None, None, Some("Check global prefs."));
         assert!(out.ends_with("<hint>Check global prefs.</hint>"));
     }
 
     #[test]
     fn render_search_results_empty_input_is_empty() {
-        let out = render_search_results(&[], Some("p"), None);
+        let out = render_search_results(&[], Some("p"), None, None);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn render_search_results_places_working_context_first() {
+        let ctx = WorkingContext {
+            project: "agent-memory".to_string(),
+            content: "Continue from the DB migration.".to_string(),
+            version: 2,
+            updated_at: "2026-05-18T15:00:00Z".to_string(),
+        };
+        let memory = mk_memory(
+            "11111111-aaaa",
+            "current project memory",
+            Some("agent-memory"),
+            None,
+        );
+        let results = vec![mk_result(memory, true, false)];
+
+        let out = render_search_results(&results, Some("agent-memory"), Some(&ctx), None);
+        assert!(out.starts_with("<working_context project=\"agent-memory\""));
+        assert!(
+            out.find("<working_context").unwrap() < out.find("<project_memories>").unwrap(),
+            "working context must render before ranked memories:\n{out}"
+        );
+        assert!(out.contains("Continue from the DB migration."));
     }
 
     #[test]
