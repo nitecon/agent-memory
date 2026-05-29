@@ -16,8 +16,8 @@ fn project_memory() -> GatewayMemory {
         gateway_memory_id: None,
         base_server_revision: None,
         server_revision: None,
-        created_at: Some("2026-05-29T13:51:04Z".to_string()),
-        updated_at: Some("2026-05-29T13:51:04Z".to_string()),
+        created_at: Some("1970-01-01T00:00:01Z".to_string()),
+        updated_at: Some("1970-01-01T00:00:02Z".to_string()),
         provenance: None,
         tombstone: None,
     }
@@ -45,8 +45,8 @@ fn push_request_is_project_plus_memory_array() {
                     "content_hash": "abc123",
                     "local_memory_id": "local-1",
                     "client_id": "client-1",
-                    "created_at": "2026-05-29T13:51:04Z",
-                    "updated_at": "2026-05-29T13:51:04Z"
+                    "created_at": 1000_i64,
+                    "updated_at": 2000_i64
                 }
             ]
         })

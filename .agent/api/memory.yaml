@@ -302,6 +302,7 @@ content:
             - memory accepts project as an alias for project_ident on responses.
             - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
             - content_hash is the gateway-compatible lowercase SHA-256 hex digest of content bytes, with no sha256: prefix.
+            - memory serializes created_at and updated_at to the gateway as Unix epoch milliseconds, and accepts either epoch milliseconds or RFC3339 strings on responses.
       deconfliction:
         push: Client sends base_server_revision when linked; gateway returns conflict for stale updates.
         pull: Client updates only when local content hash matches last_pulled_content_hash or last_pushed_content_hash.

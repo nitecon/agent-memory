@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -306,12 +306,14 @@ pub struct GatewayMemory {
     #[serde(
         default,
         deserialize_with = "deserialize_optional_timestamp",
+        serialize_with = "serialize_optional_timestamp",
         skip_serializing_if = "Option::is_none"
     )]
     pub created_at: Option<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_timestamp",
+        serialize_with = "serialize_optional_timestamp",
         skip_serializing_if = "Option::is_none"
     )]
     pub updated_at: Option<String>,
@@ -444,6 +446,20 @@ where
         Some(other) => Err(serde::de::Error::custom(format!(
             "expected timestamp string or integer, got {other}"
         ))),
+    }
+}
+
+fn serialize_optional_timestamp<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_none(),
+        Some(value) => {
+            let timestamp =
+                chrono::DateTime::parse_from_rfc3339(value).map_err(serde::ser::Error::custom)?;
+            serializer.serialize_some(&timestamp.timestamp_millis())
+        }
     }
 }
 
