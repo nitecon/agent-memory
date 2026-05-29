@@ -49,7 +49,9 @@ else
   error "Neither curl nor wget found. Install one and retry."
 fi
 
-LATEST_TAG=$($DOWNLOAD "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+RELEASE_JSON=$($DOWNLOAD "https://api.github.com/repos/${REPO}/releases/latest")
+
+LATEST_TAG=$(printf '%s' "$RELEASE_JSON" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
 if [ -z "$LATEST_TAG" ]; then
   error "Could not determine latest release from GitHub."
@@ -57,11 +59,31 @@ fi
 
 info "Latest version: ${LATEST_TAG}"
 
-# Release 2 asset name format: `agent-memory-<tag>-<platform>.tar.gz`.
-# The tag embedded in the name lets the updater and install scripts
-# deterministically resolve a specific release without a second API call.
-ARCHIVE_NAME="agent-memory-${LATEST_TAG}-${PLATFORM}-${ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARCHIVE_NAME}"
+# Current asset name format: `agent-memory-<platform>-<arch>.tar.gz` (tag-less).
+# Older releases shipped a tag-ful form `agent-memory-<tag>-<platform>-<arch>.tar.gz`,
+# so select the matching asset from the release JSON and accept either convention.
+ASSET_RE="^agent-memory-(${LATEST_TAG}-)?${PLATFORM}-${ARCH}\.tar\.gz$"
+
+# Pull the matching asset's name straight from the release payload we already
+# fetched (no second API call), then build its download URL deterministically
+# from the repo + tag. Accepts both the current tag-less names and the legacy
+# tag-ful ones.
+ARCHIVE_NAME=""
+DOWNLOAD_URL=""
+while IFS= read -r asset_name; do
+  if printf '%s' "$asset_name" | grep -Eq "$ASSET_RE"; then
+    ARCHIVE_NAME="$asset_name"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${asset_name}"
+    break
+  fi
+done <<EOF
+$(printf '%s' "$RELEASE_JSON" | grep -oE '"name": *"agent-memory-[^"]+"' | sed -E 's/.*"name": *"([^"]+)".*/\1/')
+EOF
+
+if [ -z "$DOWNLOAD_URL" ]; then
+  AVAILABLE=$(printf '%s' "$RELEASE_JSON" | grep -oE '"name": *"agent-memory-[^"]+"' | sed -E 's/.*"name": *"([^"]+)".*/\1/' | paste -sd ', ' -)
+  error "Could not find a ${PLATFORM} ${ARCH} release archive for ${LATEST_TAG}. Available assets: ${AVAILABLE:-none}"
+fi
 
 # --- Check existing installation --------------------------------------------
 

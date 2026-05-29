@@ -50,11 +50,11 @@ First `memory` invocation downloads the embedding model (~80MB, cached alongside
 Each release tag produces a single combined archive per platform:
 
 ```
-agent-memory-v1.2.0-linux-x86_64.tar.gz        # memory + memory-dream
-agent-memory-v1.2.0-linux-aarch64.tar.gz
-agent-memory-v1.2.0-macos-x86_64.tar.gz
-agent-memory-v1.2.0-macos-aarch64.tar.gz
-agent-memory-v1.2.0-windows-x86_64.zip
+agent-memory-linux-x86_64.tar.gz        # memory + memory-dream
+agent-memory-linux-aarch64.tar.gz
+agent-memory-macos-x86_64.tar.gz
+agent-memory-macos-aarch64.tar.gz
+agent-memory-windows-x86_64.zip
 ```
 
 Archive size is ~70MB (candle + tokenizers add weight to `memory-dream`). The model weights are **not** shipped in the archive — they're downloaded on demand via `memory-dream --pull`. Users who never run `memory-dream` pay the ~28MB of disk it takes up but incur zero cognitive overhead; `memory update` force-bundles both binaries on every upgrade so install and updater logic stay symmetric.
