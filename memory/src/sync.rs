@@ -319,7 +319,11 @@ pub struct GatewayMemory {
     pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<GatewayMemoryProvenance>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_tombstone",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tombstone: Option<GatewayMemoryTombstone>,
 }
 
@@ -445,6 +449,29 @@ where
         }
         Some(other) => Err(serde::de::Error::custom(format!(
             "expected timestamp string or integer, got {other}"
+        ))),
+    }
+}
+
+fn deserialize_optional_tombstone<'de, D>(
+    deserializer: D,
+) -> Result<Option<GatewayMemoryTombstone>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => Ok(None),
+        Some(serde_json::Value::Bool(true)) => Ok(Some(GatewayMemoryTombstone {
+            deleted: true,
+            deleted_at: None,
+            reason: None,
+        })),
+        Some(value @ serde_json::Value::Object(_)) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected tombstone object, boolean, or null, got {other}"
         ))),
     }
 }

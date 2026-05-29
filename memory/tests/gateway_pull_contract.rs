@@ -179,3 +179,47 @@ fn pull_response_accepts_gateway_shape_aliases_and_tombstones() {
     assert_eq!(tombstone.project, "agent-memory");
     assert_eq!(tombstone.gateway_memory_id, "gw-1");
 }
+
+#[test]
+fn pull_response_accepts_boolean_tombstone_flags() {
+    let active = json!({
+        "project_ident": "agent-memory",
+        "server_revision": 44,
+        "has_more": false,
+        "memories": [
+            {
+                "project_ident": "agent-memory",
+                "gateway_memory_id": "gw-2",
+                "server_revision": 44,
+                "content": "Remote project memory",
+                "memory_type": "project",
+                "tags": ["gateway-sync"],
+                "content_hash": "remote",
+                "tombstone": false
+            }
+        ]
+    });
+    let response: PullMemoriesResponse = serde_json::from_value(active).unwrap();
+    assert_eq!(response.memories.len(), 1);
+    assert!(response.memories[0].tombstone.is_none());
+
+    let deleted = json!({
+        "project_ident": "agent-memory",
+        "server_revision": 45,
+        "has_more": false,
+        "memories": [
+            {
+                "project_ident": "agent-memory",
+                "gateway_memory_id": "gw-2",
+                "server_revision": 45,
+                "content": "",
+                "memory_type": "project",
+                "tags": [],
+                "content_hash": "remote",
+                "tombstone": true
+            }
+        ]
+    });
+    let response: PullMemoriesResponse = serde_json::from_value(deleted).unwrap();
+    assert!(response.memories[0].tombstone.as_ref().unwrap().deleted);
+}
