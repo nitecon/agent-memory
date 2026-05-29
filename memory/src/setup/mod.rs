@@ -29,6 +29,7 @@
 //! private to their respective submodules.
 
 pub mod codex_config_toml;
+pub mod gateway;
 pub mod gemini_settings_json;
 pub mod menu;
 pub mod rules;

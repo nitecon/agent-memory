@@ -2,29 +2,32 @@
 //! `memory setup all` (non-interactive sweep).
 //!
 //! The components are intentionally executed in a fixed order:
-//!   1. rules — injects the `<memory-rules>` block into agent rule files
-//!   2. skill — installs the Claude Code skill
+//!   1. gateway — supplies the URL/key that memory push/pull depend on
+//!   2. rules — injects the `<memory-rules>` block into agent rule files
+//!   3. skill — installs the Claude Code skill
 //!
 //! Putting rules before skill keeps humans reading a freshly-updated
 //! CLAUDE.md able to see the new rules ahead of the model discovering the
 //! skill.
 
-use crate::setup::{rules, skill};
+use crate::setup::{gateway, rules, skill};
 use anyhow::{Context, Result};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
+    Gateway,
     Rules,
     Skill,
 }
 
 impl Component {
-    pub const ALL: [Component; 2] = [Component::Rules, Component::Skill];
+    pub const ALL: [Component; 3] = [Component::Gateway, Component::Rules, Component::Skill];
 
     fn label(self) -> &'static str {
         match self {
+            Component::Gateway => "Gateway",
             Component::Rules => "Rules",
             Component::Skill => "Skill",
         }
@@ -47,7 +50,7 @@ pub fn run_interactive() -> Result<()> {
     println!();
     println!("Select components to (re)install:");
     println!("  a     = all");
-    println!("  1,2   = specific (comma-separated indices)");
+    println!("  1,3   = specific (comma-separated indices)");
     println!("  c     = cancel");
     print!("> ");
     io::stdout().flush().context("flush stdout")?;
@@ -68,10 +71,11 @@ pub fn run_interactive() -> Result<()> {
 }
 
 /// Entry point for `memory setup all`. `assume_yes` suppresses the
-/// confirmation prompt; useful for scripted installs.
+/// component-sweep confirmation prompt; gateway setup may still prompt for
+/// connection details.
 pub fn run_all(assume_yes: bool) -> Result<()> {
     if !assume_yes {
-        println!("Will install: rules, skill.");
+        println!("Will install: gateway, rules, skill.");
         print!("Proceed? [y/N]: ");
         io::stdout().flush().context("flush stdout")?;
         let mut input = String::new();
@@ -96,8 +100,29 @@ struct ComponentState {
 
 fn probe(c: Component) -> ComponentState {
     match c {
+        Component::Gateway => probe_gateway(),
         Component::Rules => probe_rules(),
         Component::Skill => probe_skill(),
+    }
+}
+
+fn probe_gateway() -> ComponentState {
+    if gateway::is_configured() {
+        ComponentState {
+            installed: true,
+            detail: format!(
+                "configured at {}",
+                gateway::configured_url().unwrap_or_else(|| "(unknown)".to_string())
+            ),
+        }
+    } else {
+        ComponentState {
+            installed: false,
+            detail: format!(
+                "not configured ({} missing)",
+                gateway::user_config_path_display()
+            ),
+        }
     }
 }
 
@@ -185,6 +210,7 @@ fn run_components(components: &[Component]) -> Result<()> {
         println!();
         println!("=== {} ===", c.label());
         let result = match c {
+            Component::Gateway => gateway::run(),
             // Rules: pass `all=true` so detected files are updated without a
             // second interactive prompt — the menu's selection step already
             // got user consent for *which components* to install.
@@ -259,30 +285,30 @@ mod tests {
     #[test]
     fn parse_selection_specific_indices() {
         let r = parse_selection("1,2", &Component::ALL).unwrap();
-        assert_eq!(r, vec![Component::Rules, Component::Skill]);
+        assert_eq!(r, vec![Component::Gateway, Component::Rules]);
     }
 
     #[test]
     fn parse_selection_single_index() {
         let r = parse_selection("2", &Component::ALL).unwrap();
-        assert_eq!(r, vec![Component::Skill]);
+        assert_eq!(r, vec![Component::Rules]);
     }
 
     #[test]
     fn parse_selection_dedupes() {
         let r = parse_selection("1,1,2,1", &Component::ALL).unwrap();
-        assert_eq!(r, vec![Component::Rules, Component::Skill]);
+        assert_eq!(r, vec![Component::Gateway, Component::Rules]);
     }
 
     #[test]
     fn parse_selection_handles_whitespace() {
         let r = parse_selection("  1 , 2  ", &Component::ALL).unwrap();
-        assert_eq!(r, vec![Component::Rules, Component::Skill]);
+        assert_eq!(r, vec![Component::Gateway, Component::Rules]);
     }
 
     #[test]
     fn parse_selection_rejects_out_of_range() {
-        assert!(parse_selection("3", &Component::ALL).is_err());
+        assert!(parse_selection("4", &Component::ALL).is_err());
         assert!(parse_selection("0", &Component::ALL).is_err());
     }
 
@@ -296,6 +322,9 @@ mod tests {
     fn component_all_order_matches_execution_contract() {
         // Pin the order so future contributors don't accidentally reorder
         // and end up installing the skill before the rules that explain it.
-        assert_eq!(Component::ALL, [Component::Rules, Component::Skill]);
+        assert_eq!(
+            Component::ALL,
+            [Component::Gateway, Component::Rules, Component::Skill]
+        );
     }
 }

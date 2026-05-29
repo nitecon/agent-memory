@@ -1041,6 +1041,27 @@ fn results_hint(
     }
 }
 
+#[tool_handler]
+impl ServerHandler for MemoryServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Persistent memory system for AI coding agents. All tools return light-XML \
+                 text (sectioned tags with numbered content lines — no JSON). \
+                 memory_store saves context (auto-tagged with cwd project), \
+                 memory_search and memory_context rank with a current-project boost and \
+                 return grouped <project_memories>/<general_knowledge>/<other_projects> \
+                 sections; fetch full content via memory_get. \
+                 memory_recall filters by project/agent/tags/type, \
+                 memory_forget deletes by id (short prefix supported) or query, \
+                 memory_prune cleans stale memories. memory_working_get/set/clear manages the \
+                 current project's transient WorkingContext handoff. memory_projects lists distinct durable-memory \
+                 idents (spot aliases), memory_move reassigns the project ident on memories \
+                 (project-wide moves also transfer or clear WorkingContext), memory_copy duplicates memories \
+                 under a new ident without copying WorkingContext.",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,26 +1188,5 @@ mod tests {
                 .content,
             "handoff"
         );
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for MemoryServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Persistent memory system for AI coding agents. All tools return light-XML \
-                 text (sectioned tags with numbered content lines — no JSON). \
-                 memory_store saves context (auto-tagged with cwd project), \
-                 memory_search and memory_context rank with a current-project boost and \
-                 return grouped <project_memories>/<general_knowledge>/<other_projects> \
-                 sections; fetch full content via memory_get. \
-                 memory_recall filters by project/agent/tags/type, \
-                 memory_forget deletes by id (short prefix supported) or query, \
-                 memory_prune cleans stale memories. memory_working_get/set/clear manages the \
-                 current project's transient WorkingContext handoff. memory_projects lists distinct durable-memory \
-                 idents (spot aliases), memory_move reassigns the project ident on memories \
-                 (project-wide moves also transfer or clear WorkingContext), memory_copy duplicates memories \
-                 under a new ident without copying WorkingContext.",
-        )
     }
 }

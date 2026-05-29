@@ -19,48 +19,54 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::db::open_database;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Serve => {
-            // MCP mode: stderr logging only, stdout is JSON-RPC transport
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
-                .with_writer(std::io::stderr)
-                .with_ansi(false)
-                .init();
-
-            let config = Config::load()?;
-            config.ensure_dirs()?;
-            let conn = open_database(&config.db_path)?;
-
-            let server = mcp::MemoryServer::new(config, conn);
-
-            tracing::info!("Starting agent-memory MCP server");
-
-            let service = server.serve(rmcp::transport::io::stdio()).await?;
-            service.waiting().await?;
-        }
-        other => {
-            // CLI mode: stderr for logs, stdout for results
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
-                .with_writer(std::io::stderr)
-                .init();
-
-            let config = Config::load()?;
-            config.ensure_dirs()?;
-
-            // Auto-update check (rate-limited, non-blocking on failure)
-            updater::auto_update(&config.data_dir);
-
-            let conn = open_database(&config.db_path)?;
-
-            cli::execute(other, config, &conn)?;
-        }
+        Cli::Serve => run_server(),
+        other => run_cli(other),
     }
+}
 
+fn run_cli(cli: Cli) -> anyhow::Result<()> {
+    // CLI mode: stderr for logs, stdout for results
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
+    let config = Config::load()?;
+    config.ensure_dirs()?;
+
+    // Auto-update check (rate-limited, non-blocking on failure)
+    updater::auto_update(&config.data_dir);
+
+    let conn = open_database(&config.db_path)?;
+
+    cli::execute(cli, config, &conn)?;
     Ok(())
+}
+
+fn run_server() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        // MCP mode: stderr logging only, stdout is JSON-RPC transport
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+
+        let config = Config::load()?;
+        config.ensure_dirs()?;
+        let conn = open_database(&config.db_path)?;
+
+        let server = mcp::MemoryServer::new(config, conn);
+
+        tracing::info!("Starting agent-memory MCP server");
+
+        let service = server.serve(rmcp::transport::io::stdio()).await?;
+        service.waiting().await?;
+        Ok(())
+    })
 }

@@ -10,7 +10,7 @@ fn project_memory() -> GatewayMemory {
         content: "Project-only memory body".to_string(),
         memory_type: "project".to_string(),
         tags: vec!["gateway-sync".to_string(), "project-ident".to_string()],
-        content_hash: "sha256:abc123".to_string(),
+        content_hash: "abc123".to_string(),
         local_memory_id: Some("local-1".to_string()),
         client_id: Some("client-1".to_string()),
         gateway_memory_id: None,
@@ -36,14 +36,13 @@ fn push_request_is_project_plus_memory_array() {
     assert_eq!(
         value,
         json!({
-            "project": "agent-memory",
             "memories": [
                 {
-                    "project": "agent-memory",
+                    "project_ident": "agent-memory",
                     "content": "Project-only memory body",
                     "memory_type": "project",
                     "tags": ["gateway-sync", "project-ident"],
-                    "content_hash": "sha256:abc123",
+                    "content_hash": "abc123",
                     "local_memory_id": "local-1",
                     "client_id": "client-1",
                     "created_at": "2026-05-29T13:51:04Z",
@@ -90,6 +89,7 @@ fn push_request_rejects_working_context_memory_type() {
 fn push_response_covers_created_linked_conflict_and_rejected() {
     let response = PushMemoriesResponse {
         project: "agent-memory".to_string(),
+        server_revision: Some(7),
         results: vec![
             PushMemoryResult {
                 local_memory_id: Some("local-1".to_string()),
@@ -97,8 +97,9 @@ fn push_response_covers_created_linked_conflict_and_rejected() {
                 gateway_memory_id: Some("gw-1".to_string()),
                 server_revision: Some(1),
                 action: PushMemoryAction::Created,
-                content_hash: Some("sha256:abc123".to_string()),
+                content_hash: Some("abc123".to_string()),
                 conflict: None,
+                error: None,
                 errors: vec![],
             },
             PushMemoryResult {
@@ -107,8 +108,9 @@ fn push_response_covers_created_linked_conflict_and_rejected() {
                 gateway_memory_id: Some("gw-1".to_string()),
                 server_revision: Some(1),
                 action: PushMemoryAction::Linked,
-                content_hash: Some("sha256:abc123".to_string()),
+                content_hash: Some("abc123".to_string()),
                 conflict: None,
+                error: None,
                 errors: vec![],
             },
             PushMemoryResult {
@@ -121,10 +123,11 @@ fn push_response_covers_created_linked_conflict_and_rejected() {
                 conflict: Some(MemoryConflict {
                     base_server_revision: Some(5),
                     remote_server_revision: Some(7),
-                    local_content_hash: Some("sha256:local".to_string()),
-                    remote_content_hash: Some("sha256:remote".to_string()),
+                    local_content_hash: Some("local".to_string()),
+                    remote_content_hash: Some("remote".to_string()),
                     reason: "remote revision moved".to_string(),
                 }),
+                error: None,
                 errors: vec![],
             },
             PushMemoryResult {
@@ -135,6 +138,7 @@ fn push_response_covers_created_linked_conflict_and_rejected() {
                 action: PushMemoryAction::Rejected,
                 content_hash: None,
                 conflict: None,
+                error: Some("memory content failed redaction policy".to_string()),
                 errors: vec![MemoryValidationError {
                     code: "secret_detected".to_string(),
                     message: "memory content failed redaction policy".to_string(),

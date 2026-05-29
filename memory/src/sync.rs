@@ -1,5 +1,6 @@
+use chrono::{TimeZone, Utc};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -68,12 +69,12 @@ impl MemoryGatewayClient {
     pub fn from_config(config: &GatewayConfig) -> Result<Self, GatewaySyncClientError> {
         let base_url = config.base_url.as_deref().ok_or_else(|| {
             GatewaySyncClientError::Config(
-                "set AGENT_MEMORY_GATEWAY_URL or AGENT_GATEWAY_URL".to_string(),
+                "run `memory setup gateway` (or `agent-tools setup gateway`) or set AGENT_MEMORY_GATEWAY_URL, AGENT_GATEWAY_URL, or GATEWAY_URL".to_string(),
             )
         })?;
         let api_key = config.api_key.as_deref().ok_or_else(|| {
             GatewaySyncClientError::Config(
-                "set AGENT_MEMORY_GATEWAY_API_KEY or AGENT_GATEWAY_API_KEY".to_string(),
+                "run `memory setup gateway` (or `agent-tools setup gateway`) or set AGENT_MEMORY_GATEWAY_API_KEY, AGENT_GATEWAY_API_KEY, or GATEWAY_API_KEY".to_string(),
             )
         })?;
         Self::from_parts(base_url, api_key)
@@ -110,10 +111,12 @@ impl MemoryGatewayClient {
         request: &PullMemoriesRequest,
     ) -> Result<PullMemoriesResponse, GatewaySyncClientError> {
         request.validate_project_scope()?;
-        self.post_json(
+        let mut response: PullMemoriesResponse = self.post_json(
             &project_memory_path(PULL_MEMORIES_PATH, &request.project),
             request,
-        )
+        )?;
+        response.normalize_gateway_shape();
+        Ok(response)
     }
 
     fn post_json<T, R>(&self, path: &str, body: &T) -> Result<R, GatewaySyncClientError>
@@ -147,6 +150,7 @@ impl MemoryGatewayClient {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushMemoriesRequest {
+    #[serde(skip_serializing)]
     pub project: String,
     pub memories: Vec<GatewayMemory>,
 }
@@ -163,7 +167,10 @@ impl PushMemoriesRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushMemoriesResponse {
+    #[serde(alias = "project_ident")]
     pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_revision: Option<i64>,
     pub results: Vec<PushMemoryResult>,
 }
 
@@ -182,6 +189,8 @@ pub struct PushMemoryResult {
     pub content_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict: Option<MemoryConflict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<MemoryValidationError>,
 }
@@ -198,14 +207,28 @@ pub enum PushMemoryAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullMemoriesRequest {
+    #[serde(skip_serializing)]
     pub project: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "since_revision",
+        alias = "since_server_revision",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub since_server_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "known",
+        alias = "known_memories",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub known_memories: Vec<KnownGatewayMemory>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "page_size",
+        alias = "limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<u32>,
 }
 
@@ -217,8 +240,12 @@ impl PullMemoriesRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullMemoriesResponse {
+    #[serde(alias = "project_ident")]
     pub project: String,
+    #[serde(default)]
     pub memories: Vec<GatewayMemory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<GatewayMemoryTombstoneRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,6 +255,15 @@ pub struct PullMemoriesResponse {
 }
 
 impl PullMemoriesResponse {
+    fn normalize_gateway_shape(&mut self) {
+        let tombstones = std::mem::take(&mut self.tombstones);
+        self.memories.extend(
+            tombstones
+                .into_iter()
+                .map(GatewayMemoryTombstoneRecord::into_memory),
+        );
+    }
+
     pub fn validate_project_scope(&self) -> Result<(), MemorySyncValidationError> {
         validate_project_ident(&self.project)?;
         for memory in &self.memories {
@@ -246,6 +282,7 @@ pub struct KnownGatewayMemory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayMemory {
+    #[serde(rename = "project_ident", alias = "project")]
     pub project: String,
     pub content: String,
     pub memory_type: String,
@@ -258,13 +295,25 @@ pub struct GatewayMemory {
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_memory_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "base_gateway_revision",
+        alias = "base_server_revision",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub base_server_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_revision: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<GatewayMemoryProvenance>,
@@ -293,6 +342,44 @@ impl GatewayMemory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayMemoryTombstoneRecord {
+    #[serde(rename = "project_ident", alias = "project")]
+    pub project: String,
+    pub gateway_memory_id: String,
+    pub server_revision: i64,
+    pub content_hash: String,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
+    pub tombstoned_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
+    pub updated_at: Option<String>,
+}
+
+impl GatewayMemoryTombstoneRecord {
+    fn into_memory(self) -> GatewayMemory {
+        GatewayMemory {
+            project: self.project,
+            content: String::new(),
+            memory_type: "project".to_string(),
+            tags: Vec::new(),
+            content_hash: self.content_hash,
+            local_memory_id: None,
+            client_id: None,
+            gateway_memory_id: Some(self.gateway_memory_id),
+            base_server_revision: None,
+            server_revision: Some(self.server_revision),
+            created_at: None,
+            updated_at: self.updated_at.clone(),
+            provenance: None,
+            tombstone: Some(GatewayMemoryTombstone {
+                deleted: true,
+                deleted_at: self.tombstoned_at.or(self.updated_at),
+                reason: Some("remote memory deleted".to_string()),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayMemoryProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_agent_id: Option<String>,
@@ -315,7 +402,11 @@ pub struct GatewayMemoryTombstone {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryConflict {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "base_gateway_revision",
+        alias = "base_server_revision",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub base_server_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_server_revision: Option<i64>,
@@ -332,6 +423,30 @@ pub struct MemoryValidationError {
     pub message: String,
 }
 
+fn deserialize_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(serde_json::Value::Number(value)) => {
+            let millis = value
+                .as_i64()
+                .ok_or_else(|| serde::de::Error::custom("timestamp must be an integer"))?;
+            let timestamp = Utc
+                .timestamp_millis_opt(millis)
+                .single()
+                .ok_or_else(|| serde::de::Error::custom("timestamp is out of range"))?;
+            Ok(Some(timestamp.to_rfc3339()))
+        }
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected timestamp string or integer, got {other}"
+        ))),
+    }
+}
+
 fn validate_project_ident(project: &str) -> Result<(), MemorySyncValidationError> {
     if project.trim().is_empty() {
         return Err(MemorySyncValidationError::EmptyProject);
@@ -343,18 +458,11 @@ fn validate_project_ident(project: &str) -> Result<(), MemorySyncValidationError
 }
 
 pub fn memory_content_hash(content: &str, memory_type: &str, tags: &[String]) -> String {
-    let mut sorted_tags = tags.to_vec();
-    sorted_tags.sort();
+    let _ = (memory_type, tags);
 
     let mut hasher = Sha256::new();
-    hasher.update(memory_type.as_bytes());
-    hasher.update([0]);
-    for tag in sorted_tags {
-        hasher.update(tag.as_bytes());
-        hasher.update([0]);
-    }
     hasher.update(content.as_bytes());
-    format!("sha256:{}", hex_lower(&hasher.finalize()))
+    hex_lower(&hasher.finalize())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -518,6 +626,9 @@ mod tests {
             &["gateway".to_string(), "sre".to_string()],
         );
         assert_eq!(a, b);
-        assert!(a.starts_with("sha256:"));
+        assert_eq!(
+            a,
+            "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5"
+        );
     }
 }

@@ -10,7 +10,7 @@ fn remote_memory() -> GatewayMemory {
         content: "Remote project memory".to_string(),
         memory_type: "project".to_string(),
         tags: vec!["sre".to_string(), "gateway-sync".to_string()],
-        content_hash: "sha256:remote".to_string(),
+        content_hash: "remote".to_string(),
         local_memory_id: None,
         client_id: None,
         gateway_memory_id: Some("gw-1".to_string()),
@@ -37,7 +37,7 @@ fn pull_request_is_project_plus_cursor_state() {
         known_memories: vec![KnownGatewayMemory {
             gateway_memory_id: "gw-1".to_string(),
             server_revision: 41,
-            content_hash: "sha256:old".to_string(),
+            content_hash: "old".to_string(),
         }],
         limit: Some(100),
     };
@@ -48,17 +48,16 @@ fn pull_request_is_project_plus_cursor_state() {
     assert_eq!(
         value,
         json!({
-            "project": "agent-memory",
-            "since_server_revision": 41,
+            "since_revision": 41,
             "cursor": "cursor-1",
-            "known_memories": [
+            "known": [
                 {
                     "gateway_memory_id": "gw-1",
                     "server_revision": 41,
-                    "content_hash": "sha256:old"
+                    "content_hash": "old"
                 }
             ],
-            "limit": 100
+            "page_size": 100
         })
     );
 }
@@ -68,6 +67,7 @@ fn pull_response_returns_memory_array_and_cursor() {
     let response = PullMemoriesResponse {
         project: "agent-memory".to_string(),
         memories: vec![remote_memory()],
+        tombstones: vec![],
         next_cursor: Some("cursor-2".to_string()),
         server_revision: Some(42),
         has_more: true,
@@ -91,7 +91,7 @@ fn pull_response_returns_memory_array_and_cursor() {
 fn pull_response_carries_tombstones_without_content_deletion_policy() {
     let mut memory = remote_memory();
     memory.content = "".to_string();
-    memory.content_hash = "sha256:tombstone".to_string();
+    memory.content_hash = "tombstone".to_string();
     memory.tombstone = Some(GatewayMemoryTombstone {
         deleted: true,
         deleted_at: Some("2026-05-29T13:45:00Z".to_string()),
@@ -101,6 +101,7 @@ fn pull_response_carries_tombstones_without_content_deletion_policy() {
     let response = PullMemoriesResponse {
         project: "agent-memory".to_string(),
         memories: vec![memory],
+        tombstones: vec![],
         next_cursor: None,
         server_revision: Some(43),
         has_more: false,
@@ -121,6 +122,7 @@ fn pull_response_rejects_malformed_project() {
     let response = PullMemoriesResponse {
         project: "agent-memory".to_string(),
         memories: vec![memory],
+        tombstones: vec![],
         next_cursor: None,
         server_revision: Some(42),
         has_more: false,
@@ -131,4 +133,49 @@ fn pull_response_rejects_malformed_project() {
         err.to_string(),
         "memory project ident mismatch: expected agent-memory, got other-project"
     );
+}
+
+#[test]
+fn pull_response_accepts_gateway_shape_aliases_and_tombstones() {
+    let value = json!({
+        "project_ident": "agent-memory",
+        "server_revision": 44,
+        "has_more": false,
+        "memories": [
+            {
+                "project_ident": "agent-memory",
+                "gateway_memory_id": "gw-2",
+                "server_revision": 44,
+                "content": "Remote project memory",
+                "memory_type": "project",
+                "tags": ["gateway-sync"],
+                "content_hash": "remote",
+                "created_at": 1780000000000_i64,
+                "updated_at": 1780000001000_i64
+            }
+        ],
+        "tombstones": [
+            {
+                "project_ident": "agent-memory",
+                "gateway_memory_id": "gw-1",
+                "server_revision": 43,
+                "content_hash": "tombstone",
+                "tombstoned_at": 1780000002000_i64,
+                "updated_at": 1780000002000_i64
+            }
+        ]
+    });
+
+    let mut response: PullMemoriesResponse = serde_json::from_value(value).unwrap();
+    response.validate_project_scope().unwrap();
+    assert_eq!(response.project, "agent-memory");
+    assert_eq!(response.memories[0].project, "agent-memory");
+    assert_eq!(
+        response.memories[0].created_at.as_deref().unwrap().len(),
+        25
+    );
+
+    let tombstone = response.tombstones.remove(0);
+    assert_eq!(tombstone.project, "agent-memory");
+    assert_eq!(tombstone.gateway_memory_id, "gw-1");
 }

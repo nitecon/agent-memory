@@ -14,7 +14,7 @@ use crate::error::MemoryError;
 use crate::project;
 use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
-use crate::setup::{menu, rules, skill};
+use crate::setup::{gateway, menu, rules, skill};
 use crate::sync::{
     memory_content_hash, GatewayMemory, GatewayMemoryTombstone, GatewaySyncClientError,
     MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse, PushMemoriesRequest,
@@ -377,6 +377,13 @@ pub enum GatewayTransferCommand {
 
 #[derive(Subcommand)]
 pub enum SetupCommands {
+    /// Configure the shared agent-gateway connection used by memory push/pull.
+    ///
+    /// Writes `GATEWAY_URL`, `GATEWAY_API_KEY`, and `GATEWAY_TIMEOUT_MS` to
+    /// `~/.agentic/agent-tools/gateway.conf`, the same config file consumed by
+    /// `agent-tools setup gateway`.
+    Gateway,
+
     /// Inject the memory usage protocols into known agent rule files.
     ///
     /// Detects `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`,
@@ -438,7 +445,7 @@ pub enum SetupCommands {
         remove: bool,
     },
 
-    /// Run rules → skill non-interactively.
+    /// Run gateway → rules → skill in sequence.
     All {
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
@@ -1306,6 +1313,9 @@ fn print_push_response(response: &PushMemoriesResponse) {
         if let Some(conflict) = result.conflict.as_ref() {
             attrs.push(("reason", conflict.reason.clone()));
         }
+        if let Some(error) = result.error.as_deref() {
+            attrs.push(("error", error.to_string()));
+        }
         if let Some(error) = result.errors.first() {
             attrs.push(("error", error.code.clone()));
         }
@@ -1733,6 +1743,7 @@ fn execute_setup(command: Option<SetupCommands>) -> anyhow::Result<()> {
             remove,
         }) => skill::run(dry_run, print, remove),
         Some(SetupCommands::All { yes }) => menu::run_all(yes),
+        Some(SetupCommands::Gateway) => gateway::run(),
     }
 }
 
@@ -2305,6 +2316,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_setup_gateway_command() {
+        let cli = Cli::try_parse_from(["memory", "setup", "gateway"]).unwrap();
+        match cli {
+            Cli::Setup { command } => assert!(matches!(command, Some(SetupCommands::Gateway))),
+            _ => panic!("expected Setup variant"),
+        }
+    }
+
+    #[test]
     fn push_candidates_track_create_and_skipped_without_metadata_writes() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         crate::db::run_migrations(&conn).expect("migrate");
@@ -2432,6 +2452,7 @@ mod tests {
 
         let response = PushMemoriesResponse {
             project: "agent-memory".to_string(),
+            server_revision: Some(4),
             results: vec![PushMemoryResult {
                 local_memory_id: Some(memory.id.clone()),
                 client_id: None,
@@ -2440,6 +2461,7 @@ mod tests {
                 action: PushMemoryAction::Conflict,
                 content_hash: Some("new-hash".to_string()),
                 conflict: None,
+                error: None,
                 errors: Vec::new(),
             }],
         };
@@ -2573,6 +2595,7 @@ mod tests {
                 cli_remote_memory("gw-fast-forward", "remote update", vec!["fast"], 4),
                 cli_remote_memory("gw-conflict", "remote update", vec!["conflict"], 4),
             ],
+            tombstones: vec![],
             next_cursor: Some("cursor-4".to_string()),
             server_revision: Some(4),
             has_more: false,
@@ -2627,6 +2650,7 @@ mod tests {
                 cli_remote_memory("gw-link", "same project content", vec!["link"], 10),
                 cli_remote_memory("gw-import", "global only content", vec!["global"], 11),
             ],
+            tombstones: vec![],
             next_cursor: None,
             server_revision: Some(11),
             has_more: false,

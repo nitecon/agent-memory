@@ -37,13 +37,15 @@ content:
         - Confirm memory working get returns present="false".
     - name: Push project memories to the gateway
       steps:
-        - Configure AGENT_MEMORY_GATEWAY_URL and AGENT_MEMORY_GATEWAY_API_KEY, or their AGENT_GATEWAY_* fallbacks.
+        - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
+        - Environment overrides also work via AGENT_MEMORY_GATEWAY_*, AGENT_GATEWAY_*, or GATEWAY_*.
         - Run memory push status to inspect local project memories that would be sent; this status command does not contact the gateway.
         - Run memory push to POST pending create/update records to the gateway.
         - Resolve any conflict results reported by the gateway before expecting the local sync metadata to advance.
     - name: Pull project memories from the gateway
       steps:
-        - Configure AGENT_MEMORY_GATEWAY_URL and AGENT_MEMORY_GATEWAY_API_KEY, or their AGENT_GATEWAY_* fallbacks.
+        - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
+        - Environment overrides also work via AGENT_MEMORY_GATEWAY_*, AGENT_GATEWAY_*, or GATEWAY_*.
         - Run memory pull status to fetch remote diffs and print the local plan without writing local memory rows or sync metadata.
         - Run memory pull to import, link, fast-forward, or mark tombstone metadata for non-conflicting gateway memories.
         - Resolve conflicts before expecting the project pull cursor to advance.
@@ -53,12 +55,22 @@ content:
         - Publish with agent-tools docs publish --file .agent/api/memory.yaml.
   auth:
     gateway_memory_exchange:
+      shared_config:
+        system: /opt/agentic/agent-tools/gateway.conf
+        user: ~/.agentic/agent-tools/gateway.conf
+        setup:
+          - memory setup gateway
+          - agent-tools setup gateway
       base_url_env:
         preferred: AGENT_MEMORY_GATEWAY_URL
-        fallback: AGENT_GATEWAY_URL
+        fallback:
+          - AGENT_GATEWAY_URL
+          - GATEWAY_URL
       api_key_env:
         preferred: AGENT_MEMORY_GATEWAY_API_KEY
-        fallback: AGENT_GATEWAY_API_KEY
+        fallback:
+          - AGENT_GATEWAY_API_KEY
+          - GATEWAY_API_KEY
       transport: Authorization Bearer token on gateway HTTP requests.
   cli:
     commands:
@@ -156,7 +168,7 @@ content:
       - name: memory update
         purpose: With no ID, run the self-updater; with ID plus --content, re-author a memory.
       - name: memory setup
-        purpose: Install or remove injected agent rules and bundled skill guidance.
+        purpose: Configure the shared gateway connection and install/remove injected agent rules and bundled skill guidance.
       - name: memory working get
         purpose: Read the current project's WorkingContext.
         args:
@@ -237,37 +249,41 @@ content:
       schemas:
         PushMemoriesRequest:
           required:
-            - project
             - memories
           fields:
-            project: Current project ident; must not be __global__.
-            memories: Array of GatewayMemory structs.
+            route_project: Current project ident in /v1/projects/{project}; must not be __global__.
+            memories: Array of GatewayMemory structs. Each item serializes project as project_ident for gateway validation.
         PushMemoriesResponse:
           required:
-            - project
+            - project_ident
+            - server_revision
             - results
           fields:
+            project_ident: Current project ident.
+            server_revision: Project-wide gateway memory revision after the batch.
             results: Array of per-memory created, updated, linked, conflict, or rejected results.
         PullMemoriesRequest:
-          required:
-            - project
+          required: []
           fields:
-            since_server_revision: Optional server revision watermark from project_gateway_sync_state.
-            cursor: Optional opaque gateway cursor from project_gateway_sync_state.
-            known_memories: Optional array of known gateway memory ids and revisions.
-            limit: Optional maximum remote records; CLI defaults to 100.
+            route_project: Current project ident in /v1/projects/{project}; must not be __global__.
+            since_revision: Optional server revision watermark from project_gateway_sync_state.
+            known: Optional array of known gateway_memory_id, server_revision, and content_hash values.
+            page_size: Optional maximum remote records; CLI defaults to 100.
+            include_tombstones: Gateway defaults to true.
         PullMemoriesResponse:
           required:
-            - project
+            - project_ident
             - memories
           fields:
-            memories: Array of GatewayMemory structs plus optional tombstone metadata.
-            next_cursor: Optional opaque cursor to persist only when pull has no conflicts.
+            project_ident: Current project ident.
+            memories: Array of active GatewayMemory structs.
+            tombstones: Array of tombstone records that the client converts into tombstone pull plans.
+            next_since_revision: Gateway watermark corresponding to this page.
             server_revision: Optional project-wide gateway revision to persist only when pull has no conflicts.
             has_more: True when the gateway has more records after this page.
         GatewayMemory:
           required:
-            - project
+            - project_ident
             - content
             - memory_type
             - content_hash
@@ -276,12 +292,16 @@ content:
             - local_memory_id
             - client_id
             - gateway_memory_id
-            - base_server_revision
+            - base_gateway_revision
             - server_revision
             - created_at
             - updated_at
             - provenance
             - tombstone
+          compatibility:
+            - memory accepts project as an alias for project_ident on responses.
+            - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
+            - content_hash is the gateway-compatible lowercase SHA-256 hex digest of content bytes, with no sha256: prefix.
       deconfliction:
         push: Client sends base_server_revision when linked; gateway returns conflict for stale updates.
         pull: Client updates only when local content hash matches last_pulled_content_hash or last_pushed_content_hash.

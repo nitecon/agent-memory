@@ -107,8 +107,12 @@ WorkingContext, and `memory projects` lists durable-memory projects only.
 `memory push` and `memory pull` exchange only durable memories for the current
 project ident. Global memories (`__global__`) and WorkingContext are excluded.
 
-Configure the gateway with either the memory-specific environment variables or
-the generic agent gateway variables:
+Configure the gateway once with either `memory setup gateway` or the equivalent
+`agent-tools setup gateway`. Both commands write the shared
+`~/.agentic/agent-tools/gateway.conf` file that `memory push` and
+`memory pull` read.
+
+Environment variables still override the shared file when set:
 
 ```bash
 export AGENT_MEMORY_GATEWAY_URL="https://gateway.example"
@@ -117,6 +121,10 @@ export AGENT_MEMORY_GATEWAY_API_KEY="..."
 # Fallback names also work:
 export AGENT_GATEWAY_URL="https://gateway.example"
 export AGENT_GATEWAY_API_KEY="..."
+
+# agent-tools-compatible names also work:
+export GATEWAY_URL="https://gateway.example"
+export GATEWAY_API_KEY="..."
 ```
 
 ```bash
