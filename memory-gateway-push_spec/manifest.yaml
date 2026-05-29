@@ -1,0 +1,113 @@
+spec_version: 1
+source_doc: ../memory-gateway-exchange.md
+generated_at: 2026-05-29T13:51:04Z
+generated_from_revision: 5ddfbbc47ff826f9ac08cb78885300fe84fbdce4
+metadata:
+  title: "Project Memory Push"
+  scope: "Implement the agent-memory client side of project-only memory push through the agent gateway."
+phases:
+  - id: phase-1
+    name: "Phase 1 - Contract and Local State"
+    description: "Pin the push request/response contract and add local metadata needed for idempotent gateway exchange."
+    tasks:
+      - id: T001
+        team: backend
+        title: "Define push contract structs and fixtures"
+        depends_on: []
+        spec_file: backend/T001-push-contract-structs.md
+        acceptance_criteria:
+          - "Rust request/response structs represent the gateway push API as project ident plus an array of project-only memory structs."
+          - "Structs exclude global memories and WorkingContext by construction or by explicit validation."
+          - "Per-item response model includes gateway memory ID, server revision, action, conflict metadata, and validation errors."
+          - "Serialization fixtures cover create, update, exact-hash link, conflict, and rejected-secret cases."
+          - "The spec references delegated gateway push API task `019e73fd-8869-7451-8c75-4b7c7a96b4f8` as the external contract owner."
+        touch_surface:
+          - memory/src/sync.rs
+          - memory/src/lib.rs
+          - memory/tests/gateway_push_contract.rs
+        status: todo
+      - id: T002
+        team: backend
+        title: "Add local gateway sync metadata"
+        depends_on: [T001]
+        spec_file: backend/T002-local-sync-metadata.md
+        acceptance_criteria:
+          - "SQLite schema records local memory ID, gateway memory ID, last seen server revision, last pushed content hash, sync state, and timestamps."
+          - "Migration is backward compatible for existing memory databases."
+          - "DB query helpers can read, upsert, and clear sync metadata for a memory without changing memory content."
+          - "Tests cover fresh DB migration, existing DB migration, and sync metadata round trip."
+          - "Metadata is project-aware and cannot link a local memory to a gateway record from a different project ident."
+        touch_surface:
+          - memory/src/db/mod.rs
+          - memory/src/db/models.rs
+          - memory/src/db/queries.rs
+        status: todo
+  - id: phase-2
+    name: "Phase 2 - Push Execution"
+    description: "Build the gateway client and CLI behavior for status and mutation."
+    tasks:
+      - id: T003
+        team: backend
+        title: "Implement gateway push client"
+        depends_on: [T001, T002]
+        spec_file: backend/T003-gateway-push-client.md
+        acceptance_criteria:
+          - "Client sends one batch containing the cwd-derived project ident and project-only memory structs."
+          - "Client includes gateway IDs and base revisions for previously linked records."
+          - "Client treats exact content-hash links, created records, updated records, conflicts, and rejected records as separate outcomes."
+          - "HTTP error handling distinguishes authentication, project authorization, validation, transient gateway failure, and malformed response."
+          - "Unit tests cover request construction and response classification without requiring a live gateway."
+        touch_surface:
+          - memory/src/sync.rs
+          - memory/src/config.rs
+        status: todo
+      - id: T004
+        team: backend
+        title: "Implement memory push status and memory push"
+        depends_on: [T003]
+        spec_file: backend/T004-push-cli.md
+        acceptance_criteria:
+          - "`memory push status` prints counts and per-record actions that would be sent without mutating gateway or local sync metadata."
+          - "`memory push` uploads only project-scoped durable memories for the current project ident."
+          - "Successful push records gateway IDs, server revisions, content hashes, and sync state locally."
+          - "Conflicts are reported and do not overwrite local or remote content."
+          - "Output stays compact and consistent with existing XML-like CLI result style."
+        touch_surface:
+          - memory/src/cli.rs
+          - memory/src/render/mod.rs
+          - memory/src/sync.rs
+        status: todo
+  - id: phase-3
+    name: "Phase 3 - Validation and Documentation"
+    description: "Prove the push flow and document the operating model."
+    tasks:
+      - id: T005
+        team: qa
+        title: "Add push tests and conflict coverage"
+        depends_on: [T004]
+        spec_file: qa/T005-push-tests.md
+        acceptance_criteria:
+          - "Tests prove global memories and WorkingContext are never included in push candidates."
+          - "Tests prove exact content-hash duplicates are linked rather than re-created."
+          - "Tests prove moved remote base revision creates a conflict and leaves local metadata unchanged."
+          - "Tests prove status mode performs no local sync metadata writes."
+          - "`cargo test -p memory` passes."
+        touch_surface:
+          - memory/tests/gateway_push_contract.rs
+          - memory/src/cli.rs
+          - memory/src/db/queries.rs
+        status: todo
+      - id: T006
+        team: docs
+        title: "Document memory push workflow"
+        depends_on: [T004]
+        spec_file: docs/T006-push-docs.md
+        acceptance_criteria:
+          - "README or CLI help documents `memory push status` and `memory push`."
+          - "Docs state project-only scope and explicitly exclude global memories and WorkingContext."
+          - "Docs explain created, updated, linked, conflict, and rejected outcomes."
+          - "Docs state that push conflicts must be resolved before a later push can update the gateway record."
+        touch_surface:
+          - README.md
+          - memory/src/cli.rs
+        status: todo

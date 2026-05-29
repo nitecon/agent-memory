@@ -5,3 +5,4 @@ pub mod error;
 pub mod project;
 pub mod render;
 pub mod search;
+pub mod sync;

@@ -8,6 +8,7 @@ mod project;
 mod render;
 mod search;
 mod setup;
+mod sync;
 mod updater;
 
 use clap::Parser;

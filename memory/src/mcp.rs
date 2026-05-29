@@ -1055,6 +1055,7 @@ mod tests {
                 data_dir: PathBuf::from("/tmp/agent-memory-test"),
                 db_path: PathBuf::from("/tmp/agent-memory-test/memory.db"),
                 model_cache_dir: PathBuf::from("/tmp/agent-memory-test/models"),
+                gateway: Default::default(),
             },
             conn,
         )

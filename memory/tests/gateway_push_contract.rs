@@ -1,0 +1,152 @@
+use agent_memory::sync::{
+    GatewayMemory, MemoryConflict, MemoryValidationError, PushMemoriesRequest,
+    PushMemoriesResponse, PushMemoryAction, PushMemoryResult,
+};
+use serde_json::json;
+
+fn project_memory() -> GatewayMemory {
+    GatewayMemory {
+        project: "agent-memory".to_string(),
+        content: "Project-only memory body".to_string(),
+        memory_type: "project".to_string(),
+        tags: vec!["gateway-sync".to_string(), "project-ident".to_string()],
+        content_hash: "sha256:abc123".to_string(),
+        local_memory_id: Some("local-1".to_string()),
+        client_id: Some("client-1".to_string()),
+        gateway_memory_id: None,
+        base_server_revision: None,
+        server_revision: None,
+        created_at: Some("2026-05-29T13:51:04Z".to_string()),
+        updated_at: Some("2026-05-29T13:51:04Z".to_string()),
+        provenance: None,
+        tombstone: None,
+    }
+}
+
+#[test]
+fn push_request_is_project_plus_memory_array() {
+    let request = PushMemoriesRequest {
+        project: "agent-memory".to_string(),
+        memories: vec![project_memory()],
+    };
+
+    request.validate_project_scope().unwrap();
+
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "project": "agent-memory",
+            "memories": [
+                {
+                    "project": "agent-memory",
+                    "content": "Project-only memory body",
+                    "memory_type": "project",
+                    "tags": ["gateway-sync", "project-ident"],
+                    "content_hash": "sha256:abc123",
+                    "local_memory_id": "local-1",
+                    "client_id": "client-1",
+                    "created_at": "2026-05-29T13:51:04Z",
+                    "updated_at": "2026-05-29T13:51:04Z"
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn push_request_rejects_global_project() {
+    let mut memory = project_memory();
+    memory.project = "__global__".to_string();
+    let request = PushMemoriesRequest {
+        project: "__global__".to_string(),
+        memories: vec![memory],
+    };
+
+    let err = request.validate_project_scope().unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "global memories are excluded from gateway exchange"
+    );
+}
+
+#[test]
+fn push_request_rejects_working_context_memory_type() {
+    let mut memory = project_memory();
+    memory.memory_type = "working_context".to_string();
+    let request = PushMemoriesRequest {
+        project: "agent-memory".to_string(),
+        memories: vec![memory],
+    };
+
+    let err = request.validate_project_scope().unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "WorkingContext is excluded from gateway exchange"
+    );
+}
+
+#[test]
+fn push_response_covers_created_linked_conflict_and_rejected() {
+    let response = PushMemoriesResponse {
+        project: "agent-memory".to_string(),
+        results: vec![
+            PushMemoryResult {
+                local_memory_id: Some("local-1".to_string()),
+                client_id: None,
+                gateway_memory_id: Some("gw-1".to_string()),
+                server_revision: Some(1),
+                action: PushMemoryAction::Created,
+                content_hash: Some("sha256:abc123".to_string()),
+                conflict: None,
+                errors: vec![],
+            },
+            PushMemoryResult {
+                local_memory_id: Some("local-2".to_string()),
+                client_id: None,
+                gateway_memory_id: Some("gw-1".to_string()),
+                server_revision: Some(1),
+                action: PushMemoryAction::Linked,
+                content_hash: Some("sha256:abc123".to_string()),
+                conflict: None,
+                errors: vec![],
+            },
+            PushMemoryResult {
+                local_memory_id: Some("local-3".to_string()),
+                client_id: None,
+                gateway_memory_id: Some("gw-3".to_string()),
+                server_revision: Some(7),
+                action: PushMemoryAction::Conflict,
+                content_hash: None,
+                conflict: Some(MemoryConflict {
+                    base_server_revision: Some(5),
+                    remote_server_revision: Some(7),
+                    local_content_hash: Some("sha256:local".to_string()),
+                    remote_content_hash: Some("sha256:remote".to_string()),
+                    reason: "remote revision moved".to_string(),
+                }),
+                errors: vec![],
+            },
+            PushMemoryResult {
+                local_memory_id: Some("local-4".to_string()),
+                client_id: None,
+                gateway_memory_id: None,
+                server_revision: None,
+                action: PushMemoryAction::Rejected,
+                content_hash: None,
+                conflict: None,
+                errors: vec![MemoryValidationError {
+                    code: "secret_detected".to_string(),
+                    message: "memory content failed redaction policy".to_string(),
+                }],
+            },
+        ],
+    };
+
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["results"][0]["action"], "created");
+    assert_eq!(value["results"][1]["action"], "linked");
+    assert_eq!(value["results"][2]["action"], "conflict");
+    assert_eq!(value["results"][3]["action"], "rejected");
+    assert_eq!(value["results"][3]["errors"][0]["code"], "secret_detected");
+}

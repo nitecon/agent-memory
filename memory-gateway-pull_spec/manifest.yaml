@@ -1,0 +1,128 @@
+spec_version: 1
+source_doc: ../memory-gateway-exchange.md
+generated_at: 2026-05-29T13:51:04Z
+generated_from_revision: 5ddfbbc47ff826f9ac08cb78885300fe84fbdce4
+metadata:
+  title: "Project Memory Pull"
+  scope: "Implement the agent-memory client side of project-only memory pull through the agent gateway."
+phases:
+  - id: phase-1
+    name: "Phase 1 - Contract and Import State"
+    description: "Pin the pull response shape and local cursor/revision state before mutation."
+    tasks:
+      - id: T001
+        team: backend
+        title: "Define pull contract structs and fixtures"
+        depends_on: []
+        spec_file: backend/T001-pull-contract-structs.md
+        acceptance_criteria:
+          - "Rust request/response structs represent the gateway pull API as project ident plus cursor/revision state returning an array of project-only memory structs."
+          - "Structs carry gateway memory ID, server revision, content, memory type, tags, project ident, content hash, provenance, and tombstone status."
+          - "Structs exclude global memories and WorkingContext by construction or by explicit validation."
+          - "Serialization fixtures cover new remote memory, remote update, tombstone, paginated cursor, and malformed-project rejection cases."
+          - "The spec references delegated gateway pull API task `019e73fd-8860-7781-b3a6-878af49b8c36` as the external contract owner."
+        touch_surface:
+          - memory/src/sync.rs
+          - memory/src/lib.rs
+          - memory/tests/gateway_pull_contract.rs
+        status: todo
+      - id: T002
+        team: backend
+        title: "Add pull cursor and import metadata"
+        depends_on: [T001]
+        spec_file: backend/T002-pull-import-metadata.md
+        acceptance_criteria:
+          - "SQLite metadata records last pulled server revision or cursor for the current project ident."
+          - "Local memory to gateway memory mapping can be created for pulled remote records."
+          - "Metadata supports tombstone tracking without hard-deleting local memories automatically."
+          - "Tests cover fresh DB migration, cursor round trip, imported mapping round trip, and project-ident mismatch rejection."
+          - "Metadata updates do not modify memory content timestamps unless a memory body is actually imported or updated."
+        touch_surface:
+          - memory/src/db/mod.rs
+          - memory/src/db/models.rs
+          - memory/src/db/queries.rs
+        status: todo
+  - id: phase-2
+    name: "Phase 2 - Pull Execution"
+    description: "Fetch remote diffs and apply non-conflicting imports."
+    tasks:
+      - id: T003
+        team: backend
+        title: "Implement gateway pull client"
+        depends_on: [T001, T002]
+        spec_file: backend/T003-gateway-pull-client.md
+        acceptance_criteria:
+          - "Client requests diffs using current project ident and the local last-seen gateway revision or cursor."
+          - "Client handles stable pagination until complete or until a configured page limit is reached."
+          - "Client classifies new remote records, remote updates, tombstones, exact-hash links, conflicts, and rejected records."
+          - "HTTP error handling distinguishes authentication, project authorization, validation, transient gateway failure, and malformed response."
+          - "Unit tests cover request construction, pagination, and response classification without requiring a live gateway."
+        touch_surface:
+          - memory/src/sync.rs
+          - memory/src/config.rs
+        status: todo
+      - id: T004
+        team: backend
+        title: "Implement pull import and conflict handling"
+        depends_on: [T003]
+        spec_file: backend/T004-pull-import-conflicts.md
+        acceptance_criteria:
+          - "New remote memories import as local project-scoped durable memories with gateway provenance metadata."
+          - "Remote updates fast-forward local memories only when the local body has not changed since the recorded base revision/hash."
+          - "Local edits plus newer remote revision produce a conflict and leave local content unchanged."
+          - "Tombstones are recorded and reported without automatically hard-deleting local memory content."
+          - "Exact content-hash duplicates are linked to the gateway record without creating duplicate local memories."
+        touch_surface:
+          - memory/src/sync.rs
+          - memory/src/db/queries.rs
+        status: todo
+      - id: T005
+        team: backend
+        title: "Implement memory pull status and memory pull"
+        depends_on: [T004]
+        spec_file: backend/T005-pull-cli.md
+        acceptance_criteria:
+          - "`memory pull status` fetches or computes pending remote actions and prints them without importing or updating local memories."
+          - "`memory pull` imports non-conflicting remote diffs for the current project ident."
+          - "Successful pull records gateway IDs, server revisions, content hashes, provenance, and project cursor locally."
+          - "Conflicts are reported and do not overwrite local content."
+          - "Output stays compact and consistent with existing XML-like CLI result style."
+        touch_surface:
+          - memory/src/cli.rs
+          - memory/src/render/mod.rs
+          - memory/src/sync.rs
+        status: todo
+  - id: phase-3
+    name: "Phase 3 - Validation and Documentation"
+    description: "Prove the pull flow and document how imported memories behave."
+    tasks:
+      - id: T006
+        team: qa
+        title: "Add pull tests and conflict coverage"
+        depends_on: [T005]
+        spec_file: qa/T006-pull-tests.md
+        acceptance_criteria:
+          - "Tests prove global memories and WorkingContext are never imported through pull."
+          - "Tests prove new remote memories import under the current project ident."
+          - "Tests prove remote updates fast-forward only when the local base hash still matches."
+          - "Tests prove status mode performs no local content or metadata writes."
+          - "`cargo test -p memory` passes."
+        touch_surface:
+          - memory/tests/gateway_pull_contract.rs
+          - memory/src/cli.rs
+          - memory/src/db/queries.rs
+        status: todo
+      - id: T007
+        team: docs
+        title: "Document memory pull workflow"
+        depends_on: [T005]
+        spec_file: docs/T007-pull-docs.md
+        acceptance_criteria:
+          - "README or CLI help documents `memory pull status` and `memory pull`."
+          - "Docs state project-only scope and explicitly exclude global memories and WorkingContext."
+          - "Docs explain imported, updated, linked, tombstone, conflict, and rejected outcomes."
+          - "Docs state that semantic near-duplicates are not silently merged during pull."
+        touch_surface:
+          - README.md
+          - memory/src/cli.rs
+        status: todo

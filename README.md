@@ -67,12 +67,12 @@ The database path is resolved in this order:
 |----------|-----------|------|
 | 1 | `AGENT_MEMORY_DIR` env var is set | `$AGENT_MEMORY_DIR/memory.db` |
 | 2 | `~/.agentic/memory.db` exists | `~/.agentic/memory.db` (user-local) |
-| 3 | Default (Linux/macOS) | `/opt/agentic/memory.db` (global) |
-| 3 | Default (Windows) | `%USERPROFILE%\.agentic\memory.db` |
+| 3 | writable `/opt/agentic/memory.db` exists (Linux/macOS) | `/opt/agentic/memory.db` (legacy shared DB) |
+| 4 | Default | `~/.agentic/memory.db` |
 
 The model cache and any auxiliary data are stored alongside the database in the same directory.
 
-This means on a shared Linux/macOS machine, all agents share `/opt/agentic/memory.db` by default. If you need per-user isolation, create `~/.agentic/memory.db` (even an empty file will trigger the user-local path) or set `AGENT_MEMORY_DIR`.
+Fresh installs default to the user-writable `~/.agentic/` directory so first-run model downloads and database writes do not depend on `/opt` permissions. Existing shared Linux/macOS installs that already have a writable `/opt/agentic/memory.db` continue to use that database. Set `AGENT_MEMORY_DIR` when you need an explicit shared or test data directory.
 
 ## Recommended usage: CLI-first
 
@@ -101,6 +101,45 @@ characters so every future `memory context` call stays bounded.
 Project-wide `memory move --from X --to Y` transfers the handoff to `Y`;
 moving to an empty target clears it. `memory copy` does not duplicate
 WorkingContext, and `memory projects` lists durable-memory projects only.
+
+### Project memory gateway exchange
+
+`memory push` and `memory pull` exchange only durable memories for the current
+project ident. Global memories (`__global__`) and WorkingContext are excluded.
+
+Configure the gateway with either the memory-specific environment variables or
+the generic agent gateway variables:
+
+```bash
+export AGENT_MEMORY_GATEWAY_URL="https://gateway.example"
+export AGENT_MEMORY_GATEWAY_API_KEY="..."
+
+# Fallback names also work:
+export AGENT_GATEWAY_URL="https://gateway.example"
+export AGENT_GATEWAY_API_KEY="..."
+```
+
+```bash
+# Local, read-only preview of project memories that would be uploaded.
+memory push status
+
+# Upload pending project memories. Successful created/updated/linked results
+# record gateway IDs and server revisions locally.
+memory push
+
+# Gateway-backed preview of remote project-memory diffs.
+memory pull status
+
+# Import/link/update non-conflicting remote project memories. Conflicts are
+# reported without overwriting local content.
+memory pull
+```
+
+Push outcomes are `created`, `updated`, `linked`, `conflict`, or `rejected`.
+Pull outcomes are `import`, `update`, `link`, `tombstone`, `conflict`,
+`skipped`, or `rejected`. Semantic near-duplicates are not silently merged
+during pull; use the dream/consolidation flow after import when memories need
+curation.
 
 ### Auto-install the agent protocol
 
@@ -344,6 +383,12 @@ memory list -k 50 --project myapp
 
 # List distinct project idents (great for spotting alias mismatches)
 memory projects
+
+# Exchange durable project memories with the agent gateway
+memory push status
+memory push
+memory pull status
+memory pull
 
 # Migrate memories from a legacy project name to the canonical git-remote ident
 memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git" --dry-run
@@ -688,4 +733,4 @@ Results are combined via **Reciprocal Rank Fusion** (k=60), which merges ranked 
 - **Model loads lazily.** Commands that don't need embeddings (e.g., `recall`, `forget --id`) skip the ~200ms model load.
 - **Access counts track usage.** Every retrieval increments `access_count`, enabling `prune` to identify stale memories.
 - **All logging goes to stderr.** Stdout is reserved for light-XML results (CLI) or JSON-RPC transport (MCP), so logging never pollutes either channel. MCP tool responses themselves are light-XML strings delivered as a single text content block.
-- **Global-first storage.** `/opt/agentic/memory.db` is shared across all users/agents by default, with `~/.agentic/` as a user-local override.
+- **User-writable default storage.** Fresh installs store data under `~/.agentic/` to avoid `/opt` permission failures; existing writable `/opt/agentic/memory.db` installs are preserved as legacy shared databases.

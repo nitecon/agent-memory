@@ -3,11 +3,19 @@ pub mod queries;
 
 use rusqlite::Connection;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::MemoryError;
 
 pub fn open_database(db_path: &Path) -> Result<Connection, MemoryError> {
+    if db_path != Path::new(":memory:") {
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     let conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
 
     // WAL mode for better concurrent read performance
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -190,6 +198,48 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         )?;
     }
 
+    if version < 6 {
+        // Schema v6 — gateway exchange metadata for project-only memories.
+        //
+        // Durable memory rows remain canonical for local recall. These side
+        // tables only record mapping/cursor state needed by `memory push` and
+        // `memory pull`, so sync bookkeeping does not mutate memory content or
+        // bump `memories.updated_at`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_gateway_sync (
+                 local_memory_id TEXT PRIMARY KEY NOT NULL,
+                 project TEXT NOT NULL
+                     CHECK (project <> '__global__'),
+                 gateway_memory_id TEXT NOT NULL,
+                 last_seen_server_revision INTEGER NOT NULL,
+                 last_pushed_content_hash TEXT,
+                 last_pulled_content_hash TEXT,
+                 sync_state TEXT NOT NULL,
+                 tombstone_deleted INTEGER NOT NULL DEFAULT 0
+                     CHECK (tombstone_deleted IN (0, 1)),
+                 tombstone_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 FOREIGN KEY(local_memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                 UNIQUE(project, gateway_memory_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_sync_project
+                 ON memory_gateway_sync(project);
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_sync_gateway_id
+                 ON memory_gateway_sync(project, gateway_memory_id);
+
+             CREATE TABLE IF NOT EXISTS project_gateway_sync_state (
+                 project TEXT PRIMARY KEY NOT NULL
+                     CHECK (project <> '__global__'),
+                 last_pull_server_revision INTEGER,
+                 last_pull_cursor TEXT,
+                 updated_at TEXT NOT NULL
+             );
+
+             INSERT OR IGNORE INTO schema_version (version) VALUES (6);",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -244,7 +294,7 @@ mod migration_tests {
         )
         .expect("seed v2 db");
 
-        // Apply migrations — should run v3, v4, and v5 steps in sequence.
+        // Apply migrations — should run v3, v4, v5, and v6 steps in sequence.
         run_migrations(&conn).expect("migrate to latest");
 
         // Schema version advanced to latest.
@@ -253,7 +303,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 5);
+        assert_eq!(max_v, 6);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -296,7 +346,24 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 5);
+        assert_eq!(max_v, 6);
+    }
+
+    #[test]
+    fn open_database_creates_parent_dirs_and_sets_busy_timeout() {
+        let root = std::env::temp_dir().join(format!("agent-memory-db-{}", uuid::Uuid::new_v4()));
+        let db_path = root.join("nested").join("memory.db");
+
+        let conn = open_database(&db_path).expect("open database");
+
+        assert!(db_path.exists());
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("read busy timeout");
+        assert_eq!(timeout_ms, 5000);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// v4 migration from a v3 fixture DB must create the `project_state`
@@ -344,7 +411,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 5);
+        assert_eq!(max_v, 6);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -357,8 +424,9 @@ mod migration_tests {
         assert_eq!(existing, "body");
     }
 
-    /// v5 migration from a v4 fixture DB must create the WorkingContext table
-    /// without disturbing `project_state` or existing memory rows.
+    /// v5+ migrations from a v4 fixture DB must create the WorkingContext and
+    /// gateway sync tables without disturbing `project_state` or existing
+    /// memory rows.
     #[test]
     fn v4_database_upgrades_to_v5_creating_working_context() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -401,6 +469,13 @@ mod migration_tests {
             .expect("query project_working_context");
         assert_eq!(working_count, 0);
 
+        let gateway_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
+                row.get(0)
+            })
+            .expect("query memory_gateway_sync");
+        assert_eq!(gateway_count, 0);
+
         let dream_ts: String = conn
             .query_row(
                 "SELECT last_dream_at FROM project_state WHERE project = 'agent-memory'",
@@ -415,7 +490,95 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 5);
+        assert_eq!(max_v, 6);
+
+        let existing: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id = 'existing-row'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("select existing row");
+        assert_eq!(existing, "body");
+    }
+
+    /// v6 migration from a v5 fixture DB must add gateway exchange metadata
+    /// tables without disturbing WorkingContext or durable memory rows.
+    #[test]
+    fn v5_database_upgrades_to_v6_creating_gateway_sync_tables() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                 tags TEXT, project TEXT, agent TEXT, source_file TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 access_count INTEGER DEFAULT 0, embedding BLOB, memory_type TEXT,
+                 content_raw TEXT, superseded_by TEXT,
+                 condenser_version TEXT, embedding_model TEXT
+             );
+             CREATE VIRTUAL TABLE memories_fts USING fts5(
+                 content, content='memories', content_rowid='rowid',
+                 tokenize='porter unicode61'
+             );
+             CREATE TABLE project_state (
+                 project TEXT PRIMARY KEY,
+                 last_dream_at TEXT NOT NULL
+             );
+             CREATE TABLE project_working_context (
+                 project TEXT PRIMARY KEY NOT NULL
+                     CHECK (project <> '__global__'),
+                 content TEXT NOT NULL
+                     CHECK (LENGTH(content) <= 65536),
+                 version INTEGER NOT NULL DEFAULT 1,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO schema_version (version) VALUES (1);
+             INSERT INTO schema_version (version) VALUES (2);
+             INSERT INTO schema_version (version) VALUES (3);
+             INSERT INTO schema_version (version) VALUES (4);
+             INSERT INTO schema_version (version) VALUES (5);
+             INSERT INTO memories (id, content, project, created_at, updated_at)
+                 VALUES ('existing-row', 'body', 'agent-memory', '2026-01-01', '2026-01-01');
+             INSERT INTO project_working_context (project, content, version, updated_at)
+                 VALUES ('agent-memory', 'handoff', 1, '2026-04-23T00:00:00Z');",
+        )
+        .expect("seed v5 db");
+
+        run_migrations(&conn).expect("migrate to latest");
+
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("query schema_version");
+        assert_eq!(max_v, 6);
+
+        let sync_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
+                row.get(0)
+            })
+            .expect("query memory_gateway_sync");
+        assert_eq!(sync_count, 0);
+
+        let project_sync_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_gateway_sync_state",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query project_gateway_sync_state");
+        assert_eq!(project_sync_count, 0);
+
+        let handoff: String = conn
+            .query_row(
+                "SELECT content FROM project_working_context WHERE project = 'agent-memory'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query working context");
+        assert_eq!(handoff, "handoff");
 
         let existing: String = conn
             .query_row(

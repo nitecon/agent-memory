@@ -1,10 +1,13 @@
-use std::{io::Read, path::PathBuf};
+use std::{collections::HashMap, io::Read, path::PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::db::models::{Memory, WorkingContext};
+use crate::db::models::{
+    embedding_to_blob, Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert, WorkingContext,
+    EMBEDDING_MODEL_NAME_DEFAULT,
+};
 use crate::db::queries::{self, ResolvedId};
 use crate::embedding;
 use crate::error::MemoryError;
@@ -12,6 +15,11 @@ use crate::project;
 use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
 use crate::setup::{menu, rules, skill};
+use crate::sync::{
+    memory_content_hash, GatewayMemory, GatewayMemoryTombstone, GatewaySyncClientError,
+    MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse, PushMemoriesRequest,
+    PushMemoriesResponse, PushMemoryAction,
+};
 
 /// Score multiplier applied to memories tagged with the current project.
 /// Strong cross-project matches can still out-rank weak current-project hits;
@@ -282,6 +290,16 @@ pub enum Cli {
         #[command(subcommand)]
         command: WorkingCommands,
     },
+    /// Push project-scoped durable memories to the agent gateway.
+    Push {
+        #[command(subcommand)]
+        command: Option<GatewayTransferCommand>,
+    },
+    /// Pull project-scoped durable memories from the agent gateway.
+    Pull {
+        #[command(subcommand)]
+        command: Option<GatewayTransferCommand>,
+    },
     /// Start MCP stdio server.
     Serve,
     /// Dual-mode command:
@@ -349,6 +367,12 @@ pub enum WorkingCommands {
         #[arg(short, long)]
         project: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum GatewayTransferCommand {
+    /// Show pending gateway exchange actions without local mutation.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -802,6 +826,22 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 );
             }
         },
+        Cli::Push { command } => {
+            run_push(
+                conn,
+                &config,
+                cwd_project.as_deref(),
+                matches!(command, Some(GatewayTransferCommand::Status)),
+            )?;
+        }
+        Cli::Pull { command } => {
+            run_pull(
+                conn,
+                &config,
+                cwd_project.as_deref(),
+                matches!(command, Some(GatewayTransferCommand::Status)),
+            )?;
+        }
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
         }
@@ -1027,6 +1067,651 @@ fn run_update_content(
         render::render_action_result("updated", &[("id", render::short_id(&full_id).to_string())])
     );
     Ok(())
+}
+
+#[derive(Debug)]
+struct PushCandidate {
+    local_memory_id: String,
+    gateway_memory: GatewayMemory,
+    action: &'static str,
+}
+
+#[derive(Debug)]
+struct PullPlan {
+    action: &'static str,
+    remote: GatewayMemory,
+    local_memory_id: Option<String>,
+    local_content_hash: Option<String>,
+}
+
+fn run_push(
+    conn: &Connection,
+    config: &Config,
+    cwd_project: Option<&str>,
+    status_only: bool,
+) -> Result<(), MemoryError> {
+    let project = resolve_gateway_project(cwd_project)?;
+    let candidates = build_push_candidates(conn, &project)?;
+    let pending: Vec<&PushCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.action != "skipped")
+        .collect();
+
+    print_push_status(&project, &candidates);
+    if status_only {
+        return Ok(());
+    }
+
+    if pending.is_empty() {
+        println!(
+            "{}",
+            render::render_action_result("push_complete", &[("sent", "0".to_string())])
+        );
+        return Ok(());
+    }
+
+    let request = PushMemoriesRequest {
+        project: project.clone(),
+        memories: pending
+            .iter()
+            .map(|candidate| candidate.gateway_memory.clone())
+            .collect(),
+    };
+    let hashes: HashMap<String, String> = pending
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.local_memory_id.clone(),
+                candidate.gateway_memory.content_hash.clone(),
+            )
+        })
+        .collect();
+    let response = MemoryGatewayClient::from_config(&config.gateway)
+        .map_err(map_gateway_error)?
+        .push_memories(&request)
+        .map_err(map_gateway_error)?;
+
+    apply_push_response(conn, &project, &response, &hashes)?;
+    print_push_response(&response);
+    Ok(())
+}
+
+fn build_push_candidates(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<PushCandidate>, MemoryError> {
+    if project == GLOBAL_PROJECT_IDENT {
+        return Err(MemoryError::Config(
+            "Global memories are excluded from gateway push".to_string(),
+        ));
+    }
+    let memories = queries::list_memories_by_project(conn, Some(project))?;
+    let mut candidates = Vec::new();
+    for memory in memories {
+        let sync = queries::get_memory_gateway_sync(conn, &memory.id)?;
+        let gateway_memory = gateway_memory_from_local(&memory, project, sync.as_ref())?;
+        let action = match sync.as_ref() {
+            None => "create",
+            Some(record)
+                if record.last_pushed_content_hash.as_deref()
+                    == Some(gateway_memory.content_hash.as_str()) =>
+            {
+                "skipped"
+            }
+            Some(_) => "update",
+        };
+        candidates.push(PushCandidate {
+            local_memory_id: memory.id,
+            gateway_memory,
+            action,
+        });
+    }
+    Ok(candidates)
+}
+
+fn gateway_memory_from_local(
+    memory: &Memory,
+    project: &str,
+    sync: Option<&MemoryGatewaySync>,
+) -> Result<GatewayMemory, MemoryError> {
+    if memory.project.as_deref() != Some(project) {
+        return Err(MemoryError::Config(format!(
+            "memory {} is not scoped to project {project}",
+            memory.id
+        )));
+    }
+    let memory_type = memory
+        .memory_type
+        .clone()
+        .unwrap_or_else(|| "user".to_string());
+    let tags = memory.tags.clone().unwrap_or_default();
+    let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
+    Ok(GatewayMemory {
+        project: project.to_string(),
+        content: memory.content.clone(),
+        memory_type,
+        tags,
+        content_hash,
+        local_memory_id: Some(memory.id.clone()),
+        client_id: Some(memory.id.clone()),
+        gateway_memory_id: sync.map(|record| record.gateway_memory_id.clone()),
+        base_server_revision: sync.map(|record| record.last_seen_server_revision),
+        server_revision: None,
+        created_at: Some(memory.created_at.clone()),
+        updated_at: Some(memory.updated_at.clone()),
+        provenance: None,
+        tombstone: None,
+    })
+}
+
+fn apply_push_response(
+    conn: &Connection,
+    project: &str,
+    response: &PushMemoriesResponse,
+    hashes_by_local_id: &HashMap<String, String>,
+) -> Result<(), MemoryError> {
+    for result in &response.results {
+        let should_record = matches!(
+            result.action,
+            PushMemoryAction::Created | PushMemoryAction::Updated | PushMemoryAction::Linked
+        );
+        if !should_record {
+            continue;
+        }
+        let Some(local_memory_id) = result.local_memory_id.as_deref() else {
+            continue;
+        };
+        let Some(gateway_memory_id) = result.gateway_memory_id.as_deref() else {
+            continue;
+        };
+        let Some(server_revision) = result.server_revision else {
+            continue;
+        };
+        let content_hash = result
+            .content_hash
+            .clone()
+            .or_else(|| hashes_by_local_id.get(local_memory_id).cloned());
+
+        queries::upsert_memory_gateway_sync(
+            conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: local_memory_id.to_string(),
+                project: project.to_string(),
+                gateway_memory_id: gateway_memory_id.to_string(),
+                last_seen_server_revision: server_revision,
+                last_pushed_content_hash: content_hash,
+                last_pulled_content_hash: None,
+                sync_state: format!("{:?}", result.action).to_ascii_lowercase(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn print_push_status(project: &str, candidates: &[PushCandidate]) {
+    let pending = candidates
+        .iter()
+        .filter(|candidate| candidate.action != "skipped")
+        .count();
+    let skipped = candidates.len().saturating_sub(pending);
+    println!(
+        "{}",
+        render::render_action_result(
+            "push_status",
+            &[
+                ("project", project.to_string()),
+                ("candidates", candidates.len().to_string()),
+                ("pending", pending.to_string()),
+                ("skipped", skipped.to_string()),
+            ],
+        )
+    );
+    for candidate in candidates {
+        let mut attrs = vec![
+            (
+                "id",
+                render::short_id(&candidate.local_memory_id).to_string(),
+            ),
+            ("action", candidate.action.to_string()),
+            ("hash", candidate.gateway_memory.content_hash.clone()),
+            ("type", candidate.gateway_memory.memory_type.clone()),
+        ];
+        if let Some(gateway_id) = candidate.gateway_memory.gateway_memory_id.as_deref() {
+            attrs.push(("gateway_id", gateway_id.to_string()));
+        }
+        if let Some(rev) = candidate.gateway_memory.base_server_revision {
+            attrs.push(("base_revision", rev.to_string()));
+        }
+        println!("{}", render::render_action_result("push_candidate", &attrs));
+    }
+}
+
+fn print_push_response(response: &PushMemoriesResponse) {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for result in &response.results {
+        let action = push_action_label(&result.action);
+        *counts.entry(action).or_default() += 1;
+        let mut attrs = vec![("action", action.to_string())];
+        if let Some(id) = result.local_memory_id.as_deref() {
+            attrs.push(("id", render::short_id(id).to_string()));
+        }
+        if let Some(gateway_id) = result.gateway_memory_id.as_deref() {
+            attrs.push(("gateway_id", gateway_id.to_string()));
+        }
+        if let Some(rev) = result.server_revision {
+            attrs.push(("server_revision", rev.to_string()));
+        }
+        if let Some(conflict) = result.conflict.as_ref() {
+            attrs.push(("reason", conflict.reason.clone()));
+        }
+        if let Some(error) = result.errors.first() {
+            attrs.push(("error", error.code.clone()));
+        }
+        println!("{}", render::render_action_result("push_result", &attrs));
+    }
+    println!(
+        "{}",
+        render::render_action_result(
+            "push_complete",
+            &[
+                ("project", response.project.clone()),
+                (
+                    "created",
+                    counts.get("created").copied().unwrap_or(0).to_string()
+                ),
+                (
+                    "updated",
+                    counts.get("updated").copied().unwrap_or(0).to_string()
+                ),
+                (
+                    "linked",
+                    counts.get("linked").copied().unwrap_or(0).to_string()
+                ),
+                (
+                    "conflicts",
+                    counts.get("conflict").copied().unwrap_or(0).to_string(),
+                ),
+                (
+                    "rejected",
+                    counts.get("rejected").copied().unwrap_or(0).to_string(),
+                ),
+            ],
+        )
+    );
+}
+
+fn push_action_label(action: &PushMemoryAction) -> &'static str {
+    match action {
+        PushMemoryAction::Created => "created",
+        PushMemoryAction::Updated => "updated",
+        PushMemoryAction::Linked => "linked",
+        PushMemoryAction::Conflict => "conflict",
+        PushMemoryAction::Rejected => "rejected",
+    }
+}
+
+fn run_pull(
+    conn: &Connection,
+    config: &Config,
+    cwd_project: Option<&str>,
+    status_only: bool,
+) -> Result<(), MemoryError> {
+    let project = resolve_gateway_project(cwd_project)?;
+    let state = queries::get_project_gateway_sync_state(conn, &project)?;
+    let request = PullMemoriesRequest {
+        project: project.clone(),
+        since_server_revision: state.as_ref().and_then(|s| s.last_pull_server_revision),
+        cursor: state.and_then(|s| s.last_pull_cursor),
+        known_memories: Vec::new(),
+        limit: Some(100),
+    };
+    let response = MemoryGatewayClient::from_config(&config.gateway)
+        .map_err(map_gateway_error)?
+        .pull_memories(&request)
+        .map_err(map_gateway_error)?;
+    response.validate_project_scope().map_err(|err| {
+        MemoryError::Config(format!(
+            "gateway pull response failed scope validation: {err}"
+        ))
+    })?;
+
+    let plans = plan_pull_actions(conn, &project, &response)?;
+    print_pull_status(&project, &plans, status_only);
+    if status_only {
+        return Ok(());
+    }
+
+    let conflicts = apply_pull_plans(conn, config, &project, &plans)?;
+    if conflicts == 0 {
+        queries::upsert_project_gateway_sync_state(
+            conn,
+            &project,
+            response.server_revision,
+            response.next_cursor.as_deref(),
+        )?;
+    }
+    println!(
+        "{}",
+        render::render_action_result(
+            "pull_complete",
+            &[
+                ("project", project),
+                ("conflicts", conflicts.to_string()),
+                ("cursor_updated", (conflicts == 0).to_string()),
+            ],
+        )
+    );
+    Ok(())
+}
+
+fn plan_pull_actions(
+    conn: &Connection,
+    project: &str,
+    response: &PullMemoriesResponse,
+) -> Result<Vec<PullPlan>, MemoryError> {
+    let local_memories = queries::list_memories_by_project(conn, Some(project))?;
+    let mut local_hashes: HashMap<String, String> = HashMap::new();
+    for memory in &local_memories {
+        local_hashes.insert(memory.id.clone(), local_memory_hash(memory));
+    }
+
+    let mut plans = Vec::new();
+    for remote in &response.memories {
+        let gateway_id = remote.gateway_memory_id.as_deref();
+        let existing = match gateway_id {
+            Some(id) => queries::get_memory_gateway_sync_by_gateway_id(conn, project, id)?,
+            None => None,
+        };
+
+        if remote
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false)
+        {
+            plans.push(PullPlan {
+                action: if existing.is_some() {
+                    "tombstone"
+                } else {
+                    "tombstone_unknown"
+                },
+                remote: remote.clone(),
+                local_memory_id: existing.map(|record| record.local_memory_id),
+                local_content_hash: None,
+            });
+            continue;
+        }
+
+        let Some(remote_revision) = remote.server_revision else {
+            plans.push(PullPlan {
+                action: "rejected",
+                remote: remote.clone(),
+                local_memory_id: None,
+                local_content_hash: None,
+            });
+            continue;
+        };
+        if gateway_id.is_none() {
+            plans.push(PullPlan {
+                action: "rejected",
+                remote: remote.clone(),
+                local_memory_id: None,
+                local_content_hash: None,
+            });
+            continue;
+        }
+
+        if let Some(record) = existing {
+            let local_hash = local_hashes.get(&record.local_memory_id).cloned();
+            let base_hash = record
+                .last_pulled_content_hash
+                .as_ref()
+                .or(record.last_pushed_content_hash.as_ref());
+            let action = if record.last_seen_server_revision >= remote_revision {
+                "skipped"
+            } else if local_hash.as_ref() == base_hash {
+                "update"
+            } else {
+                "conflict"
+            };
+            plans.push(PullPlan {
+                action,
+                remote: remote.clone(),
+                local_memory_id: Some(record.local_memory_id),
+                local_content_hash: local_hash,
+            });
+            continue;
+        }
+
+        let exact_local = local_hashes
+            .iter()
+            .find(|(_, hash)| *hash == &remote.content_hash)
+            .map(|(id, hash)| (id.clone(), hash.clone()));
+        match exact_local {
+            Some((id, hash)) => plans.push(PullPlan {
+                action: "link",
+                remote: remote.clone(),
+                local_memory_id: Some(id),
+                local_content_hash: Some(hash),
+            }),
+            None => plans.push(PullPlan {
+                action: "import",
+                remote: remote.clone(),
+                local_memory_id: None,
+                local_content_hash: None,
+            }),
+        }
+    }
+    Ok(plans)
+}
+
+fn apply_pull_plans(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    plans: &[PullPlan],
+) -> Result<usize, MemoryError> {
+    let mut conflicts = 0usize;
+    for plan in plans {
+        match plan.action {
+            "import" => {
+                let local_id = insert_remote_memory(conn, config, project, &plan.remote)?;
+                upsert_pull_sync(conn, project, &local_id, &plan.remote, false, None)?;
+            }
+            "link" => {
+                if let Some(local_id) = plan.local_memory_id.as_deref() {
+                    upsert_pull_sync(conn, project, local_id, &plan.remote, false, None)?;
+                }
+            }
+            "update" => {
+                if let Some(local_id) = plan.local_memory_id.as_deref() {
+                    let tags = plan.remote.tags.clone();
+                    queries::update_content(
+                        conn,
+                        local_id,
+                        &plan.remote.content,
+                        Some(&tags),
+                        Some(&plan.remote.memory_type),
+                    )?;
+                    reembed_memory(conn, config, local_id, &plan.remote.content)?;
+                    upsert_pull_sync(conn, project, local_id, &plan.remote, false, None)?;
+                }
+            }
+            "tombstone" => {
+                if let Some(local_id) = plan.local_memory_id.as_deref() {
+                    upsert_pull_sync(
+                        conn,
+                        project,
+                        local_id,
+                        &plan.remote,
+                        true,
+                        plan.remote.tombstone.as_ref(),
+                    )?;
+                }
+            }
+            "conflict" => conflicts += 1,
+            _ => {}
+        }
+    }
+    Ok(conflicts)
+}
+
+fn insert_remote_memory(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    remote: &GatewayMemory,
+) -> Result<String, MemoryError> {
+    let mut memory = Memory::new(
+        remote.content.clone(),
+        Some(remote.tags.clone()),
+        Some(project.to_string()),
+        remote
+            .provenance
+            .as_ref()
+            .and_then(|p| p.source_agent_id.clone()),
+        remote
+            .gateway_memory_id
+            .as_ref()
+            .map(|id| format!("gateway:{id}")),
+        Some(remote.memory_type.clone()),
+    );
+    if let Some(created_at) = remote.created_at.as_ref() {
+        memory.created_at = created_at.clone();
+    }
+    if let Some(updated_at) = remote.updated_at.as_ref() {
+        memory.updated_at = updated_at.clone();
+    }
+    memory.embedding = Some(embedding::embed_text(
+        &remote.content,
+        &config.model_cache_dir,
+    )?);
+    queries::insert_memory(conn, &memory)?;
+    Ok(memory.id)
+}
+
+fn upsert_pull_sync(
+    conn: &Connection,
+    project: &str,
+    local_memory_id: &str,
+    remote: &GatewayMemory,
+    tombstone_deleted: bool,
+    tombstone: Option<&GatewayMemoryTombstone>,
+) -> Result<(), MemoryError> {
+    let gateway_memory_id = remote.gateway_memory_id.as_deref().ok_or_else(|| {
+        MemoryError::Config("gateway pull memory missing gateway_memory_id".to_string())
+    })?;
+    let server_revision = remote.server_revision.ok_or_else(|| {
+        MemoryError::Config("gateway pull memory missing server_revision".to_string())
+    })?;
+    queries::upsert_memory_gateway_sync(
+        conn,
+        &MemoryGatewaySyncUpsert {
+            local_memory_id: local_memory_id.to_string(),
+            project: project.to_string(),
+            gateway_memory_id: gateway_memory_id.to_string(),
+            last_seen_server_revision: server_revision,
+            last_pushed_content_hash: None,
+            last_pulled_content_hash: Some(remote.content_hash.clone()),
+            sync_state: if tombstone_deleted {
+                "tombstone".to_string()
+            } else {
+                "pulled".to_string()
+            },
+            tombstone_deleted,
+            tombstone_at: tombstone.and_then(|t| t.deleted_at.clone()),
+        },
+    )?;
+    Ok(())
+}
+
+fn reembed_memory(
+    conn: &Connection,
+    config: &Config,
+    local_memory_id: &str,
+    content: &str,
+) -> Result<(), MemoryError> {
+    let embedding = embedding::embed_text(content, &config.model_cache_dir)?;
+    let blob = embedding_to_blob(&embedding);
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE memories SET embedding = ?1, embedding_model = ?2, updated_at = ?3
+         WHERE id = ?4",
+        rusqlite::params![blob, EMBEDDING_MODEL_NAME_DEFAULT, now, local_memory_id],
+    )?;
+    Ok(())
+}
+
+fn local_memory_hash(memory: &Memory) -> String {
+    let tags = memory.tags.clone().unwrap_or_default();
+    let memory_type = memory
+        .memory_type
+        .clone()
+        .unwrap_or_else(|| "user".to_string());
+    memory_content_hash(&memory.content, &memory_type, &tags)
+}
+
+fn print_pull_status(project: &str, plans: &[PullPlan], status_only: bool) {
+    let conflicts = plans
+        .iter()
+        .filter(|plan| plan.action == "conflict")
+        .count();
+    println!(
+        "{}",
+        render::render_action_result(
+            if status_only {
+                "pull_status"
+            } else {
+                "pull_plan"
+            },
+            &[
+                ("project", project.to_string()),
+                ("remote", plans.len().to_string()),
+                ("conflicts", conflicts.to_string()),
+            ],
+        )
+    );
+    for plan in plans {
+        let mut attrs = vec![
+            ("action", plan.action.to_string()),
+            ("hash", plan.remote.content_hash.clone()),
+            ("type", plan.remote.memory_type.clone()),
+        ];
+        if let Some(local_id) = plan.local_memory_id.as_deref() {
+            attrs.push(("id", render::short_id(local_id).to_string()));
+        }
+        if let Some(local_hash) = plan.local_content_hash.as_deref() {
+            attrs.push(("local_hash", local_hash.to_string()));
+        }
+        if let Some(gateway_id) = plan.remote.gateway_memory_id.as_deref() {
+            attrs.push(("gateway_id", gateway_id.to_string()));
+        }
+        if let Some(rev) = plan.remote.server_revision {
+            attrs.push(("server_revision", rev.to_string()));
+        }
+        println!("{}", render::render_action_result("pull_candidate", &attrs));
+    }
+}
+
+fn resolve_gateway_project(cwd_project: Option<&str>) -> Result<String, MemoryError> {
+    let project = cwd_project.ok_or_else(|| {
+        MemoryError::Config("memory gateway exchange requires a current project ident".to_string())
+    })?;
+    if project == GLOBAL_PROJECT_IDENT {
+        return Err(MemoryError::Config(
+            "Global memories are excluded from gateway exchange".to_string(),
+        ));
+    }
+    Ok(project.to_string())
+}
+
+fn map_gateway_error(err: GatewaySyncClientError) -> MemoryError {
+    match err {
+        GatewaySyncClientError::Config(msg) => MemoryError::Config(msg),
+        other => MemoryError::Update(other.to_string()),
+    }
 }
 
 /// Dispatch the `memory setup` family. Returns `anyhow::Result` so the
@@ -1503,6 +2188,7 @@ fn run_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::PushMemoryResult;
     use clap::Parser;
 
     /// `--scope global` should parse to `MemoryScope::Global` and leave other
@@ -1591,6 +2277,378 @@ mod tests {
             }
             _ => panic!("expected Update variant"),
         }
+    }
+
+    #[test]
+    fn parse_push_and_pull_status_commands() {
+        let push = Cli::try_parse_from(["memory", "push", "status"]).unwrap();
+        match push {
+            Cli::Push { command } => {
+                assert!(matches!(command, Some(GatewayTransferCommand::Status)));
+            }
+            _ => panic!("expected Push variant"),
+        }
+
+        let push_run = Cli::try_parse_from(["memory", "push"]).unwrap();
+        match push_run {
+            Cli::Push { command } => assert!(command.is_none()),
+            _ => panic!("expected Push variant"),
+        }
+
+        let pull = Cli::try_parse_from(["memory", "pull", "status"]).unwrap();
+        match pull {
+            Cli::Pull { command } => {
+                assert!(matches!(command, Some(GatewayTransferCommand::Status)));
+            }
+            _ => panic!("expected Pull variant"),
+        }
+    }
+
+    #[test]
+    fn push_candidates_track_create_and_skipped_without_metadata_writes() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let mut memory = Memory::new(
+            "project memory".to_string(),
+            Some(vec!["gateway".to_string()]),
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        memory.id = "aaaaaaaa-0000-1111-2222-000000000001".to_string();
+        queries::insert_memory(&conn, &memory).unwrap();
+
+        let first = build_push_candidates(&conn, "agent-memory").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].action, "create");
+        let hash = first[0].gateway_memory.content_hash.clone();
+
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: memory.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 3,
+                last_pushed_content_hash: Some(hash.clone()),
+                last_pulled_content_hash: None,
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let second = build_push_candidates(&conn, "agent-memory").unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].action, "skipped");
+        assert_eq!(
+            second[0].gateway_memory.base_server_revision,
+            Some(3),
+            "linked records carry base revision"
+        );
+        assert_eq!(second[0].gateway_memory.content_hash, hash);
+    }
+
+    #[test]
+    fn push_candidates_are_project_only_and_reject_global_project() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+
+        for (id, content, project) in [
+            (
+                "aaaaaaaa-0000-1111-2222-000000000010",
+                "current project memory",
+                "agent-memory",
+            ),
+            (
+                "aaaaaaaa-0000-1111-2222-000000000011",
+                "other project memory",
+                "other-project",
+            ),
+            (
+                "aaaaaaaa-0000-1111-2222-000000000012",
+                "global memory",
+                GLOBAL_PROJECT_IDENT,
+            ),
+        ] {
+            let mut memory = Memory::new(
+                content.to_string(),
+                Some(vec!["gateway".to_string()]),
+                Some(project.to_string()),
+                None,
+                None,
+                Some("project".to_string()),
+            );
+            memory.id = id.to_string();
+            queries::insert_memory(&conn, &memory).unwrap();
+        }
+
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].local_memory_id,
+            "aaaaaaaa-0000-1111-2222-000000000010"
+        );
+
+        let err = build_push_candidates(&conn, GLOBAL_PROJECT_IDENT).unwrap_err();
+        assert!(
+            err.to_string().contains("Global memories are excluded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn push_conflict_response_leaves_existing_sync_metadata_unchanged() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let mut memory = Memory::new(
+            "local project memory".to_string(),
+            Some(vec!["gateway".to_string()]),
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        memory.id = "aaaaaaaa-0000-1111-2222-000000000020".to_string();
+        queries::insert_memory(&conn, &memory).unwrap();
+
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: memory.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-conflict".to_string(),
+                last_seen_server_revision: 3,
+                last_pushed_content_hash: Some("old-hash".to_string()),
+                last_pulled_content_hash: Some("old-pulled-hash".to_string()),
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let response = PushMemoriesResponse {
+            project: "agent-memory".to_string(),
+            results: vec![PushMemoryResult {
+                local_memory_id: Some(memory.id.clone()),
+                client_id: None,
+                gateway_memory_id: Some("gw-conflict".to_string()),
+                server_revision: Some(4),
+                action: PushMemoryAction::Conflict,
+                content_hash: Some("new-hash".to_string()),
+                conflict: None,
+                errors: Vec::new(),
+            }],
+        };
+        let hashes = HashMap::from([(memory.id.clone(), "new-hash".to_string())]);
+
+        apply_push_response(&conn, "agent-memory", &response, &hashes).unwrap();
+
+        let sync = queries::get_memory_gateway_sync(&conn, &memory.id)
+            .unwrap()
+            .expect("sync row");
+        assert_eq!(sync.last_seen_server_revision, 3);
+        assert_eq!(sync.last_pushed_content_hash.as_deref(), Some("old-hash"));
+        assert_eq!(
+            sync.last_pulled_content_hash.as_deref(),
+            Some("old-pulled-hash")
+        );
+        assert_eq!(sync.sync_state, "created");
+    }
+
+    fn cli_test_config() -> Config {
+        Config {
+            data_dir: PathBuf::new(),
+            db_path: PathBuf::new(),
+            model_cache_dir: PathBuf::new(),
+            gateway: Default::default(),
+        }
+    }
+
+    fn insert_cli_test_memory(
+        conn: &Connection,
+        id: &str,
+        content: &str,
+        tags: Vec<&str>,
+        project: &str,
+    ) -> Memory {
+        let mut memory = Memory::new(
+            content.to_string(),
+            Some(tags.into_iter().map(str::to_string).collect()),
+            Some(project.to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        memory.id = id.to_string();
+        queries::insert_memory(conn, &memory).unwrap();
+        memory
+    }
+
+    fn cli_remote_memory(
+        gateway_id: &str,
+        content: &str,
+        tags: Vec<&str>,
+        revision: i64,
+    ) -> GatewayMemory {
+        let tags: Vec<String> = tags.into_iter().map(str::to_string).collect();
+        GatewayMemory {
+            project: "agent-memory".to_string(),
+            content: content.to_string(),
+            memory_type: "project".to_string(),
+            content_hash: memory_content_hash(content, "project", &tags),
+            tags,
+            local_memory_id: None,
+            client_id: None,
+            gateway_memory_id: Some(gateway_id.to_string()),
+            base_server_revision: None,
+            server_revision: Some(revision),
+            created_at: None,
+            updated_at: None,
+            provenance: None,
+            tombstone: None,
+        }
+    }
+
+    #[test]
+    fn pull_planning_fast_forwards_only_when_local_matches_base_hash() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+
+        let fast_forward = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000030",
+            "shared base",
+            vec!["fast"],
+            "agent-memory",
+        );
+        let fast_forward_hash = local_memory_hash(&fast_forward);
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: fast_forward.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-fast-forward".to_string(),
+                last_seen_server_revision: 3,
+                last_pushed_content_hash: None,
+                last_pulled_content_hash: Some(fast_forward_hash),
+                sync_state: "pulled".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let local_edit = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000031",
+            "locally edited",
+            vec!["conflict"],
+            "agent-memory",
+        );
+        let old_base_hash =
+            memory_content_hash("old shared base", "project", &["conflict".to_string()]);
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: local_edit.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-conflict".to_string(),
+                last_seen_server_revision: 3,
+                last_pushed_content_hash: None,
+                last_pulled_content_hash: Some(old_base_hash),
+                sync_state: "pulled".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let response = PullMemoriesResponse {
+            project: "agent-memory".to_string(),
+            memories: vec![
+                cli_remote_memory("gw-fast-forward", "remote update", vec!["fast"], 4),
+                cli_remote_memory("gw-conflict", "remote update", vec!["conflict"], 4),
+            ],
+            next_cursor: Some("cursor-4".to_string()),
+            server_revision: Some(4),
+            has_more: false,
+        };
+
+        let plans = plan_pull_actions(&conn, "agent-memory", &response).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].action, "update");
+        assert_eq!(
+            plans[0].local_memory_id.as_deref(),
+            Some(fast_forward.id.as_str())
+        );
+        assert_eq!(plans[1].action, "conflict");
+        assert_eq!(
+            plans[1].local_memory_id.as_deref(),
+            Some(local_edit.id.as_str())
+        );
+
+        let conflicts =
+            apply_pull_plans(&conn, &cli_test_config(), "agent-memory", &plans[1..]).unwrap();
+        assert_eq!(conflicts, 1);
+        let sync = queries::get_memory_gateway_sync(&conn, &local_edit.id)
+            .unwrap()
+            .expect("sync row");
+        assert_eq!(sync.last_seen_server_revision, 3);
+        assert_eq!(sync.sync_state, "pulled");
+    }
+
+    #[test]
+    fn pull_planning_links_project_duplicate_but_not_global_duplicate() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+
+        let project_duplicate = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000040",
+            "same project content",
+            vec!["link"],
+            "agent-memory",
+        );
+        insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000041",
+            "global only content",
+            vec!["global"],
+            GLOBAL_PROJECT_IDENT,
+        );
+
+        let response = PullMemoriesResponse {
+            project: "agent-memory".to_string(),
+            memories: vec![
+                cli_remote_memory("gw-link", "same project content", vec!["link"], 10),
+                cli_remote_memory("gw-import", "global only content", vec!["global"], 11),
+            ],
+            next_cursor: None,
+            server_revision: Some(11),
+            has_more: false,
+        };
+
+        let plans = plan_pull_actions(&conn, "agent-memory", &response).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].action, "link");
+        assert_eq!(
+            plans[0].local_memory_id.as_deref(),
+            Some(project_duplicate.id.as_str())
+        );
+        assert_eq!(
+            queries::get_memory_gateway_sync_by_gateway_id(&conn, "agent-memory", "gw-link")
+                .unwrap(),
+            None,
+            "status planning must not write sync metadata"
+        );
+        assert_eq!(
+            plans[1].action, "import",
+            "global-scope matches must not satisfy project pull deconfliction"
+        );
     }
 
     #[test]

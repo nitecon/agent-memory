@@ -1,6 +1,9 @@
 use rusqlite::{params, Connection};
 
-use crate::db::models::{blob_to_embedding, embedding_to_blob, Memory, WorkingContext};
+use crate::db::models::{
+    blob_to_embedding, embedding_to_blob, Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert,
+    ProjectGatewaySyncState, WorkingContext,
+};
 use crate::error::MemoryError;
 
 /// Minimum length accepted by [`resolve_id_prefix`].
@@ -70,6 +73,48 @@ fn map_working_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkingC
     })
 }
 
+fn map_memory_gateway_sync_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryGatewaySync> {
+    let tombstone_deleted: i64 = row.get(7)?;
+    Ok(MemoryGatewaySync {
+        local_memory_id: row.get(0)?,
+        project: row.get(1)?,
+        gateway_memory_id: row.get(2)?,
+        last_seen_server_revision: row.get(3)?,
+        last_pushed_content_hash: row.get(4)?,
+        last_pulled_content_hash: row.get(5)?,
+        sync_state: row.get(6)?,
+        tombstone_deleted: tombstone_deleted != 0,
+        tombstone_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn map_project_gateway_sync_state_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectGatewaySyncState> {
+    Ok(ProjectGatewaySyncState {
+        project: row.get(0)?,
+        last_pull_server_revision: row.get(1)?,
+        last_pull_cursor: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn validate_gateway_project(project: &str) -> Result<(), MemoryError> {
+    if project.trim().is_empty() {
+        return Err(MemoryError::Config(
+            "Gateway memory exchange requires a non-empty project ident".to_string(),
+        ));
+    }
+    if project == GLOBAL_PROJECT_IDENT {
+        return Err(MemoryError::Config(
+            "Global memories are excluded from gateway exchange".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_working_project(project: &str) -> Result<(), MemoryError> {
     if project.trim().is_empty() {
         return Err(MemoryError::Config(
@@ -80,6 +125,35 @@ fn validate_working_project(project: &str) -> Result<(), MemoryError> {
         return Err(MemoryError::Config(format!(
             "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories; \
              WorkingContext is per-project only"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_local_memory_project(
+    conn: &Connection,
+    local_memory_id: &str,
+    expected_project: &str,
+) -> Result<(), MemoryError> {
+    validate_gateway_project(expected_project)?;
+    let actual_project: Option<String> = conn
+        .query_row(
+            "SELECT project FROM memories WHERE id = ?1",
+            params![local_memory_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => {
+                MemoryError::NotFound(local_memory_id.to_string())
+            }
+            other => MemoryError::Database(other),
+        })?;
+
+    if actual_project.as_deref() != Some(expected_project) {
+        let actual = actual_project.unwrap_or_else(|| "(unscoped)".to_string());
+        return Err(MemoryError::Config(format!(
+            "Cannot link local memory {local_memory_id} in project {actual} \
+             to gateway project {expected_project}"
         )));
     }
     Ok(())
@@ -255,6 +329,154 @@ pub fn clear_working_context(conn: &Connection, project: &str) -> Result<bool, M
         params![project],
     )?;
     Ok(changed > 0)
+}
+
+pub fn get_memory_gateway_sync(
+    conn: &Connection,
+    local_memory_id: &str,
+) -> Result<Option<MemoryGatewaySync>, MemoryError> {
+    let res = conn.query_row(
+        "SELECT local_memory_id, project, gateway_memory_id,
+             last_seen_server_revision, last_pushed_content_hash,
+             last_pulled_content_hash, sync_state, tombstone_deleted,
+             tombstone_at, created_at, updated_at
+         FROM memory_gateway_sync
+         WHERE local_memory_id = ?1",
+        params![local_memory_id],
+        map_memory_gateway_sync_row,
+    );
+    match res {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+pub fn get_memory_gateway_sync_by_gateway_id(
+    conn: &Connection,
+    project: &str,
+    gateway_memory_id: &str,
+) -> Result<Option<MemoryGatewaySync>, MemoryError> {
+    validate_gateway_project(project)?;
+    let res = conn.query_row(
+        "SELECT local_memory_id, project, gateway_memory_id,
+             last_seen_server_revision, last_pushed_content_hash,
+             last_pulled_content_hash, sync_state, tombstone_deleted,
+             tombstone_at, created_at, updated_at
+         FROM memory_gateway_sync
+         WHERE project = ?1 AND gateway_memory_id = ?2",
+        params![project, gateway_memory_id],
+        map_memory_gateway_sync_row,
+    );
+    match res {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+pub fn upsert_memory_gateway_sync(
+    conn: &Connection,
+    record: &MemoryGatewaySyncUpsert,
+) -> Result<MemoryGatewaySync, MemoryError> {
+    validate_local_memory_project(conn, &record.local_memory_id, &record.project)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO memory_gateway_sync (
+             local_memory_id, project, gateway_memory_id,
+             last_seen_server_revision, last_pushed_content_hash,
+             last_pulled_content_hash, sync_state, tombstone_deleted,
+             tombstone_at, created_at, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+         ON CONFLICT(local_memory_id) DO UPDATE SET
+             project = excluded.project,
+             gateway_memory_id = excluded.gateway_memory_id,
+             last_seen_server_revision = excluded.last_seen_server_revision,
+             last_pushed_content_hash = excluded.last_pushed_content_hash,
+             last_pulled_content_hash = excluded.last_pulled_content_hash,
+             sync_state = excluded.sync_state,
+             tombstone_deleted = excluded.tombstone_deleted,
+             tombstone_at = excluded.tombstone_at,
+             updated_at = excluded.updated_at",
+        params![
+            record.local_memory_id,
+            record.project,
+            record.gateway_memory_id,
+            record.last_seen_server_revision,
+            record.last_pushed_content_hash,
+            record.last_pulled_content_hash,
+            record.sync_state,
+            if record.tombstone_deleted { 1 } else { 0 },
+            record.tombstone_at,
+            now,
+        ],
+    )?;
+
+    get_memory_gateway_sync(conn, &record.local_memory_id)?.ok_or_else(|| {
+        MemoryError::NotFound(format!(
+            "gateway sync record for {} not found after upsert",
+            record.local_memory_id
+        ))
+    })
+}
+
+#[allow(dead_code)]
+pub fn clear_memory_gateway_sync(
+    conn: &Connection,
+    local_memory_id: &str,
+) -> Result<bool, MemoryError> {
+    let changed = conn.execute(
+        "DELETE FROM memory_gateway_sync WHERE local_memory_id = ?1",
+        params![local_memory_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn get_project_gateway_sync_state(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<ProjectGatewaySyncState>, MemoryError> {
+    validate_gateway_project(project)?;
+    let res = conn.query_row(
+        "SELECT project, last_pull_server_revision, last_pull_cursor, updated_at
+         FROM project_gateway_sync_state
+         WHERE project = ?1",
+        params![project],
+        map_project_gateway_sync_state_row,
+    );
+    match res {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+pub fn upsert_project_gateway_sync_state(
+    conn: &Connection,
+    project: &str,
+    last_pull_server_revision: Option<i64>,
+    last_pull_cursor: Option<&str>,
+) -> Result<ProjectGatewaySyncState, MemoryError> {
+    validate_gateway_project(project)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO project_gateway_sync_state (
+             project, last_pull_server_revision, last_pull_cursor, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(project) DO UPDATE SET
+             last_pull_server_revision = excluded.last_pull_server_revision,
+             last_pull_cursor = excluded.last_pull_cursor,
+             updated_at = excluded.updated_at",
+        params![project, last_pull_server_revision, last_pull_cursor, now],
+    )?;
+
+    get_project_gateway_sync_state(conn, project)?.ok_or_else(|| {
+        MemoryError::NotFound(format!(
+            "gateway sync state for project {project} not found after upsert"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1371,6 +1593,152 @@ mod resolve_id_tests {
         );
         // Null-project state does not leak to a named project key.
         assert!(get_last_dream_at(&conn, Some("other")).unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_gateway_sync_round_trip_does_not_touch_memory_updated_at() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        let before = get_memory_by_id(&conn, id).unwrap();
+
+        let record = upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: id.to_string(),
+                project: "test".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 7,
+                last_pushed_content_hash: Some("sha256:pushed".to_string()),
+                last_pulled_content_hash: None,
+                sync_state: "pushed".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .expect("upsert gateway sync");
+
+        assert_eq!(record.local_memory_id, id);
+        assert_eq!(record.project, "test");
+        assert_eq!(record.gateway_memory_id, "gw-1");
+        assert_eq!(record.last_seen_server_revision, 7);
+        assert_eq!(
+            record.last_pushed_content_hash.as_deref(),
+            Some("sha256:pushed")
+        );
+        assert!(!record.tombstone_deleted);
+
+        let by_local = get_memory_gateway_sync(&conn, id)
+            .unwrap()
+            .expect("sync by local id");
+        assert_eq!(by_local, record);
+
+        let by_gateway = get_memory_gateway_sync_by_gateway_id(&conn, "test", "gw-1")
+            .unwrap()
+            .expect("sync by gateway id");
+        assert_eq!(by_gateway.local_memory_id, id);
+
+        let after = get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(after.content, before.content);
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "sync metadata must not bump memory updated_at"
+        );
+    }
+
+    #[test]
+    fn memory_gateway_sync_upsert_rejects_project_mismatch_and_global() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+
+        let mismatch = upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: id.to_string(),
+                project: "other-project".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 1,
+                last_pushed_content_hash: None,
+                last_pulled_content_hash: None,
+                sync_state: "linked".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .expect_err("project mismatch rejected");
+        assert!(mismatch.to_string().contains("Cannot link local memory"));
+
+        let global =
+            get_project_gateway_sync_state(&conn, GLOBAL_PROJECT_IDENT).expect_err("global reject");
+        assert!(global.to_string().contains("Global memories are excluded"));
+    }
+
+    #[test]
+    fn memory_gateway_sync_clear_deletes_mapping_only() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: id.to_string(),
+                project: "test".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 7,
+                last_pushed_content_hash: None,
+                last_pulled_content_hash: Some("sha256:pulled".to_string()),
+                sync_state: "pulled".to_string(),
+                tombstone_deleted: true,
+                tombstone_at: Some("2026-05-29T13:51:04Z".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(clear_memory_gateway_sync(&conn, id).unwrap());
+        assert!(get_memory_gateway_sync(&conn, id).unwrap().is_none());
+        assert!(
+            get_memory_by_id(&conn, id).is_ok(),
+            "clearing sync metadata must not delete memory"
+        );
+        assert!(!clear_memory_gateway_sync(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn project_gateway_sync_state_round_trip_is_project_isolated() {
+        let conn = fresh_db();
+        assert!(get_project_gateway_sync_state(&conn, "agent-memory")
+            .unwrap()
+            .is_none());
+
+        let first =
+            upsert_project_gateway_sync_state(&conn, "agent-memory", Some(10), Some("cursor-1"))
+                .unwrap();
+        assert_eq!(first.project, "agent-memory");
+        assert_eq!(first.last_pull_server_revision, Some(10));
+        assert_eq!(first.last_pull_cursor.as_deref(), Some("cursor-1"));
+
+        let second =
+            upsert_project_gateway_sync_state(&conn, "agent-memory", Some(11), None).unwrap();
+        assert_eq!(second.last_pull_server_revision, Some(11));
+        assert!(second.last_pull_cursor.is_none());
+
+        upsert_project_gateway_sync_state(&conn, "other", Some(1), Some("other-cursor")).unwrap();
+        assert_eq!(
+            get_project_gateway_sync_state(&conn, "agent-memory")
+                .unwrap()
+                .expect("agent-memory state")
+                .last_pull_server_revision,
+            Some(11)
+        );
+        assert_eq!(
+            get_project_gateway_sync_state(&conn, "other")
+                .unwrap()
+                .expect("other state")
+                .last_pull_cursor
+                .as_deref(),
+            Some("other-cursor")
+        );
     }
 
     #[test]

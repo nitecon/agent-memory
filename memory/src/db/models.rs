@@ -55,6 +55,47 @@ pub struct WorkingContext {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryGatewaySync {
+    pub local_memory_id: String,
+    pub project: String,
+    pub gateway_memory_id: String,
+    pub last_seen_server_revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pushed_content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pulled_content_hash: Option<String>,
+    pub sync_state: String,
+    pub tombstone_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryGatewaySyncUpsert {
+    pub local_memory_id: String,
+    pub project: String,
+    pub gateway_memory_id: String,
+    pub last_seen_server_revision: i64,
+    pub last_pushed_content_hash: Option<String>,
+    pub last_pulled_content_hash: Option<String>,
+    pub sync_state: String,
+    pub tombstone_deleted: bool,
+    pub tombstone_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectGatewaySyncState {
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pull_server_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pull_cursor: Option<String>,
+    pub updated_at: String,
+}
+
 impl Memory {
     pub fn new(
         content: String,
