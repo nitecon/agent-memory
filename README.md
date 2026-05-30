@@ -57,6 +57,8 @@ agent-memory-macos-aarch64.tar.gz
 agent-memory-windows-x86_64.zip
 ```
 
+Asset filenames are intentionally tag-less so an older binary can resolve the download URL for any future release — `memory update` works across version jumps without knowing the new tag ahead of time.
+
 Archive size is ~70MB (candle + tokenizers add weight to `memory-dream`). The model weights are **not** shipped in the archive — they're downloaded on demand via `memory-dream --pull`. Users who never run `memory-dream` pay the ~28MB of disk it takes up but incur zero cognitive overhead; `memory update` force-bundles both binaries on every upgrade so install and updater logic stay symmetric.
 
 ## Database location
@@ -155,15 +157,15 @@ curation.
 
 | Command | Behavior |
 |---------|----------|
-| `memory setup` | Interactive checklist: shows the install state of each component (rules, skill) and lets you pick which to (re)install |
+| `memory setup` | Interactive checklist: shows the install state of each component (gateway, rules, skill) and lets you pick which to (re)install |
 | `memory setup rules [flags]` | Inject the `<memory-rules>` block into known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md) |
 | `memory setup rules --remove` | Strip the `<memory-rules>` block and reverse every paired native-memory-disable write (Claude `autoMemoryEnabled`, Gemini `excludeTools: save_memory`, Codex `[features] memories`) |
-| `memory setup skill [flags]` | Install `SKILL.md` under **every** known agent frontend — `~/.claude/skills/agent-memory/` (Claude Code) and `~/.gemini/skills/agent-memory/` (Gemini CLI) — so each session auto-loads a ~100-token description that nudges the model toward the CLI |
+| `memory setup skill [flags]` | Install `SKILL.md` under **every** known agent frontend — `~/.claude/skills/agent-memory/` (Claude Code, tool-native) and `~/.agents/skills/agent-memory/` (cross-agent alias read by Gemini CLI and Codex) — so each session auto-loads a ~100-token description that nudges the model toward the CLI |
 | `memory setup skill --remove` | Delete the installed `SKILL.md` from every known target. Missing files are silently skipped — parity with `setup rules --remove` |
-| `memory setup all [-y]` | Run rules → skill non-interactively (use `-y` / `--yes` to skip confirmation) |
+| `memory setup all [-y]` | Run gateway → rules → skill non-interactively (use `-y` / `--yes` to skip confirmation). Rules land before skill so a human reading a freshly-updated CLAUDE.md sees the new rules ahead of the model discovering the skill |
 
 ```bash
-# Bare invocation: 2-item interactive checklist (rules + skill).
+# Bare invocation: 3-item interactive checklist (gateway + rules + skill).
 memory setup
 
 # Rules only — detects ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md,
@@ -176,8 +178,8 @@ memory setup rules --print       # emit just the <memory-rules> block
 memory setup rules --all --remove  # uninstall: strip block + reverse every native-memory-disable write
 
 # Skill only — installs SKILL.md to every known frontend:
-#   ~/.claude/skills/agent-memory/SKILL.md   (Claude Code)
-#   ~/.gemini/skills/agent-memory/SKILL.md   (Gemini CLI)
+#   ~/.claude/skills/agent-memory/SKILL.md   (Claude Code, tool-native)
+#   ~/.agents/skills/agent-memory/SKILL.md   (cross-agent — Gemini CLI + Codex)
 memory setup skill
 memory setup skill --dry-run
 memory setup skill --print
@@ -199,120 +201,17 @@ memory setup all --yes
 
 All three merges are conservative: unrelated keys, tables, and array entries are preserved; corrupt input fails loudly instead of being overwritten; re-runs are no-ops once the target state is reached. Writes are atomic (`.new` + rename) so a crash mid-write cannot leave a half-serialized file behind.
 
-`memory setup skill` writes the same SKILL.md byte-for-byte to every known agent frontend — `~/.claude/skills/agent-memory/SKILL.md` (Claude Code) and `~/.gemini/skills/agent-memory/SKILL.md` (Gemini CLI). Both frontends honor the same YAML frontmatter + Markdown body; Gemini silently ignores the Claude-specific `allowed-tools` key. The frontmatter `description` is always loaded into sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked. Install is unconditional — no auto-detection of whether each agent is installed — because running `memory setup skill` is itself the opt-in signal. Re-runs write a `.bak` sidecar then overwrite, so the command is idempotent.
+`memory setup skill` writes the same SKILL.md byte-for-byte to every known agent frontend — `~/.claude/skills/agent-memory/SKILL.md` (Claude Code, tool-native) and `~/.agents/skills/agent-memory/SKILL.md` (the cross-agent alias read by both Gemini CLI and Codex). All frontends honor the same YAML frontmatter + Markdown body; Gemini and Codex silently ignore the Claude-specific `allowed-tools` key. The frontmatter `description` is always loaded into sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked. Install is unconditional — no auto-detection of whether each agent is installed — because running `memory setup skill` is itself the opt-in signal. Re-runs write a `.bak` sidecar then overwrite, so the command is idempotent. The legacy `~/.gemini/skills/agent-memory/SKILL.md` path (written by v1.4.0/v1.4.1) is scrubbed on every install and `--remove` so no stale copy lingers.
 
-### Manual install (equivalent content)
+### Manual install (or inspect the live block)
 
-If you'd rather paste the block yourself, add the following to your global `CLAUDE.md`, `GEMINI.md`, or equivalent agent instructions:
-
-````markdown
-<memory-rules>
-## Agent Memory -- Mandatory Protocols
-
-### Memory Operations (MANDATORY)
-
-**Binary:** `memory` (installed at `/opt/agentic/bin/memory` on Linux/macOS, `%USERPROFILE%\.agentic\bin\memory.exe` on Windows) -- call directly via Bash. Do NOT use MCP or skills for memory during normal workflow.
-
-**The "Memory First/Last" Rule:** Every task must begin with a `context` or `search` call and end with a `store` call if functionality changed.
-
-### Scope tiers
-
-Every memory is stored under one of two scopes; retrieval boosts both:
-
-| Scope                      | Boost  | When to use                                    |
-|----------------------------|--------|------------------------------------------------|
-| **Current project** (cwd)  | 1.5×   | Repo-specific decisions, patterns, bugs        |
-| **Global** (`__global__`)  | 1.25×  | Universal user preferences / directives        |
-| Other project              | 1.0×   | Surfaces only as prior art via the `hint` field |
-
-`store`, `search`, and `context` auto-detect the current project from the cwd's git remote. A single `context` call returns both current-project and global hits — no second query needed.
+The exact `<memory-rules>` block evolves with the CLI surface, so this README no longer inlines a copy that can drift out of date. To see — or hand-paste — the current block, print it straight from the binary:
 
 ```bash
-# Context -- top-K relevant memories for a task (boost cwd + global)
-memory context "<task description>" -k <limit>
-
-# Search -- hybrid BM25 + vector search (boost cwd + global)
-memory search "<query>" -k <limit>
-
-# Store -- save a new project-scoped memory (cwd auto-detected)
-memory store "<content>" -m <type> -t "<tags>"
-
-# Store -- save a universal preference (applies across every repo)
-memory store "<content>" -m <type> --scope global -t "<tags>"
-# types: user, feedback, project, reference
-
-# Get -- fetch full content for specific IDs (pair with search for two-stage flow)
-memory get <id> [<id>...]                 # 8-char short prefix OK
-
-# Recall -- filter by project/agent/tags/type
-memory recall -m <type> -t "<tags>" -p "<project>" -k <limit>
-
-# Projects -- list distinct project idents (spot alias mismatches)
-memory projects
-
-# Move -- reassign the project ident on one or many memories
-memory move --from "<old>" --to "<new>" [--dry-run]
-
-# Copy -- duplicate memories under a new project ident
-memory copy --from "<old>" --to "<new>" [--dry-run]
-
-# Forget -- remove a memory by ID (or by search query)
-memory forget --id <uuid>
-
-# Prune -- decay stale/low-access memories
-memory prune --max-age-days 90 [--dry-run]
+memory setup rules --print     # emit the live <memory-rules> block to stdout
 ```
 
-### Memory quality gate (MANDATORY)
-
-Store memories only when they will help a future agent work faster. A good memory captures reusable patterns, operational procedures, user preferences, non-obvious constraints, failure causes, or "how to / why" guidance. Write for a cold agent who has not seen this session: the memory should tell them what to do next, which tool or system to use, and why that path is correct.
-
-Prefer updating an existing memory over creating a new one. Before storing, search/recall for related memories in the same project and in global scope. If the new learning refines the same workflow, subsystem, failure mode, user preference, or reusable pattern, update or rewrite the existing memory instead of adding another row. New memories are for distinct reusable knowledge that a future agent should retrieve independently.
-
-Use the applicable overall guidance for state, notes, and tasks: explicit user instructions, AGENTS.md or other repo instructions, project conventions, and the tools actually available in the environment. Git history already records timeline-specific implementation details; canonical docs, issue trackers, task boards, or other user-approved surfaces are the right place for evolving design notes, status, and open questions. Do not invent a note location, create TODO/ADR files, or assume a specific task tool if the user's guidance points elsewhere. Memory should primarily increase knowledge about **how and why** work is done, or point to the canonical system that contains live details. For example, a useful memory may say "filesystem replication decisions are tracked in the project task board; check the active task thread before changing replication behavior because it captures current constraints and open decisions." Do not copy the full note/task content into memory.
-
-Do **not** store facts that can be recovered from git history, repository inspection, CI/release systems, or configured task/comms surfaces. In particular, do not store routine deployment status, version numbers, release events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed version X" memories.
-
-Exception: store deployment/version facts only when they explain a failure mode or encode a reusable procedure that prevents future mistakes.
-
-Prefer:
-
-- Dev server `https://foo-dev.nitecon.org` is deployed by Eventic on main branch push; do not manually deploy. Average deploy time is about 2 minutes, so set a timer before checking.
-
-Avoid:
-
-- "Deployed version 1.2.0."
-- "Tag v1.2.0 was pushed."
-- "Commit abc123 passed CI."
-- "Updated pattern 019dc55f with a Mumble/Murmur example."
-
-If a user refers to "patterns", they likely mean gateway-backed `agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful memory says to inspect the current CLI with `agent-tools patterns --help`, then use `agent-tools patterns get/update/check` as appropriate. Do not save a memory that only says a pattern was updated; save the reusable workflow and the reason it matters.
-
-Short locator memories for canonical gateway patterns are allowed when they help a cold agent quickly find and reuse non-obvious guidance. For example, a memory may say that Eventic/Kubernetes deployment pipeline guidance lives in an `agent-tools patterns` record and should be looked up before designing a new pipeline. Keep the memory to the locator, reuse instruction, and why the pattern matters; do not record "created/updated pattern X" as an audit event.
-
-When you notice duplicated, stale, or nonsensical memories in the current project, naturally consolidate them as part of the work: merge clear duplicates, rewrite bloated memories into one stronger entry, or forget entries that fail this quality gate. Keep cleanup local and conservative — do not launch broad memory-cleanup sweeps unless the user asks.
-
-### Rule A -- Pre-action behavior recall (MANDATORY)
-
-Before starting any user-requested task, run one `memory context "<task>"` call first. A single call returns both global directives (1.25× boost) and project-specific directives (1.5× boost). Do not skip for "quick" tasks: directives the user has already stated must never need to be re-stated. If the `hint` field flags zero global-scope matches, pause and reflect — or ask before acting.
-
-### Rule B -- Post-action scope classification (MANDATORY)
-
-After completing an action, if the user stated or implied any directive, preference, or corrective rule during the session, you MUST store it and MUST classify its scope:
-
-- **Global** (`--scope global`) -- universal preference. Signals: "I always", "I never", "from now on", "I prefer", "don't ever", "whenever we", "in general".
-- **Project** (`--scope project`, the default) -- specific to this repo, service, or codebase. Signals: "in this repo", "for this service", "here we".
-- **Ambiguous** -- phrasing could reasonably apply either way. You MUST ask the user before storing. Do not silently default.
-
-Example:
-```bash
-memory store "User never wants PRs opened unless they explicitly ask" \
-  -m feedback --scope global -t "workflow,pr"
-```
-</memory-rules>
-````
-
-Prefer `memory setup` over hand-pasting — it keeps the block up-to-date with the latest CLI surface and guarantees the markers match what future re-runs look for.
+Add that output to your global `CLAUDE.md`, `GEMINI.md`, or equivalent agent instructions. Prefer `memory setup rules` over hand-pasting — it injects the same block between locatable markers and re-runs replace it in place, so your rule files never accumulate duplicate or stale copies.
 
 ## MCP server (optional)
 
@@ -336,7 +235,7 @@ Or add manually to `~/.claude.json`:
 }
 ```
 
-This gives Claude Code ten native tools: `memory_store`, `memory_search`, `memory_recall`, `memory_forget`, `memory_prune`, `memory_context`, `memory_get`, `memory_projects`, `memory_move`, `memory_copy`.
+This gives Claude Code thirteen native tools: `memory_store`, `memory_search`, `memory_recall`, `memory_forget`, `memory_prune`, `memory_context`, `memory_get`, `memory_projects`, `memory_move`, `memory_copy`, `memory_working_get`, `memory_working_set`, `memory_working_clear`.
 
 ### Skills (optional)
 
@@ -421,11 +320,11 @@ memory setup rules --target ~/.claude/CLAUDE.md
 memory setup rules --dry-run              # rules: preview, don't write
 memory setup rules --print                # rules: print <memory-rules> block
 memory setup rules --all --remove         # rules: strip block + reverse every native-memory-disable write
-memory setup skill                        # install SKILL.md under Claude + Gemini skill dirs
+memory setup skill                        # install SKILL.md under Claude + cross-agent (~/.agents) skill dirs
 memory setup skill --dry-run              # skill: preview SKILL.md
 memory setup skill --print                # skill: print SKILL.md to stdout
 memory setup skill --remove               # skill: delete SKILL.md from every target
-memory setup all --yes                    # rules → skill, non-interactive
+memory setup all --yes                    # gateway → rules → skill, non-interactive
 ```
 
 ## Project & global scope tiers
@@ -600,10 +499,11 @@ You can also trigger an update manually at any time with `memory update`.
 
 ## Dream compactor (offline condensation + dedup)
 
-`memory-dream` is a one-shot batch utility that walks your memory DB and does two things:
+`memory-dream` is a one-shot batch utility that walks your memory DB. Each pass runs three stages in order:
 
-1. **Condenses** verbose memories into a shorter factual claim using an in-process gemma3 model (via `candle`). The original text is preserved in a new `content_raw` column so nothing is lost — condensed text replaces `content`, raw text lives alongside.
-2. **Dedups** near-identical memories via cosine similarity on the embeddings. The older of a duplicate pair gets a `superseded_by` pointer to the newer one; default reads filter superseded rows out, so they stay in the DB for audit but never surface in search / context / list.
+1. **Stage 0 — project review** (the primary cross-memory consolidation path). Every memory in a project is sent to the model as a single message and the model returns a structured decision per memory: `keep`, `drop` (e.g. reconstructable from `git log`), `merge_into:<id>` (fold this memory's facts into another), `supersede_by:{content, tags?}` (replace a cluster with one canonical entry), or `extract:{content, tags?}` (drop the framing, retain a buried note as a new memory). Because it sees the whole project at once, it catches paraphrased duplicates that share no vocabulary.
+2. **Stage A — cosine dedup** over the Stage 0 survivors. Near-identical memories are matched by cosine similarity on the embeddings; the older of a duplicate pair gets a `superseded_by` pointer to the newer one. Default reads filter superseded rows out, so they stay in the DB for audit but never surface in search / context / list. This is a cheap secondary signal that catches byte-identical inserts without a model round-trip.
+3. **Stage B — per-memory condense**. Surviving verbose memories are condensed into a shorter factual claim using an in-process gemma3 model (via `candle`). The original text is preserved in a new `content_raw` column so nothing is lost — condensed text replaces `content`, raw text lives alongside.
 
 It's never a daemon. Each invocation loads the model, processes the DB, and exits. Run it however you like: cron, `launchd`, Windows Task Scheduler, or just manually after a heavy session.
 
@@ -624,18 +524,23 @@ export HF_TOKEN=hf_xxx_your_token_xxx
 memory-dream --pull
 ```
 
+`--pull` verifies the SHA-256 of every downloaded file against the hash HuggingFace advertises (the LFS-pointer digest). On a checksum mismatch — including a previously-cached file that fails verification on a later run — the corrupt file is deleted and re-downloaded. When HuggingFace advertises no usable hash for a file, that file emits `<result status="checksum_skipped"/>` and the pull continues.
+
 Without a token, `memory-dream --pull` emits `<result status="auth_required" .../>` and the three-step remediation above, then exits non-zero.
 
 ### Smoke-testing the pull pipeline (no auth required)
 
-For CI and contributors without an HF token, the short-name `tinyllama` resolves to an ungated repo (`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, ~2GB) so the download plumbing can be exercised end-to-end without credentials:
+For CI and contributors without an HF token, two short-names resolve to ungated repos so the download plumbing can be exercised end-to-end without credentials:
+
+- `smollm` → `HuggingFaceTB/SmolLM-135M-Instruct` (~300MB) — the lightweight laptop-CPU / CI smoke model.
+- `tinyllama` → `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (~2GB) — a higher-quality smoke model when 135M is too small.
 
 ```bash
 export AGENT_MEMORY_DIR=/tmp/dream-smoke
-memory-dream --pull --model tinyllama
+memory-dream --pull --model smollm     # or: --model tinyllama
 ```
 
-TinyLlama is not wired into the condenser — it exists solely to validate the pull flow. Real condensation still requires `gemma3`.
+Neither is wired into the condenser — they exist solely to validate the pull flow. Real condensation still requires `gemma3`.
 
 ### Regular use
 
@@ -650,10 +555,36 @@ memory-dream
 # Cap the pass for incremental runs on large DBs.
 memory-dream --limit 50
 
-# Swap model (rare — any HF repo id works; short `gemma3` and `tinyllama`
-# resolve to canonical repos, everything else passes through unchanged).
+# Re-evaluate every memory, ignoring the "recently dreamed" cutoff and the
+# condenser_version freshness check — use after a prompt or model change.
+# `--full` is the equivalent older spelling of the same switch.
+memory-dream --refresh
+
+# Swap model (rare — any HF repo id works; short names `gemma3`, `smollm`,
+# and `tinyllama` resolve to canonical repos, everything else passes through
+# unchanged).
 memory-dream --model myorg/my-fork
 ```
+
+The bare invocation (above) is equivalent to `memory-dream run`. The same global flags — `--model`, `--dry-run`, `--limit`, `--full` / `--refresh`, `--batch-size`, `--backend`, `--command-override` — apply to the bare pass and to the `test` subcommand; they override settings for a single invocation and never mutate `dream.toml`.
+
+### Subcommands
+
+`memory-dream` also exposes a small subcommand family for managing its backend and inspecting configuration. All write to (or read from) the `dream.toml` settings file unless noted.
+
+| Command | Behavior |
+|---------|----------|
+| `memory-dream run` | Explicit alias for the bare invocation (run a dream pass). |
+| `memory-dream config show` | Dump `dream.toml` as light-XML. |
+| `memory-dream config set <key> <value>` | Mutate a dotted key, e.g. `config set backend.mode headless` or `config set headless.timeout_ms 60000`. |
+| `memory-dream use <model>` | Set `local.active_model` to a short-name **and** flip `backend.mode` to `local`. |
+| `memory-dream use --headless` | Flip the backend to `headless` (run an external CLI via the `headless.command` template). |
+| `memory-dream use --disabled` | Flip the backend to `disabled` (dedup-only pass — Stage B condense is skipped). |
+| `memory-dream rm <model>` | Delete a local model's cache directory and drop it from `downloaded_models` in `dream.toml`. |
+| `memory-dream list` | Dump the effective settings (backend, active model, downloaded models, PATH-detected CLIs). |
+| `memory-dream test <id>` | Preview condensation for a single memory without writing to the DB; honors the override flags so a memory can be A/B'd across backends. |
+
+`backend.mode` is one of `local` (in-process candle model), `headless` (shell out to an external command template), or `disabled` (dedup only, no condense).
 
 ### Scheduling examples
 
@@ -715,6 +646,9 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 | `memory_projects` | List distinct project idents with memory counts (spot alias mismatches) |
 | `memory_move` | Reassign the project ident on one memory (by id) or in bulk (by from/to) |
 | `memory_copy` | Duplicate memories under a new project ident; preserves content + embedding |
+| `memory_working_get` | Return the current project's WorkingContext handoff (`present="false"` when none) |
+| `memory_working_set` | Replace the current project's WorkingContext handoff (65,536-char cap) |
+| `memory_working_clear` | Delete the current project's WorkingContext handoff (idempotent) |
 
 ## Memory types
 
