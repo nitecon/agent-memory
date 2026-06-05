@@ -337,7 +337,7 @@ memory setup all --yes                    # gateway → rules → skill, non-int
 
 ## Project & global scope tiers
 
-`store`, `search`, and `context` derive the current project identifier from the working directory's git remote and reduce it to the repository shortname (e.g. `git@github.com:nitecon/eventic.git` → `eventic`). SSH and HTTPS for the same repo produce the same ident. Non-git directories fall back to the directory basename. New memories are auto-tagged with this project unless you pass `--project` explicitly, `--no-project`, or `--scope global`.
+`store`, `search`, and `context` derive the current project identifier from the working directory's git remote and reduce it to the repository shortname (e.g. `git@github.com:nitecon/eventic.git` → `eventic`). The resolver reads `.git/config` directly, including worktree metadata and the current branch's configured upstream remote, before falling back to `git remote get-url origin`. SSH and HTTPS for the same repo produce the same ident. Non-git directories fall back to the directory basename. New memories are auto-tagged with this project unless you pass `--project` explicitly, `--no-project`, or `--scope global`.
 
 Shortname is deliberate so auto-derived idents match the hand-written shortnames most agents already use. The trade-off is that two repos with the same basename across different orgs will collide; in that case, tag them explicitly with `--project`.
 

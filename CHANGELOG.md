@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.8.6 - 2026-06-05
+
+- Fixed cwd project detection on Windows/worktree-style checkouts by reading `.git/config` directly, including the current branch's upstream remote, before falling back to the directory basename. This avoids gateway sync using an uppercase directory name when the repository ident is lowercase.
+
 ## v1.8.5 - 2026-06-05
 
 - Added best-effort gateway auto-sync after `memory store` for project-scoped memories: when gateway URL/API key are configured and auto-sync is enabled, the CLI pushes pending local project memories and then pulls remote project memories.
