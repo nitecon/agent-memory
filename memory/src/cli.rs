@@ -36,6 +36,8 @@ pub const GLOBAL_BOOST: f32 = 1.25;
 /// `__global__`).
 pub const GLOBAL_PROJECT_IDENT: &str = "__global__";
 pub const DEFAULT_PREVIEW_CHARS: usize = 160;
+const DEFAULT_GATEWAY_PUSH_BATCH_SIZE: usize = 450;
+const MAX_GATEWAY_PUSH_BATCH_SIZE: usize = 500;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum OutputFormat {
@@ -292,6 +294,9 @@ pub enum Cli {
     },
     /// Push project-scoped durable memories to the agent gateway.
     Push {
+        /// Maximum memory records to send in one gateway request.
+        #[arg(long, default_value_t = DEFAULT_GATEWAY_PUSH_BATCH_SIZE)]
+        batch_size: usize,
         #[command(subcommand)]
         command: Option<GatewayTransferCommand>,
     },
@@ -833,12 +838,16 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 );
             }
         },
-        Cli::Push { command } => {
+        Cli::Push {
+            batch_size,
+            command,
+        } => {
             run_push(
                 conn,
                 &config,
                 cwd_project.as_deref(),
                 matches!(command, Some(GatewayTransferCommand::Status)),
+                batch_size,
             )?;
         }
         Cli::Pull { command } => {
@@ -1096,6 +1105,7 @@ fn run_push(
     config: &Config,
     cwd_project: Option<&str>,
     status_only: bool,
+    batch_size: usize,
 ) -> Result<(), MemoryError> {
     let project = resolve_gateway_project(cwd_project)?;
     let candidates = build_push_candidates(conn, &project)?;
@@ -1108,6 +1118,7 @@ fn run_push(
     if status_only {
         return Ok(());
     }
+    let batch_size = validate_push_batch_size(batch_size)?;
 
     if pending.is_empty() {
         println!(
@@ -1117,14 +1128,58 @@ fn run_push(
         return Ok(());
     }
 
+    let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    let batches = push_batches(&pending, batch_size);
+    let total_batches = batches.len();
+    let mut counts = PushResponseCounts::default();
+
+    for (batch_index, batch) in batches.into_iter().enumerate() {
+        if total_batches > 1 {
+            print_push_batch(batch_index + 1, total_batches, batch.len());
+        }
+        let (request, hashes) = build_push_request(&project, batch);
+        let response = gateway.push_memories(&request).map_err(map_gateway_error)?;
+        apply_push_response(conn, &project, &response, &hashes)?;
+        print_push_results(&response, &mut counts);
+    }
+
+    print_push_complete(&project, &counts);
+    Ok(())
+}
+
+fn validate_push_batch_size(batch_size: usize) -> Result<usize, MemoryError> {
+    if batch_size == 0 {
+        return Err(MemoryError::Config(
+            "memory push --batch-size must be at least 1".to_string(),
+        ));
+    }
+    if batch_size > MAX_GATEWAY_PUSH_BATCH_SIZE {
+        return Err(MemoryError::Config(format!(
+            "memory push --batch-size must be no greater than {MAX_GATEWAY_PUSH_BATCH_SIZE}"
+        )));
+    }
+    Ok(batch_size)
+}
+
+fn push_batches<'a>(
+    pending: &'a [&'a PushCandidate],
+    batch_size: usize,
+) -> Vec<&'a [&'a PushCandidate]> {
+    pending.chunks(batch_size).collect()
+}
+
+fn build_push_request(
+    project: &str,
+    candidates: &[&PushCandidate],
+) -> (PushMemoriesRequest, HashMap<String, String>) {
     let request = PushMemoriesRequest {
-        project: project.clone(),
-        memories: pending
+        project: project.to_string(),
+        memories: candidates
             .iter()
             .map(|candidate| candidate.gateway_memory.clone())
             .collect(),
     };
-    let hashes: HashMap<String, String> = pending
+    let hashes = candidates
         .iter()
         .map(|candidate| {
             (
@@ -1133,14 +1188,7 @@ fn run_push(
             )
         })
         .collect();
-    let response = MemoryGatewayClient::from_config(&config.gateway)
-        .map_err(map_gateway_error)?
-        .push_memories(&request)
-        .map_err(map_gateway_error)?;
-
-    apply_push_response(conn, &project, &response, &hashes)?;
-    print_push_response(&response);
-    Ok(())
+    (request, hashes)
 }
 
 fn build_push_candidates(
@@ -1295,11 +1343,45 @@ fn print_push_status(project: &str, candidates: &[PushCandidate]) {
     }
 }
 
-fn print_push_response(response: &PushMemoriesResponse) {
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+#[derive(Default)]
+struct PushResponseCounts {
+    created: usize,
+    updated: usize,
+    linked: usize,
+    conflicts: usize,
+    rejected: usize,
+}
+
+impl PushResponseCounts {
+    fn record(&mut self, action: &PushMemoryAction) {
+        match action {
+            PushMemoryAction::Created => self.created += 1,
+            PushMemoryAction::Updated => self.updated += 1,
+            PushMemoryAction::Linked => self.linked += 1,
+            PushMemoryAction::Conflict => self.conflicts += 1,
+            PushMemoryAction::Rejected => self.rejected += 1,
+        }
+    }
+}
+
+fn print_push_batch(index: usize, total: usize, records: usize) {
+    println!(
+        "{}",
+        render::render_action_result(
+            "push_batch",
+            &[
+                ("index", index.to_string()),
+                ("total", total.to_string()),
+                ("records", records.to_string()),
+            ],
+        )
+    );
+}
+
+fn print_push_results(response: &PushMemoriesResponse, counts: &mut PushResponseCounts) {
     for result in &response.results {
         let action = push_action_label(&result.action);
-        *counts.entry(action).or_default() += 1;
+        counts.record(&result.action);
         let mut attrs = vec![("action", action.to_string())];
         if let Some(id) = result.local_memory_id.as_deref() {
             attrs.push(("id", render::short_id(id).to_string()));
@@ -1321,32 +1403,20 @@ fn print_push_response(response: &PushMemoriesResponse) {
         }
         println!("{}", render::render_action_result("push_result", &attrs));
     }
+}
+
+fn print_push_complete(project: &str, counts: &PushResponseCounts) {
     println!(
         "{}",
         render::render_action_result(
             "push_complete",
             &[
-                ("project", response.project.clone()),
-                (
-                    "created",
-                    counts.get("created").copied().unwrap_or(0).to_string()
-                ),
-                (
-                    "updated",
-                    counts.get("updated").copied().unwrap_or(0).to_string()
-                ),
-                (
-                    "linked",
-                    counts.get("linked").copied().unwrap_or(0).to_string()
-                ),
-                (
-                    "conflicts",
-                    counts.get("conflict").copied().unwrap_or(0).to_string(),
-                ),
-                (
-                    "rejected",
-                    counts.get("rejected").copied().unwrap_or(0).to_string(),
-                ),
+                ("project", project.to_string()),
+                ("created", counts.created.to_string()),
+                ("updated", counts.updated.to_string()),
+                ("linked", counts.linked.to_string()),
+                ("conflicts", counts.conflicts.to_string()),
+                ("rejected", counts.rejected.to_string()),
             ],
         )
     );
@@ -2294,15 +2364,38 @@ mod tests {
     fn parse_push_and_pull_status_commands() {
         let push = Cli::try_parse_from(["memory", "push", "status"]).unwrap();
         match push {
-            Cli::Push { command } => {
+            Cli::Push {
+                command,
+                batch_size,
+            } => {
                 assert!(matches!(command, Some(GatewayTransferCommand::Status)));
+                assert_eq!(batch_size, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
             }
             _ => panic!("expected Push variant"),
         }
 
         let push_run = Cli::try_parse_from(["memory", "push"]).unwrap();
         match push_run {
-            Cli::Push { command } => assert!(command.is_none()),
+            Cli::Push {
+                command,
+                batch_size,
+            } => {
+                assert!(command.is_none());
+                assert_eq!(batch_size, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
+            }
+            _ => panic!("expected Push variant"),
+        }
+
+        let push_batch_size =
+            Cli::try_parse_from(["memory", "push", "--batch-size", "123"]).unwrap();
+        match push_batch_size {
+            Cli::Push {
+                command,
+                batch_size,
+            } => {
+                assert!(command.is_none());
+                assert_eq!(batch_size, 123);
+            }
             _ => panic!("expected Push variant"),
         }
 
@@ -2420,6 +2513,124 @@ mod tests {
     }
 
     #[test]
+    fn push_batch_size_validation_respects_gateway_cap() {
+        assert_eq!(validate_push_batch_size(1).unwrap(), 1);
+        assert_eq!(
+            validate_push_batch_size(MAX_GATEWAY_PUSH_BATCH_SIZE).unwrap(),
+            MAX_GATEWAY_PUSH_BATCH_SIZE
+        );
+        assert!(validate_push_batch_size(0)
+            .unwrap_err()
+            .to_string()
+            .contains("at least 1"));
+        assert!(validate_push_batch_size(MAX_GATEWAY_PUSH_BATCH_SIZE + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("no greater than 500"));
+    }
+
+    #[test]
+    fn push_batches_default_to_unlimited_total_with_capped_requests() {
+        let candidates: Vec<PushCandidate> = (0..1001).map(push_test_candidate).collect();
+        let pending: Vec<&PushCandidate> = candidates.iter().collect();
+
+        let batches = push_batches(&pending, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 450);
+        assert_eq!(batches[1].len(), 450);
+        assert_eq!(batches[2].len(), 101);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.len() <= MAX_GATEWAY_PUSH_BATCH_SIZE));
+
+        let (request, hashes) = build_push_request("agent-memory", batches[0]);
+        assert_eq!(request.memories.len(), DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
+        assert_eq!(hashes.len(), DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
+        request.validate_project_scope().unwrap();
+    }
+
+    #[test]
+    fn push_batch_apply_makes_rerun_skip_successful_records() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let first = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000101",
+            "first pending push memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let second = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000102",
+            "second pending push memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let third = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000103",
+            "third pending push memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        let pending: Vec<&PushCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.action != "skipped")
+            .collect();
+        let batches = push_batches(&pending, 2);
+        assert_eq!(batches.len(), 2);
+
+        let (_request, hashes) = build_push_request("agent-memory", batches[0]);
+        let response = PushMemoriesResponse {
+            project: "agent-memory".to_string(),
+            server_revision: Some(2),
+            results: batches[0]
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| PushMemoryResult {
+                    local_memory_id: Some(candidate.local_memory_id.clone()),
+                    client_id: None,
+                    gateway_memory_id: Some(format!("gw-{index}")),
+                    server_revision: Some((index + 1) as i64),
+                    action: PushMemoryAction::Created,
+                    content_hash: Some(candidate.gateway_memory.content_hash.clone()),
+                    conflict: None,
+                    error: None,
+                    errors: Vec::new(),
+                })
+                .collect(),
+        };
+
+        apply_push_response(&conn, "agent-memory", &response, &hashes).unwrap();
+
+        let resumed = build_push_candidates(&conn, "agent-memory").unwrap();
+        let first_action = resumed
+            .iter()
+            .find(|candidate| candidate.local_memory_id == first.id)
+            .unwrap()
+            .action;
+        let second_action = resumed
+            .iter()
+            .find(|candidate| candidate.local_memory_id == second.id)
+            .unwrap()
+            .action;
+        let remaining_pending: Vec<&PushCandidate> = resumed
+            .iter()
+            .filter(|candidate| candidate.action != "skipped")
+            .collect();
+
+        assert_eq!(first_action, "skipped");
+        assert_eq!(second_action, "skipped");
+        assert_eq!(remaining_pending.len(), 1);
+        assert_eq!(remaining_pending[0].local_memory_id, third.id);
+        assert_eq!(remaining_pending[0].action, "create");
+    }
+
+    #[test]
     fn push_conflict_response_leaves_existing_sync_metadata_unchanged() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         crate::db::run_migrations(&conn).expect("migrate");
@@ -2508,6 +2719,30 @@ mod tests {
         memory.id = id.to_string();
         queries::insert_memory(conn, &memory).unwrap();
         memory
+    }
+
+    fn push_test_candidate(index: usize) -> PushCandidate {
+        let local_memory_id = format!("local-{index}");
+        PushCandidate {
+            local_memory_id: local_memory_id.clone(),
+            gateway_memory: GatewayMemory {
+                project: "agent-memory".to_string(),
+                content: format!("memory {index}"),
+                memory_type: "project".to_string(),
+                tags: vec!["gateway".to_string()],
+                content_hash: format!("hash-{index}"),
+                local_memory_id: Some(local_memory_id),
+                client_id: None,
+                gateway_memory_id: None,
+                base_server_revision: None,
+                server_revision: None,
+                created_at: None,
+                updated_at: None,
+                provenance: None,
+                tombstone: None,
+            },
+            action: "create",
+        }
     }
 
     fn cli_remote_memory(
