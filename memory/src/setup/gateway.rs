@@ -55,6 +55,25 @@ pub fn run() -> Result<()> {
             .to_string(),
     };
 
+    let default_auto_sync = existing.auto_sync.unwrap_or(true);
+    let default_auto_sync_label = if default_auto_sync { "Y" } else { "n" };
+    write!(
+        out,
+        "Automatically sync project memories after store? [{default_auto_sync_label}]: "
+    )?;
+    out.flush()?;
+    let mut auto_sync_input = String::new();
+    reader
+        .read_line(&mut auto_sync_input)
+        .context("read gateway auto-sync setting")?;
+    let auto_sync = match auto_sync_input.trim().to_ascii_lowercase().as_str() {
+        "" => default_auto_sync,
+        "y" | "yes" | "true" | "1" | "on" => true,
+        "n" | "no" | "false" | "0" | "off" => false,
+        _ => anyhow::bail!("gateway auto-sync must be yes or no"),
+    };
+    let auto_sync_value = if auto_sync { "true" } else { "false" };
+
     let config_path = user_gateway_conf_path().context("home directory unavailable")?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
@@ -68,6 +87,7 @@ pub fn run() -> Result<()> {
             ("GATEWAY_URL", url),
             ("GATEWAY_API_KEY", api_key),
             ("GATEWAY_TIMEOUT_MS", &timeout),
+            ("AGENT_MEMORY_GATEWAY_AUTO_SYNC", auto_sync_value),
         ],
     );
     std::fs::write(&config_path, content)
@@ -84,11 +104,15 @@ pub fn run() -> Result<()> {
 
 pub fn is_configured() -> bool {
     let cfg = GatewayConfig::load();
-    cfg.base_url.is_some() && cfg.api_key.is_some()
+    cfg.is_configured()
 }
 
 pub fn configured_url() -> Option<String> {
     GatewayConfig::load().base_url
+}
+
+pub fn auto_sync_enabled() -> bool {
+    GatewayConfig::load().auto_sync_enabled()
 }
 
 pub fn user_config_path_display() -> String {
@@ -154,12 +178,14 @@ mod tests {
             &[
                 ("GATEWAY_URL", "https://gateway.example"),
                 ("GATEWAY_API_KEY", "secret"),
+                ("AGENT_MEMORY_GATEWAY_AUTO_SYNC", "false"),
             ],
         );
 
         assert!(content.contains("DEFAULT_PROJECT_IDENT=agent-memory\n"));
         assert!(content.contains("GATEWAY_URL=https://gateway.example\n"));
         assert!(content.contains("GATEWAY_API_KEY=secret\n"));
+        assert!(content.contains("AGENT_MEMORY_GATEWAY_AUTO_SYNC=false\n"));
         assert!(!content.contains("http://old"));
     }
 

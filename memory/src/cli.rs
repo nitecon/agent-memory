@@ -552,6 +552,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             {
                 println!("{}", render::render_hint(&store_scope_hint()));
             }
+            maybe_auto_sync_after_store(conn, &config, &memory);
         }
         Cli::Search {
             query,
@@ -1093,11 +1094,163 @@ struct PushCandidate {
 }
 
 #[derive(Debug)]
+struct AutoPushSummary {
+    candidates: usize,
+    pending: usize,
+    skipped: usize,
+    counts: PushResponseCounts,
+}
+
+#[derive(Debug)]
+struct AutoPullSummary {
+    remote: usize,
+    conflicts: usize,
+    cursor_updated: bool,
+}
+
+#[derive(Debug)]
 struct PullPlan {
     action: &'static str,
     remote: GatewayMemory,
     local_memory_id: Option<String>,
     local_content_hash: Option<String>,
+}
+
+fn maybe_auto_sync_after_store(conn: &Connection, config: &Config, memory: &Memory) {
+    let Some(project) = auto_sync_project_for_memory(config, memory) else {
+        return;
+    };
+
+    match run_auto_sync_after_store(conn, config, project) {
+        Ok((push, pull)) => print_auto_sync_complete(project, &push, &pull),
+        Err(err) => println!(
+            "{}",
+            render::render_hint(&format!(
+                "gateway auto-sync skipped after store: {err}. The memory was saved locally; run `memory push` or `memory pull` to retry manually."
+            ))
+        ),
+    }
+}
+
+fn auto_sync_project_for_memory<'a>(config: &Config, memory: &'a Memory) -> Option<&'a str> {
+    if !config.gateway.auto_sync_enabled() {
+        return None;
+    }
+    match memory.project.as_deref() {
+        Some(project) if project != GLOBAL_PROJECT_IDENT => Some(project),
+        _ => None,
+    }
+}
+
+fn run_auto_sync_after_store(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+) -> Result<(AutoPushSummary, AutoPullSummary), MemoryError> {
+    let push = run_auto_push(conn, config, project, DEFAULT_GATEWAY_PUSH_BATCH_SIZE)?;
+    let pull = run_auto_pull(conn, config, project)?;
+    Ok((push, pull))
+}
+
+fn run_auto_push(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    batch_size: usize,
+) -> Result<AutoPushSummary, MemoryError> {
+    let candidates = build_push_candidates(conn, project)?;
+    let pending: Vec<&PushCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.action != "skipped")
+        .collect();
+    let pending_count = pending.len();
+    let skipped = candidates.len().saturating_sub(pending_count);
+    let batch_size = validate_push_batch_size(batch_size)?;
+    let mut counts = PushResponseCounts::default();
+
+    if !pending.is_empty() {
+        let gateway =
+            MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+        for batch in push_batches(&pending, batch_size) {
+            let (request, hashes) = build_push_request(project, batch);
+            let response = gateway.push_memories(&request).map_err(map_gateway_error)?;
+            apply_push_response(conn, project, &response, &hashes)?;
+            for result in &response.results {
+                counts.record(&result.action);
+            }
+        }
+    }
+
+    Ok(AutoPushSummary {
+        candidates: candidates.len(),
+        pending: pending_count,
+        skipped,
+        counts,
+    })
+}
+
+fn run_auto_pull(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+) -> Result<AutoPullSummary, MemoryError> {
+    let state = queries::get_project_gateway_sync_state(conn, project)?;
+    let request = PullMemoriesRequest {
+        project: project.to_string(),
+        since_server_revision: state.as_ref().and_then(|s| s.last_pull_server_revision),
+        cursor: state.and_then(|s| s.last_pull_cursor),
+        known_memories: Vec::new(),
+        limit: Some(100),
+    };
+    let response = MemoryGatewayClient::from_config(&config.gateway)
+        .map_err(map_gateway_error)?
+        .pull_memories(&request)
+        .map_err(map_gateway_error)?;
+    response.validate_project_scope().map_err(|err| {
+        MemoryError::Config(format!(
+            "gateway pull response failed scope validation: {err}"
+        ))
+    })?;
+
+    let plans = plan_pull_actions(conn, project, &response)?;
+    let conflicts = apply_pull_plans(conn, config, project, &plans)?;
+    let cursor_updated = conflicts == 0;
+    if cursor_updated {
+        queries::upsert_project_gateway_sync_state(
+            conn,
+            project,
+            response.server_revision,
+            response.next_cursor.as_deref(),
+        )?;
+    }
+    Ok(AutoPullSummary {
+        remote: plans.len(),
+        conflicts,
+        cursor_updated,
+    })
+}
+
+fn print_auto_sync_complete(project: &str, push: &AutoPushSummary, pull: &AutoPullSummary) {
+    println!(
+        "{}",
+        render::render_action_result(
+            "gateway_auto_sync",
+            &[
+                ("project", project.to_string()),
+                ("push_candidates", push.candidates.to_string()),
+                ("push_pending", push.pending.to_string()),
+                ("push_skipped", push.skipped.to_string()),
+                ("push_created", push.counts.created.to_string()),
+                ("push_updated", push.counts.updated.to_string()),
+                ("push_linked", push.counts.linked.to_string()),
+                ("push_conflicts", push.counts.conflicts.to_string()),
+                ("push_rejected", push.counts.rejected.to_string()),
+                ("pull_remote", pull.remote.to_string()),
+                ("pull_conflicts", pull.conflicts.to_string()),
+                ("cursor_updated", pull.cursor_updated.to_string()),
+            ],
+        )
+    );
 }
 
 fn run_push(
@@ -1343,7 +1496,7 @@ fn print_push_status(project: &str, candidates: &[PushCandidate]) {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PushResponseCounts {
     created: usize,
     updated: usize,
@@ -2271,6 +2424,7 @@ mod tests {
     use super::*;
     use crate::sync::PushMemoryResult;
     use clap::Parser;
+    use serde_json::{json, Value};
 
     /// `--scope global` should parse to `MemoryScope::Global` and leave other
     /// flags untouched.
@@ -2701,6 +2855,112 @@ mod tests {
         }
     }
 
+    fn cli_test_config_with_gateway(auto_sync: Option<bool>) -> Config {
+        let mut config = cli_test_config();
+        config.gateway.base_url = Some("http://127.0.0.1:1".to_string());
+        config.gateway.api_key = Some("test-key".to_string());
+        config.gateway.auto_sync = auto_sync;
+        config
+    }
+
+    #[test]
+    fn auto_sync_project_for_memory_defaults_on_for_project_memory() {
+        let config = cli_test_config_with_gateway(None);
+        let memory = Memory::new(
+            "sync me".to_string(),
+            None,
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+
+        assert_eq!(
+            auto_sync_project_for_memory(&config, &memory),
+            Some("agent-memory")
+        );
+    }
+
+    #[test]
+    fn auto_sync_project_for_memory_respects_disabled_config() {
+        let config = cli_test_config_with_gateway(Some(false));
+        let memory = Memory::new(
+            "do not sync me".to_string(),
+            None,
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+
+        assert_eq!(auto_sync_project_for_memory(&config, &memory), None);
+    }
+
+    #[test]
+    fn auto_sync_project_for_memory_skips_global_and_unscoped_memories() {
+        let config = cli_test_config_with_gateway(None);
+        let global = Memory::new(
+            "global".to_string(),
+            None,
+            Some(GLOBAL_PROJECT_IDENT.to_string()),
+            None,
+            None,
+            Some("feedback".to_string()),
+        );
+        let unscoped = Memory::new(
+            "unscoped".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("project".to_string()),
+        );
+
+        assert_eq!(auto_sync_project_for_memory(&config, &global), None);
+        assert_eq!(auto_sync_project_for_memory(&config, &unscoped), None);
+    }
+
+    #[test]
+    fn auto_sync_after_store_pushes_then_pulls_project_memories() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000201",
+            "auto sync project memory",
+            vec!["gateway", "auto-sync"],
+            "agent-memory",
+        );
+        let (base_url, server) = spawn_auto_sync_gateway();
+        let mut config = cli_test_config_with_gateway(None);
+        config.gateway.base_url = Some(base_url);
+
+        let (push, pull) =
+            run_auto_sync_after_store(&conn, &config, "agent-memory").expect("auto sync");
+
+        assert_eq!(push.candidates, 1);
+        assert_eq!(push.pending, 1);
+        assert_eq!(push.counts.created, 1);
+        assert_eq!(pull.remote, 0);
+        assert!(pull.cursor_updated);
+        let sync = queries::get_memory_gateway_sync(&conn, &memory.id)
+            .expect("load sync")
+            .expect("sync metadata");
+        assert_eq!(sync.gateway_memory_id, "gw-auto-1");
+        assert_eq!(sync.last_seen_server_revision, 7);
+
+        let requests = server.join().expect("gateway server");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .0
+            .contains("POST /v1/projects/agent-memory/memories/push "));
+        assert_eq!(requests[0].1["memories"].as_array().map(Vec::len), Some(1));
+        assert!(requests[1]
+            .0
+            .contains("POST /v1/projects/agent-memory/memories/pull "));
+        assert_eq!(requests[1].1["page_size"], json!(100));
+    }
+
     fn insert_cli_test_memory(
         conn: &Connection,
         id: &str,
@@ -2719,6 +2979,104 @@ mod tests {
         memory.id = id.to_string();
         queries::insert_memory(conn, &memory).unwrap();
         memory
+    }
+
+    fn spawn_auto_sync_gateway() -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind gateway");
+        let addr = listener.local_addr().expect("gateway addr");
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept gateway request");
+                let (first_line, body) = read_http_request(&mut stream);
+                let value: Value = serde_json::from_str(&body).expect("request json");
+                let response = if first_line.contains("/memories/push") {
+                    let memory = value["memories"]
+                        .as_array()
+                        .and_then(|memories| memories.first())
+                        .expect("push memory");
+                    json!({
+                        "project_ident": "agent-memory",
+                        "server_revision": 7,
+                        "results": [
+                            {
+                                "local_memory_id": memory["local_memory_id"],
+                                "gateway_memory_id": "gw-auto-1",
+                                "server_revision": 7,
+                                "action": "created",
+                                "content_hash": memory["content_hash"]
+                            }
+                        ]
+                    })
+                } else {
+                    json!({
+                        "project_ident": "agent-memory",
+                        "server_revision": 7,
+                        "memories": []
+                    })
+                };
+                write_http_response(&mut stream, &response.to_string());
+                requests.push((first_line, value));
+            }
+            requests
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String) {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).expect("read request");
+            assert!(n > 0, "connection closed before headers");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = find_bytes(&buf, b"\r\n\r\n") {
+                let body_start = header_end + 4;
+                let headers = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(key, value)| {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or(0);
+                while buf.len() < body_start + content_length {
+                    let n = stream.read(&mut tmp).expect("read request body");
+                    assert!(n > 0, "connection closed before body");
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let first_line = headers.lines().next().unwrap_or_default().to_string();
+                let body = String::from_utf8(buf[body_start..body_start + content_length].to_vec())
+                    .expect("utf8 body");
+                return (first_line, body);
+            }
+        }
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, body: &str) {
+        use std::io::Write;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
     }
 
     fn push_test_candidate(index: usize) -> PushCandidate {

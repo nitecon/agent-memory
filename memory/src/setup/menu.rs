@@ -111,8 +111,13 @@ fn probe_gateway() -> ComponentState {
         ComponentState {
             installed: true,
             detail: format!(
-                "configured at {}",
-                gateway::configured_url().unwrap_or_else(|| "(unknown)".to_string())
+                "configured at {} (auto-sync {})",
+                gateway::configured_url().unwrap_or_else(|| "(unknown)".to_string()),
+                if gateway::auto_sync_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ),
         }
     } else {

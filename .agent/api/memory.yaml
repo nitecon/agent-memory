@@ -17,9 +17,11 @@ content:
     ranked context retrieval for AI agents. WorkingContext is a separate
     per-project handoff row for transient active-work state; it is not a
     durable memory and does not participate in ranking or dream curation.
-    Gateway exchange moves project-scoped durable memories between machines
-    through explicit push and pull commands; it never exports global memories
-    or WorkingContext state.
+    Gateway exchange moves project-scoped durable memories between machines:
+    memory store can run best-effort automatic push-then-pull when the gateway
+    is configured, and explicit push/pull commands remain the manual diagnostic
+    and retry surface. Gateway exchange never exports global memories or
+    WorkingContext state.
   workflows:
     - name: Start a task
       steps:
@@ -31,6 +33,12 @@ content:
         - Replace the current handoff with memory working set "current state and next step".
         - Use memory working set - < handoff.md for multiline stdin bodies.
         - Keep durable decisions and reusable lessons in memory store, not only in WorkingContext.
+    - name: Store and auto-sync project memory
+      steps:
+        - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
+        - Leave AGENT_MEMORY_GATEWAY_AUTO_SYNC unset or true to use the default-on behavior when URL/API key exist.
+        - Run memory store from a project directory; project-scoped stores push pending local memories and then pull remote memories.
+        - If auto-sync emits a retry hint, the local store succeeded; use memory push or memory pull manually to retry gateway exchange.
     - name: Clear a completed handoff
       steps:
         - Run memory working clear when the project thread completes or the user directs cleanup.
@@ -71,6 +79,15 @@ content:
         fallback:
           - AGENT_GATEWAY_API_KEY
           - GATEWAY_API_KEY
+      auto_sync_config:
+        key: AGENT_MEMORY_GATEWAY_AUTO_SYNC
+        alias: MEMORY_GATEWAY_AUTO_SYNC
+        default: true when gateway URL and API key are configured.
+        disable_values:
+          - "false"
+          - "0"
+          - "no"
+          - "off"
       transport: Authorization Bearer token on gateway HTTP requests.
   cli:
     commands:
@@ -87,7 +104,11 @@ content:
             - --memory-type user|feedback|project|reference
             - --no-project
             - --scope project|global
-        output: <result status="stored" id="..." scope="..." project="..."/>
+        output: <result status="stored" id="..." scope="..." project="..."/> followed by optional <result status="gateway_auto_sync" .../> when gateway auto-sync runs.
+        behavior:
+          - Project-scoped stores automatically push pending local project memories, then pull remote project memories, when gateway URL/API key are configured and AGENT_MEMORY_GATEWAY_AUTO_SYNC is not false.
+          - Auto-sync is best-effort; gateway failures do not undo the local store and are rendered as hints with manual memory push/pull retry guidance.
+          - Global and unscoped stores are excluded from gateway auto-sync.
       - name: memory search
         purpose: Hybrid BM25/vector search with current-project and global boosts.
         args:

@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.8.5 - 2026-06-05
+
+- Added best-effort gateway auto-sync after `memory store` for project-scoped memories: when gateway URL/API key are configured and auto-sync is enabled, the CLI pushes pending local project memories and then pulls remote project memories.
+- Added persisted `AGENT_MEMORY_GATEWAY_AUTO_SYNC` / `MEMORY_GATEWAY_AUTO_SYNC` config parsing and a `memory setup gateway` prompt to disable the default-on behavior.
+
 ## v1.8.3 - 2026-05-29
 
 - `memory pull` now accepts boolean `tombstone` flags in gateway responses: `true` is treated as a deletion (synthesizing a tombstone), while `false`/`null`/absent mean "live"; object-form tombstones continue to deserialize as before.

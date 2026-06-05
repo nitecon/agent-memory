@@ -33,8 +33,11 @@ remote records, plus cursor, revision, provenance, and tombstone metadata.
 
 ## Local Client Responsibilities
 
-- Keep local memory retrieval behavior unchanged unless the user invokes push
-  or pull.
+- Keep local memory retrieval behavior unchanged. `memory store` may now run
+  best-effort project sync automatically when gateway auto-sync is enabled:
+  push pending local project memories first, then pull remote project memories.
+  Manual `memory push` and `memory pull` remain the explicit diagnostic and
+  retry surfaces.
 - Add sync metadata that maps local memory IDs to gateway memory IDs and server
   revisions.
 - Detect push and pull conflicts without silently overwriting local or remote

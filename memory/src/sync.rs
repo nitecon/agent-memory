@@ -631,6 +631,7 @@ mod tests {
         let missing_key = GatewayConfig {
             base_url: Some("https://gateway.example".to_string()),
             api_key: None,
+            auto_sync: None,
         };
         let err = MemoryGatewayClient::from_config(&missing_key).unwrap_err();
         assert!(err.to_string().contains("AGENT_MEMORY_GATEWAY_API_KEY"));

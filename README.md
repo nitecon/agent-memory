@@ -114,11 +114,19 @@ Configure the gateway once with either `memory setup gateway` or the equivalent
 `~/.agentic/agent-tools/gateway.conf` file that `memory push` and
 `memory pull` read.
 
+When a gateway URL and API key are configured, `memory store` automatically
+syncs project-scoped durable memories by pushing pending local changes and then
+pulling remote changes. The automatic sync is best-effort: the memory remains
+saved locally if the gateway is unavailable, and the command emits a retry hint.
+Disable it by setting `AGENT_MEMORY_GATEWAY_AUTO_SYNC=false` in the shared
+gateway config; `memory setup gateway` prompts for this setting.
+
 Environment variables still override the shared file when set:
 
 ```bash
 export AGENT_MEMORY_GATEWAY_URL="https://gateway.example"
 export AGENT_MEMORY_GATEWAY_API_KEY="..."
+export AGENT_MEMORY_GATEWAY_AUTO_SYNC="false" # optional opt-out
 
 # Fallback names also work:
 export AGENT_GATEWAY_URL="https://gateway.example"

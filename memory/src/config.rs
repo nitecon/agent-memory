@@ -20,6 +20,7 @@ pub struct Config {
 pub struct GatewayConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub auto_sync: Option<bool>,
 }
 
 impl GatewayConfig {
@@ -56,6 +57,7 @@ impl GatewayConfig {
         Self {
             base_url: first_nonempty([memory_url, agent_url, gateway_url]),
             api_key: first_nonempty([memory_api_key, agent_api_key, gateway_api_key]),
+            auto_sync: None,
         }
     }
 
@@ -74,6 +76,12 @@ impl GatewayConfig {
         if file_config.api_key.is_some() {
             self.api_key = file_config.api_key;
         }
+        if let Some(auto_sync) = first_bool([
+            pairs.get("AGENT_MEMORY_GATEWAY_AUTO_SYNC").cloned(),
+            pairs.get("MEMORY_GATEWAY_AUTO_SYNC").cloned(),
+        ]) {
+            self.auto_sync = Some(auto_sync);
+        }
     }
 
     fn apply_env_overrides(&mut self) {
@@ -91,6 +99,20 @@ impl GatewayConfig {
         if env_config.api_key.is_some() {
             self.api_key = env_config.api_key;
         }
+        if let Some(auto_sync) = first_bool([
+            std::env::var("AGENT_MEMORY_GATEWAY_AUTO_SYNC").ok(),
+            std::env::var("MEMORY_GATEWAY_AUTO_SYNC").ok(),
+        ]) {
+            self.auto_sync = Some(auto_sync);
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.base_url.is_some() && self.api_key.is_some()
+    }
+
+    pub fn auto_sync_enabled(&self) -> bool {
+        self.is_configured() && self.auto_sync.unwrap_or(true)
     }
 }
 
@@ -106,6 +128,20 @@ fn nonempty_trimmed(value: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn first_bool(values: impl IntoIterator<Item = Option<String>>) -> Option<bool> {
+    values
+        .into_iter()
+        .find_map(|value| value.and_then(|v| parse_bool(&v)))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -394,6 +430,56 @@ mod tests {
             Some("https://memory-gateway.example")
         );
         assert_eq!(cfg.api_key.as_deref(), Some("gateway-key"));
+    }
+
+    #[test]
+    fn gateway_auto_sync_defaults_on_when_gateway_configured() {
+        let cfg = GatewayConfig {
+            base_url: Some("https://gateway.example".to_string()),
+            api_key: Some("key".to_string()),
+            auto_sync: None,
+        };
+
+        assert!(cfg.is_configured());
+        assert!(cfg.auto_sync_enabled());
+    }
+
+    #[test]
+    fn gateway_auto_sync_can_be_disabled_from_config_file() {
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "GATEWAY_URL".to_string(),
+            "https://gateway.example".to_string(),
+        );
+        pairs.insert("GATEWAY_API_KEY".to_string(), "gateway-key".to_string());
+        pairs.insert(
+            "AGENT_MEMORY_GATEWAY_AUTO_SYNC".to_string(),
+            "false".to_string(),
+        );
+
+        let mut cfg = GatewayConfig::default();
+        cfg.apply_key_value_pairs(&pairs);
+
+        assert!(cfg.is_configured());
+        assert_eq!(cfg.auto_sync, Some(false));
+        assert!(!cfg.auto_sync_enabled());
+    }
+
+    #[test]
+    fn gateway_auto_sync_accepts_memory_gateway_alias() {
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "GATEWAY_URL".to_string(),
+            "https://gateway.example".to_string(),
+        );
+        pairs.insert("GATEWAY_API_KEY".to_string(), "gateway-key".to_string());
+        pairs.insert("MEMORY_GATEWAY_AUTO_SYNC".to_string(), "on".to_string());
+
+        let mut cfg = GatewayConfig::default();
+        cfg.apply_key_value_pairs(&pairs);
+
+        assert_eq!(cfg.auto_sync, Some(true));
+        assert!(cfg.auto_sync_enabled());
     }
 
     #[test]
