@@ -4,7 +4,9 @@
 //! `git@github.com:nitecon/eventic.git`) so that memories auto-tagged by the
 //! cwd resolver share an ident with the logical, human-written project labels
 //! most agents already use (`rithmic`, `traderx`, `agent-tools`, ...). For
-//! non-git directories, falls back to the directory basename.
+//! non-git directories, falls back to the directory basename. Git-derived and
+//! fallback idents are lowercased to match the gateway/project-board
+//! convention and avoid Windows path-case drift.
 //!
 //! Trade-off: two repos with the same basename across different orgs will
 //! collide on ident. This is intentional -- the alternative (full host/org/repo
@@ -43,8 +45,8 @@ pub fn project_ident(project_root: &Path) -> String {
         .unwrap_or_else(|_| project_root.to_path_buf());
     canonical
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| canonical.to_string_lossy().to_string())
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| canonical.to_string_lossy().to_ascii_lowercase())
 }
 
 /// Resolve the project ident for the current working directory.
@@ -57,7 +59,7 @@ pub fn project_ident_from_cwd() -> std::io::Result<String> {
 ///
 /// Handles HTTPS, SSH-explicit (`ssh://git@...`), and SSH-shorthand
 /// (`git@host:org/repo.git`) forms. Returns the final path segment with
-/// any `.git` suffix stripped -- e.g. `agent-memory` for
+/// any `.git` suffix stripped and lowercased -- e.g. `agent-memory` for
 /// `https://github.com/nitecon/agent-memory.git`.
 fn normalize_git_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -67,7 +69,9 @@ fn normalize_git_url(url: &str) -> String {
         .rsplit(['/', ':'])
         .find(|seg| !seg.is_empty())
         .unwrap_or(trimmed);
-    last.strip_suffix(".git").unwrap_or(last).to_string()
+    last.strip_suffix(".git")
+        .unwrap_or(last)
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,6 +272,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_uppercase_repo_name_to_gateway_ident() {
+        assert_eq!(normalize_git_url("git@github.com:nitecon/X.git"), "x");
+        assert_eq!(normalize_git_url("https://github.com/nitecon/X.git"), "x");
+    }
+
+    #[test]
     fn normalize_ssh_explicit() {
         assert_eq!(
             normalize_git_url("ssh://git@github.com/nitecon/agent-memory.git"),
@@ -328,6 +338,16 @@ mod tests {
     }
 
     #[test]
+    fn project_ident_lowercases_directory_fallback() {
+        let root = temp_root();
+        let project_root = root.join("X");
+        fs::create_dir_all(&project_root).expect("create project");
+
+        assert_eq!(project_ident(&project_root), "x");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn project_ident_reads_git_config_before_uppercase_directory_fallback() {
         let root = temp_root();
         let project_root = root.join("X");
@@ -337,6 +357,23 @@ mod tests {
             r#"
 [remote "origin"]
     url = https://github.com/nitecon/x.git
+"#,
+        );
+
+        assert_eq!(project_ident(&project_root), "x");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_ident_lowercases_uppercase_origin_repo_name() {
+        let root = temp_root();
+        let project_root = root.join("X");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_git_config(
+            &project_root,
+            r#"
+[remote "origin"]
+    url = https://github.com/nitecon/X.git
 "#,
         );
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.8.7 - 2026-06-05
+
+- Fixed gateway project lookup for remotes whose repository name differs by case from the gateway ident, e.g. `git@github.com:nitecon/X.git` now resolves to `x` for `memory pull`/`memory push`.
+- Lowercased the non-git directory fallback ident to avoid Windows/PowerShell path-case drift creating a separate project id.
+
 ## v1.8.6 - 2026-06-05
 
 - Fixed cwd project detection on Windows/worktree-style checkouts by reading `.git/config` directly, including the current branch's upstream remote, before falling back to the directory basename. This avoids gateway sync using an uppercase directory name when the repository ident is lowercase.
