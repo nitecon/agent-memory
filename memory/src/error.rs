@@ -8,6 +8,9 @@ pub enum MemoryError {
     #[error("Embedding error: {0}")]
     Embedding(String),
 
+    #[error("Rerank error: {0}")]
+    Rerank(String),
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

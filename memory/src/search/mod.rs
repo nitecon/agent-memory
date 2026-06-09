@@ -1,5 +1,6 @@
 pub mod bm25;
 pub mod fusion;
+pub mod rerank;
 pub mod vector;
 
 use rusqlite::Connection;
@@ -143,6 +144,16 @@ pub fn hybrid_search(
         }
     }
 
+    // Cross-encoder rerank of the full candidate set, in place. Runs after the
+    // RRF-ordered `results` are materialized (so we have the document texts) and
+    // before scope boosts (which multiply + re-sort). On success every result's
+    // score is overwritten with the sigmoid-normalized rerank score for its
+    // `content`; the final ordering is then driven by rerank score × scope
+    // boost. Disabled-by-env or any rerank failure (offline, download error)
+    // silently falls back to the existing RRF scores so `memory context` always
+    // returns — the error is never propagated out of `hybrid_search`.
+    maybe_rerank(query, &mut results, model_cache_dir);
+
     apply_scope_boosts(
         &mut results,
         opts.current_project.is_some().then_some(opts.boost_factor),
@@ -163,6 +174,45 @@ pub fn hybrid_search(
     queries::increment_access(conn, &accessed_ids)?;
 
     Ok(results)
+}
+
+/// Reranking is on by default. The `MEMORY_RERANK` env var is an escape hatch:
+/// set it to `0`/`false`/`off`/`no`/`n` (case-insensitive) to disable. Any
+/// other value — or an unset var — leaves reranking enabled. Mirrors the
+/// boolean vocabulary `config::parse_bool` already accepts elsewhere.
+fn rerank_enabled() -> bool {
+    match std::env::var("MEMORY_RERANK") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | "n"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Rerank `results` in place when enabled, overwriting each result's score with
+/// the sigmoid-normalized cross-encoder score for its `memory.content`.
+///
+/// Graceful degradation is the whole point: if reranking is disabled or the
+/// reranker fails for any reason, this is a no-op and the caller keeps the
+/// RRF-ordered scores untouched. Errors are swallowed deliberately — recall must
+/// not break because a model download failed on a freshly-synced host.
+fn maybe_rerank(query: &str, results: &mut [SearchResult], model_cache_dir: &Path) {
+    if results.is_empty() || !rerank_enabled() {
+        return;
+    }
+
+    let docs: Vec<&str> = results.iter().map(|r| r.memory.content.as_str()).collect();
+    match rerank::rerank_scores(query, &docs, model_cache_dir) {
+        Ok(scores) if scores.len() == results.len() => {
+            for (r, score) in results.iter_mut().zip(scores) {
+                r.rank_info.score = score;
+            }
+        }
+        // A mismatched length would corrupt the score/result pairing; treat it
+        // like any other failure and fall back to the RRF ordering.
+        Ok(_) | Err(_) => {}
+    }
 }
 
 /// Apply per-scope score multipliers in place and re-sort by descending score.
@@ -325,6 +375,50 @@ mod tests {
         apply_scope_boosts(&mut results, Some(1.0), Some(1.0));
         let after2: Vec<f32> = results.iter().map(|r| r.rank_info.score).collect();
         assert_eq!(before, after2);
+    }
+
+    /// With reranking disabled via `MEMORY_RERANK=0`, `maybe_rerank` is a no-op:
+    /// scores and ordering are exactly the RRF input. Exercises the graceful
+    /// fallback path without a DB or the reranker model. The env var is set and
+    /// cleared within the test; `MEMORY_RERANK` is unique to rerank so this does
+    /// not collide with other env-reading tests.
+    #[test]
+    fn maybe_rerank_is_noop_when_disabled_by_env() {
+        std::env::set_var("MEMORY_RERANK", "0");
+
+        let mut results = vec![
+            mk_result("a", Some("agent-memory"), 0.9, "agent-memory", "__global__"),
+            mk_result("b", Some("__global__"), 0.4, "agent-memory", "__global__"),
+        ];
+        let before_scores: Vec<f32> = results.iter().map(|r| r.rank_info.score).collect();
+        let before_ids: Vec<String> = results.iter().map(|r| r.rank_info.id.clone()).collect();
+
+        // model_cache_dir is never touched because the env disable short-circuits
+        // before any model access.
+        maybe_rerank("any query", &mut results, Path::new("/nonexistent"));
+
+        let after_scores: Vec<f32> = results.iter().map(|r| r.rank_info.score).collect();
+        let after_ids: Vec<String> = results.iter().map(|r| r.rank_info.id.clone()).collect();
+        assert_eq!(before_scores, after_scores);
+        assert_eq!(before_ids, after_ids);
+
+        std::env::remove_var("MEMORY_RERANK");
+    }
+
+    /// The env disable predicate accepts the documented falsey vocabulary
+    /// (case-insensitive) and treats unset / anything-else as enabled.
+    #[test]
+    fn rerank_enabled_respects_env_vocabulary() {
+        for v in ["0", "false", "OFF", "No", "n", " false "] {
+            std::env::set_var("MEMORY_RERANK", v);
+            assert!(!rerank_enabled(), "expected {v:?} to disable rerank");
+        }
+        for v in ["1", "true", "on", "anything"] {
+            std::env::set_var("MEMORY_RERANK", v);
+            assert!(rerank_enabled(), "expected {v:?} to keep rerank enabled");
+        }
+        std::env::remove_var("MEMORY_RERANK");
+        assert!(rerank_enabled(), "unset MEMORY_RERANK should keep rerank on");
     }
 
     /// Global boost alone (no current-project boost) still elevates global
