@@ -6,7 +6,7 @@ Persistent hybrid-search memory system for AI coding agents. Replaces markdown-b
 
 - **SQLite** -- single-file backing store, portable, zero config
 - **fastembed-rs** -- local embeddings via all-MiniLM-L6-v2 ONNX model (semantic similarity, no API calls)
-- **Hybrid ranking** -- BM25 (FTS5) + cosine similarity combined via Reciprocal Rank Fusion (RRF)
+- **Hybrid ranking** -- BM25 (FTS5) + cosine similarity fused via Reciprocal Rank Fusion (RRF), then re-ordered by a local cross-encoder reranker (fastembed, on by default)
 - **MCP server** -- stdio JSON-RPC server for native Claude Code tool integration
 - **CLI** -- direct command-line interface for humans, scripts, and AI agents
 
@@ -676,11 +676,31 @@ Every query runs through two retrieval paths simultaneously:
 
 Results are combined via **Reciprocal Rank Fusion** (k=60), which merges ranked lists without requiring score normalization. A memory that ranks well in both paths gets a strong combined score.
 
+3. **Cross-encoder rerank** (fastembed, on by default) -- the fused candidate set (3× the requested limit) is re-scored by a cross-encoder that reads the query and each memory *together*, then sigmoid-normalized so the project/global scope boosts still apply multiplicatively. RRF gets the right memory into the candidate pool; the reranker fixes the ordering of the slice the agent actually reads. The reranker model loads lazily (same pattern as the embedder) and is cached per process. If it can't load (e.g. offline, first-run download blocked), search **silently falls back to RRF order** -- recall never breaks.
+
+Reranking is tuned by two environment variables:
+
+| Variable | Default | Behavior |
+|----------|---------|----------|
+| `MEMORY_RERANK` | on | Set to `0`/`false`/`off`/`no`/`n` to disable reranking entirely (pure RRF order). |
+| `MEMORY_RERANK_MODEL` | `turbo` | Selects the cross-encoder. `turbo`/`jina-turbo` → JINA Reranker v1 Turbo (EN); `bge-base`/`bge-reranker-base` → BGE Reranker Base; `bge-v2-m3` → BGE Reranker v2 m3; `jina-v2`/`multilingual` → JINA Reranker v2 (multilingual). Unrecognized values fall back to `turbo`. |
+
+The default (`turbo`) is chosen for the CLI hot path: because each invocation is a fresh process, the per-call cost is dominated by **model load**, not inference. Measured warm latency (model already downloaded), per `memory search` call:
+
+| Config | Warm latency/call | First-run download |
+|--------|-------------------|--------------------|
+| `MEMORY_RERANK=0` (off) | ~0.06s | -- |
+| `turbo` (default) | ~0.62s | ~30s |
+| `bge-base` | ~2.5s | ~3min |
+
+Use the heavier `bge-base` for max precision on non-hot-path work (e.g. batch consolidation), and keep `turbo` for interactive recall.
+
 ## Design decisions
 
 - **SQLite is the source of truth.** FTS5 handles full-text indexing within the same database file.
 - **Embeddings are brute-force cosine.** For a personal memory system (<100K memories), this is fast enough and avoids ANN index complexity.
-- **Model loads lazily.** Commands that don't need embeddings (e.g., `recall`, `forget --id`) skip the ~200ms model load.
+- **Models load lazily.** Commands that don't need embeddings (e.g., `recall`, `forget --id`) skip the ~200ms embedder load, and the reranker only loads on search paths that actually rerank.
+- **Reranking happens at query time, not at store.** A cross-encoder scores a (query, memory) pair jointly, so its score is query-specific -- it can't be precomputed at store (no query exists yet) or cached across recalls (queries rarely repeat verbatim). The lever for query-independent write-time work is a stronger embedder or a sparse (SPLADE) leg, not a deferred reranker.
 - **Access counts track usage.** Every retrieval increments `access_count`, enabling `prune` to identify stale memories.
 - **All logging goes to stderr.** Stdout is reserved for light-XML results (CLI) or JSON-RPC transport (MCP), so logging never pollutes either channel. MCP tool responses themselves are light-XML strings delivered as a single text content block.
 - **User-writable default storage.** Fresh installs store data under `~/.agentic/` to avoid `/opt` permission failures; existing writable `/opt/agentic/memory.db` installs are preserved as legacy shared databases.
