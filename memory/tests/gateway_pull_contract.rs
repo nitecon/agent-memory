@@ -21,6 +21,8 @@ fn remote_memory() -> GatewayMemory {
         provenance: Some(GatewayMemoryProvenance {
             source_agent_id: Some("sre-agent".to_string()),
             source_machine_id: Some("infra-host".to_string()),
+            source_os: Some("linux".to_string()),
+            source_arch: Some("x86_64".to_string()),
             source_system: Some("agent-memory".to_string()),
             pushed_at: Some("2026-05-29T13:30:00Z".to_string()),
         }),

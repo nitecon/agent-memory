@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, path::PathBuf};
+use std::{collections::HashMap, env, io::Read, path::PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
@@ -16,9 +16,9 @@ use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
 use crate::setup::{gateway, menu, rules, skill};
 use crate::sync::{
-    memory_content_hash, GatewayMemory, GatewayMemoryTombstone, GatewaySyncClientError,
-    MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse, PushMemoriesRequest,
-    PushMemoriesResponse, PushMemoryAction,
+    memory_content_hash, GatewayMemory, GatewayMemoryProvenance, GatewayMemoryTombstone,
+    GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse,
+    PushMemoriesRequest, PushMemoriesResponse, PushMemoryAction,
 };
 
 /// Score multiplier applied to memories tagged with the current project.
@@ -294,6 +294,9 @@ pub enum Cli {
     },
     /// Push project-scoped durable memories to the agent gateway.
     Push {
+        /// Push every local durable-memory project, including global scope.
+        #[arg(long)]
+        all: bool,
         /// Maximum memory records to send in one gateway request.
         #[arg(long, default_value_t = DEFAULT_GATEWAY_PUSH_BATCH_SIZE)]
         batch_size: usize,
@@ -302,6 +305,9 @@ pub enum Cli {
     },
     /// Pull project-scoped durable memories from the agent gateway.
     Pull {
+        /// Discover and pull every gateway memory project, including global scope.
+        #[arg(long)]
+        all: bool,
         #[command(subcommand)]
         command: Option<GatewayTransferCommand>,
     },
@@ -840,6 +846,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             }
         },
         Cli::Push {
+            all,
             batch_size,
             command,
         } => {
@@ -849,14 +856,16 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 cwd_project.as_deref(),
                 matches!(command, Some(GatewayTransferCommand::Status)),
                 batch_size,
+                all,
             )?;
         }
-        Cli::Pull { command } => {
+        Cli::Pull { all, command } => {
             run_pull(
                 conn,
                 &config,
                 cwd_project.as_deref(),
                 matches!(command, Some(GatewayTransferCommand::Status)),
+                all,
             )?;
         }
         Cli::Serve => {
@@ -1116,6 +1125,21 @@ struct PullPlan {
     local_content_hash: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct PullProjectSummary {
+    remote: usize,
+    conflicts: usize,
+    cursors_updated: usize,
+}
+
+impl PullProjectSummary {
+    fn add_assign(&mut self, other: &PullProjectSummary) {
+        self.remote += other.remote;
+        self.conflicts += other.conflicts;
+        self.cursors_updated += other.cursors_updated;
+    }
+}
+
 fn maybe_auto_sync_after_store(conn: &Connection, config: &Config, memory: &Memory) {
     let Some(project) = auto_sync_project_for_memory(config, memory) else {
         return;
@@ -1259,29 +1283,103 @@ fn run_push(
     cwd_project: Option<&str>,
     status_only: bool,
     batch_size: usize,
+    all: bool,
 ) -> Result<(), MemoryError> {
+    let batch_size = validate_push_batch_size(batch_size)?;
+    if all {
+        return run_push_all(conn, config, status_only, batch_size);
+    }
     let project = resolve_gateway_project(cwd_project)?;
-    let candidates = build_push_candidates(conn, &project)?;
+    let gateway = if status_only {
+        None
+    } else {
+        Some(MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?)
+    };
+    run_push_project(conn, gateway.as_ref(), &project, status_only, batch_size)?;
+    Ok(())
+}
+
+fn run_push_all(
+    conn: &Connection,
+    config: &Config,
+    status_only: bool,
+    batch_size: usize,
+) -> Result<(), MemoryError> {
+    let projects = list_local_gateway_projects(conn)?;
+    let gateway = if status_only || projects.is_empty() {
+        None
+    } else {
+        Some(MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?)
+    };
+    let mut total = PushProjectSummary::default();
+    for project in &projects {
+        let summary = run_push_project(conn, gateway.as_ref(), project, status_only, batch_size)?;
+        total.add_assign(&summary);
+    }
+    println!(
+        "{}",
+        render::render_action_result(
+            if status_only {
+                "push_all_status"
+            } else {
+                "push_all_complete"
+            },
+            &[
+                ("projects", projects.len().to_string()),
+                ("candidates", total.candidates.to_string()),
+                ("pending", total.pending.to_string()),
+                ("skipped", total.skipped.to_string()),
+                ("created", total.counts.created.to_string()),
+                ("updated", total.counts.updated.to_string()),
+                ("linked", total.counts.linked.to_string()),
+                ("conflicts", total.counts.conflicts.to_string()),
+                ("rejected", total.counts.rejected.to_string()),
+            ],
+        )
+    );
+    Ok(())
+}
+
+fn run_push_project(
+    conn: &Connection,
+    gateway: Option<&MemoryGatewayClient>,
+    project: &str,
+    status_only: bool,
+    batch_size: usize,
+) -> Result<PushProjectSummary, MemoryError> {
+    let candidates = build_push_candidates(conn, project)?;
     let pending: Vec<&PushCandidate> = candidates
         .iter()
         .filter(|candidate| candidate.action != "skipped")
         .collect();
+    let skipped = candidates.len().saturating_sub(pending.len());
 
-    print_push_status(&project, &candidates);
+    print_push_status(project, &candidates);
     if status_only {
-        return Ok(());
+        return Ok(PushProjectSummary {
+            candidates: candidates.len(),
+            pending: pending.len(),
+            skipped,
+            counts: PushResponseCounts::default(),
+        });
     }
-    let batch_size = validate_push_batch_size(batch_size)?;
 
     if pending.is_empty() {
         println!(
             "{}",
             render::render_action_result("push_complete", &[("sent", "0".to_string())])
         );
-        return Ok(());
+        return Ok(PushProjectSummary {
+            candidates: candidates.len(),
+            pending: 0,
+            skipped,
+            counts: PushResponseCounts::default(),
+        });
     }
 
-    let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    let gateway = gateway.ok_or_else(|| {
+        MemoryError::Config("memory push requires configured gateway client".to_string())
+    })?;
     let batches = push_batches(&pending, batch_size);
     let total_batches = batches.len();
     let mut counts = PushResponseCounts::default();
@@ -1290,14 +1388,19 @@ fn run_push(
         if total_batches > 1 {
             print_push_batch(batch_index + 1, total_batches, batch.len());
         }
-        let (request, hashes) = build_push_request(&project, batch);
+        let (request, hashes) = build_push_request(project, batch);
         let response = gateway.push_memories(&request).map_err(map_gateway_error)?;
-        apply_push_response(conn, &project, &response, &hashes)?;
+        apply_push_response(conn, project, &response, &hashes)?;
         print_push_results(&response, &mut counts);
     }
 
-    print_push_complete(&project, &counts);
-    Ok(())
+    print_push_complete(project, &counts);
+    Ok(PushProjectSummary {
+        candidates: candidates.len(),
+        pending: pending.len(),
+        skipped,
+        counts,
+    })
 }
 
 fn validate_push_batch_size(batch_size: usize) -> Result<usize, MemoryError> {
@@ -1312,6 +1415,17 @@ fn validate_push_batch_size(batch_size: usize) -> Result<usize, MemoryError> {
         )));
     }
     Ok(batch_size)
+}
+
+fn list_local_gateway_projects(conn: &Connection) -> Result<Vec<String>, MemoryError> {
+    let mut projects: Vec<String> = queries::list_projects(conn)?
+        .into_iter()
+        .filter_map(|(project, _)| project)
+        .filter(|project| !project.trim().is_empty())
+        .collect();
+    projects.sort();
+    projects.dedup();
+    Ok(projects)
 }
 
 fn push_batches<'a>(
@@ -1348,11 +1462,6 @@ fn build_push_candidates(
     conn: &Connection,
     project: &str,
 ) -> Result<Vec<PushCandidate>, MemoryError> {
-    if project == GLOBAL_PROJECT_IDENT {
-        return Err(MemoryError::Config(
-            "Global memories are excluded from gateway push".to_string(),
-        ));
-    }
     let memories = queries::list_memories_by_project(conn, Some(project))?;
     let mut candidates = Vec::new();
     for memory in memories {
@@ -1407,9 +1516,31 @@ fn gateway_memory_from_local(
         server_revision: None,
         created_at: Some(memory.created_at.clone()),
         updated_at: Some(memory.updated_at.clone()),
-        provenance: None,
+        provenance: Some(gateway_provenance_from_local(memory)),
         tombstone: None,
     })
+}
+
+fn gateway_provenance_from_local(memory: &Memory) -> GatewayMemoryProvenance {
+    GatewayMemoryProvenance {
+        source_agent_id: memory.agent.clone(),
+        source_machine_id: local_host_alias(),
+        source_os: Some(env::consts::OS.to_string()),
+        source_arch: Some(env::consts::ARCH.to_string()),
+        source_system: Some("agent-memory".to_string()),
+        pushed_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn local_host_alias() -> Option<String> {
+    ["AGENT_MEMORY_HOST", "HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| {
+            env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn apply_push_response(
@@ -1497,6 +1628,23 @@ fn print_push_status(project: &str, candidates: &[PushCandidate]) {
 }
 
 #[derive(Debug, Default)]
+struct PushProjectSummary {
+    candidates: usize,
+    pending: usize,
+    skipped: usize,
+    counts: PushResponseCounts,
+}
+
+impl PushProjectSummary {
+    fn add_assign(&mut self, other: &PushProjectSummary) {
+        self.candidates += other.candidates;
+        self.pending += other.pending;
+        self.skipped += other.skipped;
+        self.counts.add_assign(&other.counts);
+    }
+}
+
+#[derive(Debug, Default)]
 struct PushResponseCounts {
     created: usize,
     updated: usize,
@@ -1514,6 +1662,14 @@ impl PushResponseCounts {
             PushMemoryAction::Conflict => self.conflicts += 1,
             PushMemoryAction::Rejected => self.rejected += 1,
         }
+    }
+
+    fn add_assign(&mut self, other: &PushResponseCounts) {
+        self.created += other.created;
+        self.updated += other.updated;
+        self.linked += other.linked;
+        self.conflicts += other.conflicts;
+        self.rejected += other.rejected;
     }
 }
 
@@ -1590,37 +1746,97 @@ fn run_pull(
     config: &Config,
     cwd_project: Option<&str>,
     status_only: bool,
+    all: bool,
 ) -> Result<(), MemoryError> {
+    let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    if all {
+        return run_pull_all(conn, config, &gateway, status_only);
+    }
     let project = resolve_gateway_project(cwd_project)?;
-    let state = queries::get_project_gateway_sync_state(conn, &project)?;
+    run_pull_project(conn, config, &gateway, &project, status_only)?;
+    Ok(())
+}
+
+fn run_pull_all(
+    conn: &Connection,
+    config: &Config,
+    gateway: &MemoryGatewayClient,
+    status_only: bool,
+) -> Result<(), MemoryError> {
+    let response = gateway.list_memory_projects().map_err(map_gateway_error)?;
+    let mut projects: Vec<String> = response
+        .project_idents()
+        .filter(|project| !project.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    projects.sort();
+    projects.dedup();
+
+    let mut total = PullProjectSummary::default();
+    for project in &projects {
+        let summary = run_pull_project(conn, config, gateway, project, status_only)?;
+        total.add_assign(&summary);
+    }
+    println!(
+        "{}",
+        render::render_action_result(
+            if status_only {
+                "pull_all_status"
+            } else {
+                "pull_all_complete"
+            },
+            &[
+                ("projects", projects.len().to_string()),
+                ("remote", total.remote.to_string()),
+                ("conflicts", total.conflicts.to_string()),
+                ("cursors_updated", total.cursors_updated.to_string(),),
+            ],
+        )
+    );
+    Ok(())
+}
+
+fn run_pull_project(
+    conn: &Connection,
+    config: &Config,
+    gateway: &MemoryGatewayClient,
+    project: &str,
+    status_only: bool,
+) -> Result<PullProjectSummary, MemoryError> {
+    let state = queries::get_project_gateway_sync_state(conn, project)?;
     let request = PullMemoriesRequest {
-        project: project.clone(),
+        project: project.to_string(),
         since_server_revision: state.as_ref().and_then(|s| s.last_pull_server_revision),
         cursor: state.and_then(|s| s.last_pull_cursor),
         known_memories: Vec::new(),
         limit: Some(100),
     };
-    let response = MemoryGatewayClient::from_config(&config.gateway)
-        .map_err(map_gateway_error)?
-        .pull_memories(&request)
-        .map_err(map_gateway_error)?;
+    let response = gateway.pull_memories(&request).map_err(map_gateway_error)?;
     response.validate_project_scope().map_err(|err| {
         MemoryError::Config(format!(
             "gateway pull response failed scope validation: {err}"
         ))
     })?;
 
-    let plans = plan_pull_actions(conn, &project, &response)?;
-    print_pull_status(&project, &plans, status_only);
+    let plans = plan_pull_actions(conn, project, &response)?;
+    print_pull_status(project, &plans, status_only);
     if status_only {
-        return Ok(());
+        return Ok(PullProjectSummary {
+            remote: plans.len(),
+            conflicts: plans
+                .iter()
+                .filter(|plan| plan.action == "conflict")
+                .count(),
+            cursors_updated: 0,
+        });
     }
 
-    let conflicts = apply_pull_plans(conn, config, &project, &plans)?;
+    let conflicts = apply_pull_plans(conn, config, project, &plans)?;
+    let cursor_updated = conflicts == 0;
     if conflicts == 0 {
         queries::upsert_project_gateway_sync_state(
             conn,
-            &project,
+            project,
             response.server_revision,
             response.next_cursor.as_deref(),
         )?;
@@ -1630,13 +1846,17 @@ fn run_pull(
         render::render_action_result(
             "pull_complete",
             &[
-                ("project", project),
+                ("project", project.to_string()),
                 ("conflicts", conflicts.to_string()),
-                ("cursor_updated", (conflicts == 0).to_string()),
+                ("cursor_updated", cursor_updated.to_string()),
             ],
         )
     );
-    Ok(())
+    Ok(PullProjectSummary {
+        remote: plans.len(),
+        conflicts,
+        cursors_updated: usize::from(cursor_updated),
+    })
 }
 
 fn plan_pull_actions(
@@ -2519,9 +2739,11 @@ mod tests {
         let push = Cli::try_parse_from(["memory", "push", "status"]).unwrap();
         match push {
             Cli::Push {
+                all,
                 command,
                 batch_size,
             } => {
+                assert!(!all);
                 assert!(matches!(command, Some(GatewayTransferCommand::Status)));
                 assert_eq!(batch_size, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
             }
@@ -2531,9 +2753,11 @@ mod tests {
         let push_run = Cli::try_parse_from(["memory", "push"]).unwrap();
         match push_run {
             Cli::Push {
+                all,
                 command,
                 batch_size,
             } => {
+                assert!(!all);
                 assert!(command.is_none());
                 assert_eq!(batch_size, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
             }
@@ -2544,18 +2768,68 @@ mod tests {
             Cli::try_parse_from(["memory", "push", "--batch-size", "123"]).unwrap();
         match push_batch_size {
             Cli::Push {
+                all,
                 command,
                 batch_size,
             } => {
+                assert!(!all);
                 assert!(command.is_none());
                 assert_eq!(batch_size, 123);
             }
             _ => panic!("expected Push variant"),
         }
 
+        let push_all =
+            Cli::try_parse_from(["memory", "push", "--all", "--batch-size", "123"]).unwrap();
+        match push_all {
+            Cli::Push {
+                all,
+                command,
+                batch_size,
+            } => {
+                assert!(all);
+                assert!(command.is_none());
+                assert_eq!(batch_size, 123);
+            }
+            _ => panic!("expected Push variant"),
+        }
+
+        let push_all_status = Cli::try_parse_from(["memory", "push", "--all", "status"]).unwrap();
+        match push_all_status {
+            Cli::Push {
+                all,
+                command,
+                batch_size,
+            } => {
+                assert!(all);
+                assert!(matches!(command, Some(GatewayTransferCommand::Status)));
+                assert_eq!(batch_size, DEFAULT_GATEWAY_PUSH_BATCH_SIZE);
+            }
+            _ => panic!("expected Push variant"),
+        }
+
         let pull = Cli::try_parse_from(["memory", "pull", "status"]).unwrap();
         match pull {
-            Cli::Pull { command } => {
+            Cli::Pull { all, command } => {
+                assert!(!all);
+                assert!(matches!(command, Some(GatewayTransferCommand::Status)));
+            }
+            _ => panic!("expected Pull variant"),
+        }
+
+        let pull_all = Cli::try_parse_from(["memory", "pull", "--all"]).unwrap();
+        match pull_all {
+            Cli::Pull { all, command } => {
+                assert!(all);
+                assert!(command.is_none());
+            }
+            _ => panic!("expected Pull variant"),
+        }
+
+        let pull_all_status = Cli::try_parse_from(["memory", "pull", "--all", "status"]).unwrap();
+        match pull_all_status {
+            Cli::Pull { all, command } => {
+                assert!(all);
                 assert!(matches!(command, Some(GatewayTransferCommand::Status)));
             }
             _ => panic!("expected Pull variant"),
@@ -2619,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn push_candidates_are_project_only_and_reject_global_project() {
+    fn push_candidates_are_project_scoped_and_allow_global_scope() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         crate::db::run_migrations(&conn).expect("migrate");
 
@@ -2659,10 +2933,52 @@ mod tests {
             "aaaaaaaa-0000-1111-2222-000000000010"
         );
 
-        let err = build_push_candidates(&conn, GLOBAL_PROJECT_IDENT).unwrap_err();
-        assert!(
-            err.to_string().contains("Global memories are excluded"),
-            "unexpected error: {err}"
+        let global = build_push_candidates(&conn, GLOBAL_PROJECT_IDENT).unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(
+            global[0].local_memory_id,
+            "aaaaaaaa-0000-1111-2222-000000000012"
+        );
+        assert_eq!(global[0].gateway_memory.project, GLOBAL_PROJECT_IDENT);
+        assert_eq!(
+            global[0]
+                .gateway_memory
+                .provenance
+                .as_ref()
+                .and_then(|p| p.source_os.as_deref()),
+            Some(env::consts::OS)
+        );
+    }
+
+    #[test]
+    fn local_gateway_projects_include_global_and_exclude_unscoped() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+
+        for (id, project) in [
+            ("aaaaaaaa-0000-1111-2222-000000000020", Some("agent-memory")),
+            (
+                "aaaaaaaa-0000-1111-2222-000000000021",
+                Some(GLOBAL_PROJECT_IDENT),
+            ),
+            ("aaaaaaaa-0000-1111-2222-000000000022", None),
+        ] {
+            let mut memory = Memory::new(
+                format!("memory {id}"),
+                Some(vec!["gateway".to_string()]),
+                project.map(str::to_string),
+                None,
+                None,
+                Some("project".to_string()),
+            );
+            memory.id = id.to_string();
+            queries::insert_memory(&conn, &memory).unwrap();
+        }
+
+        let projects = list_local_gateway_projects(&conn).unwrap();
+        assert_eq!(
+            projects,
+            vec![GLOBAL_PROJECT_IDENT.to_string(), "agent-memory".to_string()]
         );
     }
 

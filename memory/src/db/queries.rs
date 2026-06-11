@@ -107,11 +107,6 @@ fn validate_gateway_project(project: &str) -> Result<(), MemoryError> {
             "Gateway memory exchange requires a non-empty project ident".to_string(),
         ));
     }
-    if project == GLOBAL_PROJECT_IDENT {
-        return Err(MemoryError::Config(
-            "Global memories are excluded from gateway exchange".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -1647,7 +1642,7 @@ mod resolve_id_tests {
     }
 
     #[test]
-    fn memory_gateway_sync_upsert_rejects_project_mismatch_and_global() {
+    fn memory_gateway_sync_upsert_rejects_project_mismatch_and_allows_global() {
         let conn = fresh_db();
         let id = "aaaaaaaa-0000-1111-2222-000000000001";
         insert(&conn, id);
@@ -1669,9 +1664,41 @@ mod resolve_id_tests {
         .expect_err("project mismatch rejected");
         assert!(mismatch.to_string().contains("Cannot link local memory"));
 
-        let global =
-            get_project_gateway_sync_state(&conn, GLOBAL_PROJECT_IDENT).expect_err("global reject");
-        assert!(global.to_string().contains("Global memories are excluded"));
+        assert!(get_project_gateway_sync_state(&conn, GLOBAL_PROJECT_IDENT)
+            .unwrap()
+            .is_none());
+
+        let mut global_memory = Memory::new(
+            "global memory".to_string(),
+            Some(vec!["workflow".to_string()]),
+            Some(GLOBAL_PROJECT_IDENT.to_string()),
+            None,
+            None,
+            Some("feedback".to_string()),
+        );
+        global_memory.id = "aaaaaaaa-0000-1111-2222-000000000002".to_string();
+        insert_memory(&conn, &global_memory).unwrap();
+
+        upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: global_memory.id.clone(),
+                project: GLOBAL_PROJECT_IDENT.to_string(),
+                gateway_memory_id: "gw-global".to_string(),
+                last_seen_server_revision: 1,
+                last_pushed_content_hash: None,
+                last_pulled_content_hash: Some("hash".to_string()),
+                sync_state: "pulled".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let global_sync = get_memory_gateway_sync(&conn, &global_memory.id)
+            .unwrap()
+            .expect("global sync metadata");
+        assert_eq!(global_sync.project, GLOBAL_PROJECT_IDENT);
     }
 
     #[test]

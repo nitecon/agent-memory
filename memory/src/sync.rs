@@ -5,15 +5,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::GatewayConfig;
-use crate::db::queries::GLOBAL_PROJECT_IDENT;
-
 pub const PUSH_MEMORIES_PATH: &str = "/v1/projects/{project}/memories/push";
 pub const PULL_MEMORIES_PATH: &str = "/v1/projects/{project}/memories/pull";
+pub const MEMORY_PROJECTS_PATH: &str = "/v1/memories/projects";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemorySyncValidationError {
     EmptyProject,
-    GlobalProjectExcluded,
     ProjectMismatch { expected: String, actual: String },
     WorkingContextExcluded,
 }
@@ -22,9 +20,6 @@ impl std::fmt::Display for MemorySyncValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyProject => write!(f, "project ident must not be empty"),
-            Self::GlobalProjectExcluded => {
-                write!(f, "global memories are excluded from gateway exchange")
-            }
             Self::ProjectMismatch { expected, actual } => write!(
                 f,
                 "memory project ident mismatch: expected {expected}, got {actual}"
@@ -119,6 +114,28 @@ impl MemoryGatewayClient {
         Ok(response)
     }
 
+    pub fn list_memory_projects(
+        &self,
+    ) -> Result<ListMemoryProjectsResponse, GatewaySyncClientError> {
+        let response: ListMemoryProjectsResponse = self.get_json(MEMORY_PROJECTS_PATH)?;
+        response.validate_project_idents()?;
+        Ok(response)
+    }
+
+    fn get_json<R>(&self, path: &str) -> Result<R, GatewaySyncClientError>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.endpoint(path);
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .map_err(|err| GatewaySyncClientError::Transport(err.to_string()))?;
+        decode_json_response(response)
+    }
+
     fn post_json<T, R>(&self, path: &str, body: &T) -> Result<R, GatewaySyncClientError>
     where
         T: Serialize,
@@ -132,19 +149,122 @@ impl MemoryGatewayClient {
             .json(body)
             .send()
             .map_err(|err| GatewaySyncClientError::Transport(err.to_string()))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .map_err(|err| GatewaySyncClientError::Transport(err.to_string()))?;
-        if !status.is_success() {
-            return Err(classify_gateway_status(status, &text));
-        }
-        serde_json::from_str(&text)
-            .map_err(|err| GatewaySyncClientError::MalformedResponse(err.to_string()))
+        decode_json_response(response)
     }
 
     pub fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url, normalize_path(path))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListMemoryProjectsResponse {
+    pub projects: Vec<GatewayMemoryProject>,
+}
+
+impl<'de> Deserialize<'de> for ListMemoryProjectsResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(ListMemoryProjectsResponseShape::deserialize(deserializer)?.into())
+    }
+}
+
+impl ListMemoryProjectsResponse {
+    pub fn validate_project_idents(&self) -> Result<(), MemorySyncValidationError> {
+        for project in &self.projects {
+            project.validate_project_ident()?;
+        }
+        Ok(())
+    }
+
+    pub fn project_idents(&self) -> impl Iterator<Item = &str> {
+        self.projects.iter().map(|project| project.project.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayMemoryProject {
+    #[serde(rename = "project_ident")]
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_revision: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for GatewayMemoryProject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(GatewayMemoryProjectShape::deserialize(deserializer)?.into())
+    }
+}
+
+impl GatewayMemoryProject {
+    pub fn validate_project_ident(&self) -> Result<(), MemorySyncValidationError> {
+        validate_project_ident(&self.project)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ListMemoryProjectsResponseShape {
+    Object {
+        #[serde(default, alias = "project_idents", alias = "items")]
+        projects: Vec<GatewayMemoryProject>,
+    },
+    Projects(Vec<GatewayMemoryProject>),
+}
+
+impl From<ListMemoryProjectsResponseShape> for ListMemoryProjectsResponse {
+    fn from(shape: ListMemoryProjectsResponseShape) -> Self {
+        match shape {
+            ListMemoryProjectsResponseShape::Object { projects }
+            | ListMemoryProjectsResponseShape::Projects(projects) => Self { projects },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GatewayMemoryProjectShape {
+    Ident(String),
+    Object {
+        #[serde(
+            rename = "project_ident",
+            alias = "project",
+            alias = "ident",
+            alias = "id"
+        )]
+        project: String,
+        #[serde(default, alias = "count")]
+        memory_count: Option<u64>,
+        #[serde(default, alias = "latest_server_revision")]
+        server_revision: Option<i64>,
+    },
+}
+
+impl From<GatewayMemoryProjectShape> for GatewayMemoryProject {
+    fn from(shape: GatewayMemoryProjectShape) -> Self {
+        match shape {
+            GatewayMemoryProjectShape::Ident(project) => Self {
+                project,
+                memory_count: None,
+                server_revision: None,
+            },
+            GatewayMemoryProjectShape::Object {
+                project,
+                memory_count,
+                server_revision,
+            } => Self {
+                project,
+                memory_count,
+                server_revision,
+            },
+        }
     }
 }
 
@@ -392,6 +512,10 @@ pub struct GatewayMemoryProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_machine_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pushed_at: Option<String>,
@@ -494,9 +618,6 @@ fn validate_project_ident(project: &str) -> Result<(), MemorySyncValidationError
     if project.trim().is_empty() {
         return Err(MemorySyncValidationError::EmptyProject);
     }
-    if project == GLOBAL_PROJECT_IDENT {
-        return Err(MemorySyncValidationError::GlobalProjectExcluded);
-    }
     Ok(())
 }
 
@@ -566,6 +687,23 @@ fn hex_upper(byte: u8) -> String {
     out
 }
 
+fn decode_json_response<R>(
+    response: reqwest::blocking::Response,
+) -> Result<R, GatewaySyncClientError>
+where
+    R: DeserializeOwned,
+{
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|err| GatewaySyncClientError::Transport(err.to_string()))?;
+    if !status.is_success() {
+        return Err(classify_gateway_status(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| GatewaySyncClientError::MalformedResponse(err.to_string()))
+}
+
 fn classify_gateway_status(status: reqwest::StatusCode, body: &str) -> GatewaySyncClientError {
     let message = body.trim();
     let message = if message.is_empty() {
@@ -586,7 +724,10 @@ fn classify_gateway_status(status: reqwest::StatusCode, body: &str) -> GatewaySy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::queries::GLOBAL_PROJECT_IDENT;
     use reqwest::StatusCode;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn client_normalizes_endpoint_paths() {
@@ -599,6 +740,115 @@ mod tests {
             client.endpoint("v1/projects/{project}/memories/pull"),
             "https://gateway.example/v1/projects/{project}/memories/pull"
         );
+        assert_eq!(
+            client.endpoint(MEMORY_PROJECTS_PATH),
+            "https://gateway.example/v1/memories/projects"
+        );
+    }
+
+    #[test]
+    fn client_lists_memory_projects_with_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /v1/memories/projects HTTP/1.1\r\n"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer key"));
+
+            let body = r#"{"projects":[{"project_ident":"agent-memory","memory_count":2},{"project":"__global__","server_revision":7}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let client = MemoryGatewayClient::from_parts(&format!("http://{addr}"), "key").unwrap();
+        let response = client.list_memory_projects().unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            response.project_idents().collect::<Vec<_>>(),
+            vec!["agent-memory", GLOBAL_PROJECT_IDENT]
+        );
+        assert_eq!(response.projects[0].memory_count, Some(2));
+        assert_eq!(response.projects[1].server_revision, Some(7));
+    }
+
+    #[test]
+    fn memory_project_response_accepts_legacy_aliases_and_string_entries() {
+        let response: ListMemoryProjectsResponse = serde_json::from_value(serde_json::json!({
+            "project_idents": ["agent-memory", "__global__"]
+        }))
+        .unwrap();
+        response.validate_project_idents().unwrap();
+        assert_eq!(
+            response.project_idents().collect::<Vec<_>>(),
+            vec!["agent-memory", GLOBAL_PROJECT_IDENT]
+        );
+
+        let response: ListMemoryProjectsResponse = serde_json::from_value(serde_json::json!({
+            "items": [
+                {"project": "agent-memory", "count": 3, "latest_server_revision": 11},
+                {"project_ident": "__global__", "memory_count": 1, "server_revision": 12}
+            ]
+        }))
+        .unwrap();
+        response.validate_project_idents().unwrap();
+        assert_eq!(response.projects[0].memory_count, Some(3));
+        assert_eq!(response.projects[0].server_revision, Some(11));
+        assert_eq!(response.projects[1].memory_count, Some(1));
+        assert_eq!(response.projects[1].server_revision, Some(12));
+    }
+
+    #[test]
+    fn project_discovery_allows_global_without_changing_pull_scope() {
+        let response = ListMemoryProjectsResponse {
+            projects: vec![GatewayMemoryProject {
+                project: GLOBAL_PROJECT_IDENT.to_string(),
+                memory_count: None,
+                server_revision: None,
+            }],
+        };
+        assert_eq!(response.validate_project_idents(), Ok(()));
+
+        let empty = ListMemoryProjectsResponse {
+            projects: vec![GatewayMemoryProject {
+                project: " ".to_string(),
+                memory_count: None,
+                server_revision: None,
+            }],
+        };
+        assert_eq!(
+            empty.validate_project_idents(),
+            Err(MemorySyncValidationError::EmptyProject)
+        );
+
+        let pull = PullMemoriesRequest {
+            project: GLOBAL_PROJECT_IDENT.to_string(),
+            since_server_revision: None,
+            cursor: None,
+            known_memories: Vec::new(),
+            limit: None,
+        };
+        assert_eq!(pull.validate_project_scope(), Ok(()));
     }
 
     #[test]

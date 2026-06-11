@@ -106,8 +106,23 @@ WorkingContext, and `memory projects` lists durable-memory projects only.
 
 ### Project memory gateway exchange
 
-`memory push` and `memory pull` exchange only durable memories for the current
-project ident. Global memories (`__global__`) and WorkingContext are excluded.
+`memory push` and `memory pull` exchange durable memories with the agent
+gateway. By default they operate on the current project ident only; scoped mode
+still excludes global memories (`__global__`), unscoped memories, and
+WorkingContext.
+
+Use `--all` when syncing a whole local store. `memory push --all` walks every
+local durable-memory project ident reported by `memory projects`, including the
+reserved `__global__` ident. `memory pull --all` asks the gateway for remote
+memory project idents before pulling, so it can import projects that do not
+exist locally yet; remote `__global__` is included when present. WorkingContext
+never participates in scoped or all-scope gateway exchange.
+
+Gateway origin metadata belongs in `GatewayMemory.provenance`
+(`source_agent_id`, `source_machine_id`, `source_os`, `source_arch`,
+`source_system`, `pushed_at`). Do not add hostnames, OS names, or
+client-origin labels to normal memory tags; tags remain content and domain
+labels.
 
 Configure the gateway once with either `memory setup gateway` or the equivalent
 `agent-tools setup gateway`. Both commands write the shared
@@ -141,17 +156,37 @@ export GATEWAY_API_KEY="..."
 # Local, read-only preview of project memories that would be uploaded.
 memory push status
 
+# Local, read-only preview across all local durable-memory project idents.
+memory push --all status
+
 # Upload pending project memories. Successful created/updated/linked results
 # record gateway IDs and server revisions locally.
 memory push
 
+# Upload pending durable memories for every local project ident, including
+# __global__. WorkingContext is still excluded.
+memory push --all
+
 # Gateway-backed preview of remote project-memory diffs.
 memory pull status
+
+# Gateway-backed preview across gateway-discovered remote project idents.
+memory pull --all status
 
 # Import/link/update non-conflicting remote project memories. Conflicts are
 # reported without overwriting local content.
 memory pull
+
+# Import/link/update non-conflicting remote memories for every gateway-discovered
+# project ident, including projects not present in the local database.
+memory pull --all
 ```
+
+Push status is local and read-only in both scoped and `--all` modes; with
+`--all` it aggregates candidates by local durable-memory project ident. Pull
+status contacts the gateway in both modes; with `--all` it first discovers
+remote project idents, then prints each per-project plan without writing local
+memory rows, sync metadata, or pull cursors.
 
 Push outcomes are `created`, `updated`, `linked`, `conflict`, or `rejected`.
 Pull outcomes are `import`, `update`, `link`, `tombstone`, `conflict`,
@@ -301,9 +336,13 @@ memory projects
 
 # Exchange durable project memories with the agent gateway
 memory push status
+memory push --all status
 memory push
+memory push --all
 memory pull status
+memory pull --all status
 memory pull
+memory pull --all
 
 # Migrate memories from a legacy project name to the canonical git-remote ident
 memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git" --dry-run

@@ -54,7 +54,7 @@ fn push_request_is_project_plus_memory_array() {
 }
 
 #[test]
-fn push_request_rejects_global_project() {
+fn push_request_accepts_global_project() {
     let mut memory = project_memory();
     memory.project = "__global__".to_string();
     let request = PushMemoriesRequest {
@@ -62,11 +62,7 @@ fn push_request_rejects_global_project() {
         memories: vec![memory],
     };
 
-    let err = request.validate_project_scope().unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "global memories are excluded from gateway exchange"
-    );
+    request.validate_project_scope().unwrap();
 }
 
 #[test]

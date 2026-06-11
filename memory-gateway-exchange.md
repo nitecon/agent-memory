@@ -2,19 +2,25 @@
 
 ## Goal
 
-Share durable project memories between machines through the agent gateway so
-project-specific learning discovered by one system can be reused by other
-systems working on the same repository.
+Share durable project and global memories between machines through the agent
+gateway so learning discovered by one system can be reused by other systems,
+even when the same repositories do not exist on every machine.
 
 ## Constraints
 
-- Sync only project-scoped durable memories.
-- Exclude global/user-preference memories.
+- Default `memory push` / `memory pull` sync only the current project ident.
+- `memory push --all` syncs every local durable-memory project ident,
+  including `__global__`.
+- `memory pull --all` discovers remote memory project idents from the gateway
+  before pulling, including projects absent locally and `__global__` when
+  present.
 - Exclude WorkingContext; it remains a separate transient handoff surface.
 - Use explicit directional commands rather than a generic sync command:
-  `memory push status`, `memory push`, `memory pull status`, and
-  `memory pull`.
+  `memory push status`, `memory push`, `memory pull status`, `memory pull`,
+  and their `--all` variants.
 - Gateway APIs are array-oriented over memory structs.
+- Host, OS, architecture, and agent-origin metadata belongs in structured
+  `GatewayMemory.provenance`, not normal memory tags.
 - Deconfliction is based on gateway memory IDs, gateway revisions, and content
   hashes.
 - Exact content-hash duplicates can be linked automatically.
@@ -23,21 +29,25 @@ systems working on the same repository.
 
 ## Gateway API Shape
 
-`memory push` sends a project ident and an array of project-only memory structs.
-The gateway returns per-item actions such as created, updated, linked,
+`memory push` sends a project ident and an array of memory structs for that
+project. The gateway returns per-item actions such as created, updated, linked,
 conflict, or rejected, plus canonical gateway IDs and server revisions.
+`memory push --all` repeats that operation for every local durable-memory
+project ident, including `__global__`.
 
 `memory pull` sends a project ident and cursor/revision state. The gateway
-returns an array of project-only memory structs representing new or changed
-remote records, plus cursor, revision, provenance, and tombstone metadata.
+returns an array of memory structs representing new or changed remote records,
+plus cursor, revision, provenance, and tombstone metadata. `memory pull --all`
+first calls the gateway project-discovery route, then repeats the per-project
+pull for each returned ident.
 
 ## Local Client Responsibilities
 
 - Keep local memory retrieval behavior unchanged. `memory store` may now run
   best-effort project sync automatically when gateway auto-sync is enabled:
   push pending local project memories first, then pull remote project memories.
-  Manual `memory push` and `memory pull` remain the explicit diagnostic and
-  retry surfaces.
+  Manual `memory push`, `memory pull`, and their `--all` variants remain the
+  explicit diagnostic and retry surfaces.
 - Add sync metadata that maps local memory IDs to gateway memory IDs and server
   revisions.
 - Detect push and pull conflicts without silently overwriting local or remote

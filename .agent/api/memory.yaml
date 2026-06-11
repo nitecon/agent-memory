@@ -1,6 +1,6 @@
 app: memory
 title: Agent Memory CLI and MCP context
-summary: Persistent project/global memory, per-project WorkingContext handoff, and project-only gateway memory exchange for AI coding agents.
+summary: Persistent project/global memory, per-project WorkingContext handoff, and scoped/all-scope gateway memory exchange for AI coding agents.
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/memory.yaml
@@ -11,17 +11,21 @@ labels:
   - mcp
   - working-context
   - gateway-sync
+  - all-scope-sync
 content:
   purpose: >
     The memory binary stores durable project/global memories and exposes
     ranked context retrieval for AI agents. WorkingContext is a separate
     per-project handoff row for transient active-work state; it is not a
     durable memory and does not participate in ranking or dream curation.
-    Gateway exchange moves project-scoped durable memories between machines:
-    memory store can run best-effort automatic push-then-pull when the gateway
-    is configured, and explicit push/pull commands remain the manual diagnostic
-    and retry surface. Gateway exchange never exports global memories or
-    WorkingContext state.
+    Gateway exchange moves durable memories between machines: default scoped
+    push/pull operates on the current project ident, while explicit --all mode
+    syncs all durable-memory project idents. memory store can run best-effort
+    automatic push-then-pull for the stored project when the gateway is
+    configured, and explicit push/pull commands remain the manual diagnostic
+    and retry surface. Scoped push/pull excludes __global__; all-scope
+    push/pull includes __global__ as the durable global scope. WorkingContext
+    state is always excluded.
   workflows:
     - name: Start a task
       steps:
@@ -43,19 +47,24 @@ content:
       steps:
         - Run memory working clear when the project thread completes or the user directs cleanup.
         - Confirm memory working get returns present="false".
-    - name: Push project memories to the gateway
+    - name: Push durable memories to the gateway
       steps:
         - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
         - Environment overrides also work via AGENT_MEMORY_GATEWAY_*, AGENT_GATEWAY_*, or GATEWAY_*.
-        - Run memory push status to inspect local project memories that would be sent; this status command does not contact the gateway.
-        - Run memory push to POST pending create/update records to the gateway.
+        - Run memory push status to inspect local current-project memories that would be sent; this status command does not contact the gateway.
+        - Run memory push --all status to inspect all local durable-memory project idents that would be sent, including __global__; this status command does not contact the gateway.
+        - Run memory push to POST pending create/update records for the current project.
+        - Run memory push --all to POST pending create/update records for every local durable-memory project ident, including __global__.
+        - Keep host, OS, agent, and client-origin metadata in GatewayMemory.provenance, not in normal memory tags.
         - Resolve any conflict results reported by the gateway before expecting the local sync metadata to advance.
-    - name: Pull project memories from the gateway
+    - name: Pull durable memories from the gateway
       steps:
         - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
         - Environment overrides also work via AGENT_MEMORY_GATEWAY_*, AGENT_GATEWAY_*, or GATEWAY_*.
-        - Run memory pull status to fetch remote diffs and print the local plan without writing local memory rows or sync metadata.
-        - Run memory pull to import, link, fast-forward, or mark tombstone metadata for non-conflicting gateway memories.
+        - Run memory pull status to fetch current-project remote diffs and print the local plan without writing local memory rows or sync metadata.
+        - Run memory pull --all status to discover remote project idents from the gateway, then print each per-project plan without writing local memory rows or sync metadata.
+        - Run memory pull to import, link, fast-forward, or mark tombstone metadata for non-conflicting current-project gateway memories.
+        - Run memory pull --all to import, link, fast-forward, or mark tombstone metadata for every gateway-discovered project ident, including projects that do not exist locally yet and __global__ when present.
         - Resolve conflicts before expecting the project pull cursor to advance.
     - name: Publish this API context
       steps:
@@ -132,35 +141,55 @@ content:
             - --no-project-boost
         output: Optional <working_context present="true"> block, grouped memory sections, hints, and usage.
       - name: memory push status
-        purpose: Show project-scoped durable memories that would be created or updated on the gateway.
-        output: Light-XML gateway_push section with create/update/skipped counts and per-memory entries.
+        purpose: Show durable memories that would be created or updated on the gateway for the current project, or for every local durable-memory project ident when --all is set.
+        args:
+          optional:
+            - --all
+        output: Light-XML gateway_push section with create/update/skipped counts and per-memory entries; --all mode is grouped or repeated by project ident.
         behavior:
           - Local read-only status; does not require gateway configuration and does not write sync metadata.
-          - Excludes the reserved __global__ project and WorkingContext state.
+          - Scoped mode excludes the reserved __global__ project, unscoped memories, and WorkingContext state.
+          - --all mode includes every local durable-memory project ident, including __global__; WorkingContext and unscoped memories remain excluded.
       - name: memory push
-        purpose: Send pending project-scoped durable memories to the gateway as an array of memory structs.
-        output: Light-XML gateway_push section followed by push_result entries and push_complete when nothing is pending.
+        purpose: Send pending durable memories to the gateway as arrays of memory structs for the current project, or for every local durable-memory project ident when --all is set.
+        args:
+          optional:
+            - --all
+            - --batch-size
+        output: Light-XML gateway_push section followed by push_result entries and push_complete when nothing is pending; --all mode is grouped or repeated by project ident.
         behavior:
           - Posts only create/update candidates; skipped rows are not sent.
           - Records local sync metadata only for created, updated, or linked gateway results.
           - Leaves local sync metadata unchanged for conflict or rejected gateway results.
-          - Requires a non-global project ident and configured gateway URL/API key.
+          - Scoped mode requires a non-global current project ident and configured gateway URL/API key.
+          - --all mode walks every local durable-memory project ident, including __global__, and does not require a cwd-derived current project.
+          - WorkingContext and unscoped memories are never pushed.
+          - Host, OS, agent, and client-origin metadata belongs in GatewayMemory.provenance, not GatewayMemory.tags.
       - name: memory pull status
-        purpose: Fetch remote project memory diffs from the gateway and print the local pull plan without mutating local storage.
-        output: Light-XML gateway_pull section with import/link/update/conflict/tombstone/rejected counts and per-memory entries.
+        purpose: Fetch remote memory diffs from the gateway and print the local pull plan for the current project, or for gateway-discovered project idents when --all is set, without mutating local storage.
+        args:
+          optional:
+            - --all
+        output: Light-XML gateway_pull section with import/link/update/conflict/tombstone/rejected counts and per-memory entries; --all mode is grouped or repeated by project ident.
         behavior:
           - Contacts the gateway because status depends on remote diffs.
           - Does not insert memories, update memories, write sync metadata, or advance the project pull cursor.
-          - Excludes global memories and WorkingContext by validating all remote records against the current project.
+          - Scoped mode excludes global memories and WorkingContext by validating all remote records against the current project.
+          - --all mode discovers remote project idents from the gateway before planning, so projects that do not exist locally can still be pulled.
+          - --all mode includes __global__ when the gateway reports it; WorkingContext remains excluded.
       - name: memory pull
-        purpose: Apply non-conflicting gateway project memory diffs locally.
-        output: Light-XML gateway_pull section followed by pull_complete with conflict and cursor_updated attributes.
+        purpose: Apply non-conflicting gateway memory diffs locally for the current project, or for gateway-discovered project idents when --all is set.
+        args:
+          optional:
+            - --all
+        output: Light-XML gateway_pull section followed by pull_complete with conflict and cursor_updated attributes; --all mode is grouped or repeated by project ident.
         behavior:
           - Imports new remote records under the current project ident.
           - Links exact duplicate project memories by content hash.
           - Fast-forwards local rows only when the current local content hash still matches the recorded base hash.
           - Reports conflicts without modifying the conflicted memory or advancing the project pull cursor.
           - Records tombstone metadata but does not delete local memory content.
+          - --all mode first discovers remote project idents from the gateway and then applies the same per-project pull rules to each ident, including projects absent locally and __global__ when present.
       - name: memory recall
         purpose: Structured filtering by project, agent, tags, and memory type.
       - name: memory get
@@ -253,11 +282,18 @@ content:
   contracts:
     gateway_memory_exchange:
       scope:
-        included: Project-scoped durable memories only.
-        excluded:
-          - Global memories stored under __global__.
-          - WorkingContext rows.
-          - Unscoped memories with no project ident.
+        scoped_mode:
+          included: Current-project durable memories only.
+          excluded:
+            - Global memories stored under __global__.
+            - WorkingContext rows.
+            - Unscoped memories with no project ident.
+        all_scope_mode:
+          push_source: All local durable-memory project idents, including __global__.
+          pull_source: Gateway-discovered remote project idents, including idents absent locally and __global__ when present.
+          excluded:
+            - WorkingContext rows.
+            - Unscoped local memories with no project ident.
       endpoints:
         - method: POST
           path: /v1/projects/{project}/memories/push
@@ -267,6 +303,17 @@ content:
           path: /v1/projects/{project}/memories/pull
           request: PullMemoriesRequest
           response: PullMemoriesResponse
+        - method: GET
+          path: /v1/memories/projects
+          request: none
+          response: ListMemoryProjectsResponse
+      remote_project_discovery:
+        required_for: memory pull --all and memory pull --all status.
+        contract: Gateway returns durable-memory project idents visible to the caller before the client issues per-project pull requests.
+        notes:
+          - Discovery must include remote projects that have no local rows yet.
+          - Discovery must include __global__ when remote global memories exist.
+          - WorkingContext-only projects are not memory-sync projects.
       schemas:
         PushMemoriesRequest:
           required:
@@ -324,6 +371,24 @@ content:
             - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
             - content_hash is the gateway-compatible lowercase SHA-256 hex digest of content bytes, with no sha256: prefix.
             - memory serializes created_at and updated_at to the gateway as Unix epoch milliseconds, and accepts either epoch milliseconds or RFC3339 strings on responses.
+          guidance:
+            - tags are content/domain labels only; do not add hostnames, OS names, source machines, or client-origin labels to tags.
+            - origin metadata belongs in provenance.
+        GatewayMemoryProvenance:
+          optional:
+            - source_agent_id
+            - source_machine_id
+            - source_os
+            - source_arch
+            - source_system
+            - pushed_at
+          guidance:
+            - Use source_agent_id for the pushing agent identity.
+            - Use source_machine_id for host or machine identity.
+            - Use source_os for the operating system name reported by the pushing client.
+            - Use source_arch for the CPU architecture reported by the pushing client.
+            - Use source_system for the memory client/system.
+            - Use pushed_at for the gateway push timestamp.
       deconfliction:
         push: Client sends base_server_revision when linked; gateway returns conflict for stale updates.
         pull: Client updates only when local content hash matches last_pulled_content_hash or last_pushed_content_hash.
@@ -360,6 +425,7 @@ content:
     - WorkingContext is transient handoff. Store durable lessons with memory store.
     - Do not write huge handoffs; the 65536 character cap protects every future memory context call.
     - Do not use __global__ for WorkingContext; cross-project handoff state is intentionally unsupported.
+    - Do not put host, OS, machine, agent, or client-origin metadata in normal memory tags; use GatewayMemory.provenance fields.
     - Do not rely on memory for git history, releases, tags, CI state, or version facts.
   examples:
     - name: Read task context

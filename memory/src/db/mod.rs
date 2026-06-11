@@ -199,7 +199,7 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     }
 
     if version < 6 {
-        // Schema v6 — gateway exchange metadata for project-only memories.
+        // Schema v6 — gateway exchange metadata for durable memories.
         //
         // Durable memory rows remain canonical for local recall. These side
         // tables only record mapping/cursor state needed by `memory push` and
@@ -208,8 +208,7 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_gateway_sync (
                  local_memory_id TEXT PRIMARY KEY NOT NULL,
-                 project TEXT NOT NULL
-                     CHECK (project <> '__global__'),
+                 project TEXT NOT NULL,
                  gateway_memory_id TEXT NOT NULL,
                  last_seen_server_revision INTEGER NOT NULL,
                  last_pushed_content_hash TEXT,
@@ -229,14 +228,69 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
                  ON memory_gateway_sync(project, gateway_memory_id);
 
              CREATE TABLE IF NOT EXISTS project_gateway_sync_state (
-                 project TEXT PRIMARY KEY NOT NULL
-                     CHECK (project <> '__global__'),
+                 project TEXT PRIMARY KEY NOT NULL,
                  last_pull_server_revision INTEGER,
                  last_pull_cursor TEXT,
                  updated_at TEXT NOT NULL
              );
 
              INSERT OR IGNORE INTO schema_version (version) VALUES (6);",
+        )?;
+    }
+
+    if version < 7 {
+        // Schema v7 — allow gateway sync metadata for global-scope durable
+        // memories. WorkingContext remains project-only in its own table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_gateway_sync_v7 (
+                 local_memory_id TEXT PRIMARY KEY NOT NULL,
+                 project TEXT NOT NULL,
+                 gateway_memory_id TEXT NOT NULL,
+                 last_seen_server_revision INTEGER NOT NULL,
+                 last_pushed_content_hash TEXT,
+                 last_pulled_content_hash TEXT,
+                 sync_state TEXT NOT NULL,
+                 tombstone_deleted INTEGER NOT NULL DEFAULT 0
+                     CHECK (tombstone_deleted IN (0, 1)),
+                 tombstone_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 FOREIGN KEY(local_memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                 UNIQUE(project, gateway_memory_id)
+             );
+             INSERT OR IGNORE INTO memory_gateway_sync_v7 (
+                 local_memory_id, project, gateway_memory_id,
+                 last_seen_server_revision, last_pushed_content_hash,
+                 last_pulled_content_hash, sync_state, tombstone_deleted,
+                 tombstone_at, created_at, updated_at
+             )
+             SELECT local_memory_id, project, gateway_memory_id,
+                    last_seen_server_revision, last_pushed_content_hash,
+                    last_pulled_content_hash, sync_state, tombstone_deleted,
+                    tombstone_at, created_at, updated_at
+             FROM memory_gateway_sync;
+             DROP TABLE memory_gateway_sync;
+             ALTER TABLE memory_gateway_sync_v7 RENAME TO memory_gateway_sync;
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_sync_project
+                 ON memory_gateway_sync(project);
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_sync_gateway_id
+                 ON memory_gateway_sync(project, gateway_memory_id);
+
+             CREATE TABLE IF NOT EXISTS project_gateway_sync_state_v7 (
+                 project TEXT PRIMARY KEY NOT NULL,
+                 last_pull_server_revision INTEGER,
+                 last_pull_cursor TEXT,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO project_gateway_sync_state_v7 (
+                 project, last_pull_server_revision, last_pull_cursor, updated_at
+             )
+             SELECT project, last_pull_server_revision, last_pull_cursor, updated_at
+             FROM project_gateway_sync_state;
+             DROP TABLE project_gateway_sync_state;
+             ALTER TABLE project_gateway_sync_state_v7 RENAME TO project_gateway_sync_state;
+
+             INSERT OR IGNORE INTO schema_version (version) VALUES (7);",
         )?;
     }
 
@@ -294,7 +348,7 @@ mod migration_tests {
         )
         .expect("seed v2 db");
 
-        // Apply migrations — should run v3, v4, v5, and v6 steps in sequence.
+        // Apply migrations — should run v3, v4, v5, v6, and v7 steps in sequence.
         run_migrations(&conn).expect("migrate to latest");
 
         // Schema version advanced to latest.
@@ -303,7 +357,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 6);
+        assert_eq!(max_v, 7);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -346,7 +400,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 6);
+        assert_eq!(max_v, 7);
     }
 
     #[test]
@@ -411,7 +465,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 6);
+        assert_eq!(max_v, 7);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -490,7 +544,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 6);
+        assert_eq!(max_v, 7);
 
         let existing: String = conn
             .query_row(
@@ -502,10 +556,10 @@ mod migration_tests {
         assert_eq!(existing, "body");
     }
 
-    /// v6 migration from a v5 fixture DB must add gateway exchange metadata
-    /// tables without disturbing WorkingContext or durable memory rows.
+    /// v6/v7 migrations from a v5 fixture DB must add gateway exchange
+    /// metadata tables without disturbing WorkingContext or durable memory rows.
     #[test]
-    fn v5_database_upgrades_to_v6_creating_gateway_sync_tables() {
+    fn v5_database_upgrades_to_v7_creating_gateway_sync_tables() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
 
         conn.execute_batch(
@@ -553,7 +607,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 6);
+        assert_eq!(max_v, 7);
 
         let sync_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
@@ -588,6 +642,88 @@ mod migration_tests {
             )
             .expect("select existing row");
         assert_eq!(existing, "body");
+    }
+
+    #[test]
+    fn v6_database_upgrades_to_v7_allowing_global_gateway_sync() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                 tags TEXT, project TEXT, agent TEXT, source_file TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 access_count INTEGER DEFAULT 0, embedding BLOB, memory_type TEXT,
+                 content_raw TEXT, superseded_by TEXT,
+                 condenser_version TEXT, embedding_model TEXT
+             );
+             CREATE TABLE memory_gateway_sync (
+                 local_memory_id TEXT PRIMARY KEY NOT NULL,
+                 project TEXT NOT NULL
+                     CHECK (project <> '__global__'),
+                 gateway_memory_id TEXT NOT NULL,
+                 last_seen_server_revision INTEGER NOT NULL,
+                 last_pushed_content_hash TEXT,
+                 last_pulled_content_hash TEXT,
+                 sync_state TEXT NOT NULL,
+                 tombstone_deleted INTEGER NOT NULL DEFAULT 0
+                     CHECK (tombstone_deleted IN (0, 1)),
+                 tombstone_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 FOREIGN KEY(local_memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                 UNIQUE(project, gateway_memory_id)
+             );
+             CREATE TABLE project_gateway_sync_state (
+                 project TEXT PRIMARY KEY NOT NULL
+                     CHECK (project <> '__global__'),
+                 last_pull_server_revision INTEGER,
+                 last_pull_cursor TEXT,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO schema_version (version) VALUES (1);
+             INSERT INTO schema_version (version) VALUES (2);
+             INSERT INTO schema_version (version) VALUES (3);
+             INSERT INTO schema_version (version) VALUES (4);
+             INSERT INTO schema_version (version) VALUES (5);
+             INSERT INTO schema_version (version) VALUES (6);
+             INSERT INTO memories (id, content, project, created_at, updated_at)
+                 VALUES ('global-row', 'global body', '__global__', '2026-01-01', '2026-01-01');",
+        )
+        .expect("seed v6 db");
+
+        run_migrations(&conn).expect("migrate to latest");
+
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("query schema_version");
+        assert_eq!(max_v, 7);
+
+        conn.execute(
+            "INSERT INTO memory_gateway_sync (
+                 local_memory_id, project, gateway_memory_id,
+                 last_seen_server_revision, sync_state,
+                 tombstone_deleted, created_at, updated_at
+             )
+             VALUES (
+                 'global-row', '__global__', 'gw-global',
+                 1, 'pulled', 0, '2026-01-01', '2026-01-01'
+             )",
+            [],
+        )
+        .expect("insert global gateway sync row");
+
+        conn.execute(
+            "INSERT INTO project_gateway_sync_state (
+                 project, last_pull_server_revision, last_pull_cursor, updated_at
+             )
+             VALUES ('__global__', 1, 'cursor', '2026-01-01')",
+            [],
+        )
+        .expect("insert global project cursor");
     }
 
     /// Content + content_raw are concatenated in the FTS index so terms that
