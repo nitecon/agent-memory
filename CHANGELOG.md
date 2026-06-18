@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.11.0 - 2026-06-18
+
+- Added `memory setup hooks` (opt-in POC): wires automatic per-turn RAG memory injection into each agent CLI's hook system so relevant memory is injected into context every turn WITHOUT the agent calling `memory context` itself. Installs a shared bridge script at `~/.agentic/hooks/memory-inject.sh` and registers it per agent — Claude Code (`UserPromptSubmit`), Codex (`UserPromptSubmit`), Gemini CLI (`BeforeAgent`). Merges are conservative, idempotent, and atomic; `--remove` strips only our marker-matching entries, collapses emptied parents, and deletes the script. Detection reuses the same agent resolution as `memory setup rules`. This component is **not** part of `memory setup all` — it is selectable only via the explicit subcommand or the interactive checklist's 4th option.
+- Trimmed the injected `<memory-rules>` block: removed the mandatory "Rule A — Pre-action behavior recall (run `memory context` first)" section, replaced by a terse note that recall is now automatic via the memory hook. Post-action scope-classification (Rule B), Operations, WorkingContext, and the memory quality gate are unchanged — saving stays rule-driven for now.
+- Added a `memory context --no-working-context` flag that omits the WorkingContext block (and its absence hint) from the output. The per-turn injection hook uses it so WorkingContext — already injected once by the session-start hook and refreshed across compaction — is not re-emitted every turn.
+- Made the injected `<memory-rules>` block gateway-aware: when the agent-tools gateway is configured **and** the new `AGENT_MEMORY_GATEWAY_SAVE_REMINDER` cutover flag is enabled, the block now omits the post-action save directive (Rule B scope-classification + memory quality gate) because the gateway's `tasks done` reminder delivers the save nudge instead. The flag **defaults off** (accepts the `MEMORY_GATEWAY_SAVE_REMINDER` alias, same config-file + env precedence as `AGENT_MEMORY_GATEWAY_AUTO_SYNC`), so every current install — and any install without a configured gateway — keeps Rule B as the fallback save rule and no save gap is created until the gateway reminder ships.
+
+## v1.10.0 - 2026-06-10
+
+- Added all-scope gateway sync: `memory push --all` / `memory pull --all` exchange every local/remote durable-memory project ident (including `__global__`) in one pass, while default (scoped) push/pull continue to operate on the current project ident only. WorkingContext never participates in gateway exchange.
+
+## v1.9.0 - 2026-06-09
+
+- Added a local cross-encoder rerank stage to hybrid search: BM25 (FTS5) + cosine results fused via RRF are now re-ordered by a local fastembed cross-encoder (on by default) for sharper top-K relevance. Documented in the README architecture section.
+
 ## v1.8.7 - 2026-06-05
 
 - Fixed gateway project lookup for remotes whose repository name differs by case from the gateway ident, e.g. `git@github.com:nitecon/X.git` now resolves to `x` for `memory pull`/`memory push`.

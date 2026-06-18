@@ -14,7 +14,7 @@ use crate::error::MemoryError;
 use crate::project;
 use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
-use crate::setup::{gateway, menu, rules, skill};
+use crate::setup::{gateway, hooks, menu, rules, skill};
 use crate::sync::{
     memory_content_hash, GatewayMemory, GatewayMemoryProvenance, GatewayMemoryTombstone,
     GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse,
@@ -186,6 +186,12 @@ pub enum Cli {
         /// Disable the current-project boost entirely.
         #[arg(long)]
         no_project_boost: bool,
+        /// Omit the project's WorkingContext from the output. Used by the
+        /// per-turn memory-injection hook, where WorkingContext is already
+        /// injected once by the SessionStart hook (and refreshed across
+        /// compaction) — re-emitting it every turn is pure duplication.
+        #[arg(long)]
+        no_working_context: bool,
         /// Output format (default: brief).
         #[arg(long, value_enum, default_value_t = OutputFormat::Brief)]
         format: OutputFormat,
@@ -456,6 +462,33 @@ pub enum SetupCommands {
         remove: bool,
     },
 
+    /// Wire automatic per-turn RAG memory injection into each agent CLI's
+    /// hook system (POC — opt-in, NOT part of `setup all`).
+    ///
+    /// Installs a shared bridge script at `~/.agentic/hooks/memory-inject.sh`
+    /// and registers it in each detected agent's per-turn hook:
+    ///   - Claude Code → `UserPromptSubmit` in `~/.claude/settings.json`
+    ///   - Gemini CLI  → `BeforeAgent` in `~/.gemini/settings.json`
+    ///   - Codex CLI   → `UserPromptSubmit` in Codex `config.toml`
+    ///
+    /// The script reads the turn's prompt, runs `memory context`, and injects
+    /// the result via `additionalContext` — so the agent no longer has to call
+    /// `memory context` itself. Idempotent: re-runs replace our entry in place.
+    /// This complements (and lets you trim) the manual-recall part of the
+    /// `<memory-rules>` block written by `setup rules`.
+    Hooks {
+        /// Show the intended actions without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the bridge script to stdout and exit (no file IO).
+        #[arg(long)]
+        print: bool,
+        /// Strip our hook entries from each detected agent and delete the
+        /// shared bridge script. Inverse of the default install.
+        #[arg(long)]
+        remove: bool,
+    },
+
     /// Run gateway → rules → skill in sequence.
     All {
         /// Skip the confirmation prompt.
@@ -588,6 +621,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             project,
             only,
             no_project_boost,
+            no_working_context,
             format: _,
             preview_chars: _,
         } => {
@@ -602,7 +636,12 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_boost_factor: boosts.global_boost,
             };
             let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
-            let working_context = if let Some(project) = boosts.current_project {
+            // When `--no-working-context` is set, skip the fetch entirely and
+            // suppress the absence hint too — the caller (the per-turn hook)
+            // does not want any WorkingContext signal, present or absent.
+            let working_context = if no_working_context {
+                None
+            } else if let Some(project) = boosts.current_project {
                 queries::get_working_context(conn, project)?
             } else {
                 None
@@ -612,7 +651,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 &boosts,
                 &description,
                 working_context.as_ref(),
-                true,
+                !no_working_context,
             );
         }
         Cli::Recall {
@@ -2185,6 +2224,11 @@ fn execute_setup(command: Option<SetupCommands>) -> anyhow::Result<()> {
             print,
             remove,
         }) => skill::run(dry_run, print, remove),
+        Some(SetupCommands::Hooks {
+            dry_run,
+            print,
+            remove,
+        }) => hooks::run(true, dry_run, print, remove),
         Some(SetupCommands::All { yes }) => menu::run_all(yes),
         Some(SetupCommands::Gateway) => gateway::run(),
     }
@@ -2841,6 +2885,39 @@ mod tests {
         let cli = Cli::try_parse_from(["memory", "setup", "gateway"]).unwrap();
         match cli {
             Cli::Setup { command } => assert!(matches!(command, Some(SetupCommands::Gateway))),
+            _ => panic!("expected Setup variant"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_hooks_command() {
+        let cli = Cli::try_parse_from(["memory", "setup", "hooks"]).unwrap();
+        match cli {
+            Cli::Setup { command } => assert!(matches!(
+                command,
+                Some(SetupCommands::Hooks {
+                    dry_run: false,
+                    print: false,
+                    remove: false,
+                })
+            )),
+            _ => panic!("expected Setup variant"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_hooks_command_with_flags() {
+        let cli =
+            Cli::try_parse_from(["memory", "setup", "hooks", "--dry-run", "--remove"]).unwrap();
+        match cli {
+            Cli::Setup { command } => assert!(matches!(
+                command,
+                Some(SetupCommands::Hooks {
+                    dry_run: true,
+                    print: false,
+                    remove: true,
+                })
+            )),
             _ => panic!("expected Setup variant"),
         }
     }

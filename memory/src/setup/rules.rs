@@ -57,6 +57,7 @@
 //! | Codex    | `~/.codex/config.toml`        | `[features] memories = false`     |
 
 use crate::setup::codex_config_toml;
+use crate::setup::gateway;
 use crate::setup::gemini_settings_json;
 use crate::setup::settings_json::{self, SettingsOutcome};
 use anyhow::{Context, Result};
@@ -84,7 +85,10 @@ refresh; do not edit between the marker tags — your edits will be overwritten
 on the next update.
 "#;
 
-const MEMORY_SECTION: &str = r#"
+/// Always-included core of the injected block: hot-path operations, the
+/// automatic pre-task recall note, and the WorkingContext handoff guidance.
+/// Independent of whether the gateway owns the save nudge.
+const MEMORY_SECTION_CORE: &str = r#"
 ### Operations
 
 `memory` binary at `/opt/agentic/bin/memory` (Linux/macOS) or
@@ -104,16 +108,9 @@ from the cwd's git remote. Run `memory --help` for admin verbs (`recall`,
 `list`, `projects`, `move`, `copy`, `forget`, `prune`, `update`) — agents
 rarely need these mid-task.
 
-### Rule A — Pre-action behavior recall (MANDATORY)
+### Pre-task recall — automatic
 
-Run **one** `memory context "<task>"` call before any user-requested task —
-development, SRE, writing, design, research, any domain. The single call
-returns both global directives and project-scoped context. Do not skip this
-for "quick" tasks: directives the user already stated must never need to be
-re-stated. If the response's `hint` flags zero global-scope matches and you
-suspect a relevant preference exists, ask before acting. After functionality
-changes, search/update/store reusable non-obvious learning that passes the
-quality gate.
+Relevant project + global memory is injected into your context automatically each turn by the memory hook (`memory setup hooks`). You do not need to run `memory context` manually for routine recall; still use `memory search`/`memory get` for deeper, targeted lookups.
 
 ### WorkingContext (per-project handoff)
 
@@ -121,7 +118,14 @@ quality gate.
   project_memories. Treat it as the authoritative handoff state.
 - Use `memory working set` when pausing substantial active work; `memory working clear`
   when the project thread completes. Durable lessons still go through `memory store`.
+"#;
 
+/// Conditionally-included save-side directive: Rule B (post-action scope
+/// classification) plus the memory quality gate. Omitted from the injected
+/// block when the gateway is configured AND the save-reminder cutover flag is
+/// on, because then the gateway's `tasks done` reminder delivers the save
+/// nudge. Otherwise this stays as the fallback save rule.
+const MEMORY_SECTION_SAVE: &str = r#"
 ### Rule B — Post-action scope classification (MANDATORY)
 
 If the user stated or implied any directive, preference, or corrective rule
@@ -189,8 +193,17 @@ pub fn run(
     print: bool,
     remove: bool,
 ) -> Result<()> {
+    // Gateway-awareness: drop the save-side directive (Rule B + quality gate)
+    // only when the gateway is configured AND the save-reminder cutover flag is
+    // enabled — in that case the gateway's `tasks done` reminder delivers the
+    // save nudge instead. The flag defaults OFF, so every current install (and
+    // any non-gateway install) keeps Rule B as the fallback. Computed once and
+    // shared by both the `--print` and inject paths so `--print` reflects
+    // exactly what would be written.
+    let include_save_rule = !(gateway::is_configured() && gateway::gateway_save_reminder_ready());
+
     if print {
-        print!("{}", build_block());
+        print!("{}", build_block(include_save_rule));
         return Ok(());
     }
 
@@ -221,7 +234,7 @@ pub fn run(
         return Ok(());
     }
 
-    let block = build_block();
+    let block = build_block(include_save_rule);
     let mut any_failed = false;
     for path in &chosen {
         let result = if remove {
@@ -428,10 +441,22 @@ pub(crate) fn file_has_rules_block(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_block() -> String {
+/// Assemble the injected `<memory-rules>` block.
+///
+/// `include_save_rule` controls whether the post-action save directive
+/// ([`MEMORY_SECTION_SAVE`]: Rule B + quality gate) is appended. It is set by
+/// [`run`] to `false` only when the gateway is configured AND the save-reminder
+/// cutover flag is on — in that case the gateway's `tasks done` reminder owns
+/// the save nudge and the rules block must not duplicate it. In every other
+/// case (the default, and whenever no gateway is configured) it is `true` so
+/// Rule B stays as the fallback save rule and no save gap is created.
+fn build_block(include_save_rule: bool) -> String {
     let mut body = String::new();
     body.push_str(HEADER);
-    body.push_str(MEMORY_SECTION);
+    body.push_str(MEMORY_SECTION_CORE);
+    if include_save_rule {
+        body.push_str(MEMORY_SECTION_SAVE);
+    }
     format!("{OPEN_MARKER}\n{body}{CLOSE_MARKER}\n")
 }
 
@@ -873,7 +898,7 @@ mod tests {
 
     #[test]
     fn build_block_is_wrapped_with_markers() {
-        let b = build_block();
+        let b = build_block(true);
         assert!(b.starts_with(OPEN_MARKER));
         assert!(b.trim_end().ends_with(CLOSE_MARKER));
         // Hot-path commands the agent runs every task.
@@ -885,12 +910,59 @@ mod tests {
         assert_eq!(b.matches(CLOSE_MARKER).count(), 1);
     }
 
+    /// Gateway-aware ON state: when the save reminder is owned by the rules
+    /// block (`include_save_rule = true`), Rule B and the quality gate are both
+    /// present. This is the default state for every current install.
+    #[test]
+    fn build_block_includes_save_rule_when_true() {
+        let b = build_block(true);
+        assert!(
+            b.contains("Post-action scope classification"),
+            "Rule B heading must be present when save rule is included"
+        );
+        assert!(
+            b.contains("Memory quality gate"),
+            "quality gate must be present when save rule is included"
+        );
+    }
+
+    /// Gateway-aware OFF state: when the gateway owns the save nudge
+    /// (`include_save_rule = false`), the save-side directive is dropped, but
+    /// the always-on core (operations, automatic recall, WorkingContext) and
+    /// the markers stay intact.
+    #[test]
+    fn build_block_omits_save_rule_when_false() {
+        let b = build_block(false);
+        // Save-side directive is gone.
+        assert!(
+            !b.contains("Post-action scope classification"),
+            "Rule B must be omitted when the gateway owns the save nudge"
+        );
+        assert!(
+            !b.contains("Memory quality gate"),
+            "quality gate must be omitted when the gateway owns the save nudge"
+        );
+        // Always-on core survives.
+        assert!(b.contains("memory context"), "core operations must remain");
+        assert!(
+            b.contains("injected into your context automatically"),
+            "automatic pre-task recall note must remain"
+        );
+        assert!(
+            b.contains("WorkingContext (per-project handoff)"),
+            "WorkingContext guidance must remain"
+        );
+        // Markers still appear exactly once each.
+        assert_eq!(b.matches(OPEN_MARKER).count(), 1);
+        assert_eq!(b.matches(CLOSE_MARKER).count(), 1);
+    }
+
     /// Anti-bloat regression: admin commands must not creep back as inline
     /// CLI examples. They live behind `memory --help` so the injected block
     /// stays focused on the hot path agents actually use mid-task.
     #[test]
     fn build_block_keeps_admin_commands_out_of_inline_examples() {
-        let b = build_block();
+        let b = build_block(true);
         assert!(
             b.contains("memory --help"),
             "block must point at `memory --help` for admin commands"
@@ -913,17 +985,24 @@ mod tests {
     /// time rather than discovered in the wild.
     #[test]
     fn build_block_documents_scope_and_new_rules() {
-        let b = build_block();
+        let b = build_block(true);
         // CLI example with the scope flag.
         assert!(
             b.contains("--scope global"),
             "block must show the --scope global CLI example"
         );
-        // Rule headings — exact strings the agent learns to look for.
+        // Pre-task recall is now automatic (hook-driven). The old "Rule A —
+        // Pre-action behavior recall (MANDATORY)" section was removed; assert
+        // the terse automatic-recall note replaced it.
         assert!(
-            b.contains("Pre-action behavior recall"),
-            "Rule A heading must be present"
+            b.contains("injected into your context automatically"),
+            "automatic-recall note must be present"
         );
+        assert!(
+            !b.contains("Pre-action behavior recall"),
+            "the removed Rule A heading must not linger"
+        );
+        // Rule B is still rule-driven — save stays the agent's responsibility.
         assert!(
             b.contains("Post-action scope classification"),
             "Rule B heading must be present"
@@ -939,7 +1018,7 @@ mod tests {
 
     #[test]
     fn build_block_documents_working_context_tersely() {
-        let b = build_block();
+        let b = build_block(true);
         assert!(
             b.contains("WorkingContext (per-project handoff)"),
             "block must include terse WorkingContext guidance"
@@ -974,7 +1053,7 @@ mod tests {
 
     #[test]
     fn build_block_documents_memory_quality_gate() {
-        let b = build_block();
+        let b = build_block(true);
         assert!(
             b.contains("Memory quality gate"),
             "block must include the memory quality gate"
@@ -1000,7 +1079,7 @@ mod tests {
     #[test]
     fn compute_new_content_prepends_when_absent_and_no_sibling() {
         let existing = "# Existing instructions\n\nfoo bar\n";
-        let block = build_block();
+        let block = build_block(true);
         // `file_existed = true` — the user already had a CLAUDE.md-style
         // file we're augmenting.
         let (out, mode) = compute_new_content(existing, &block, false, false, true);
@@ -1012,7 +1091,7 @@ mod tests {
 
     #[test]
     fn compute_new_content_inserts_after_sibling_when_present() {
-        let block = build_block();
+        let block = build_block(true);
         let existing =
             format!("{SIBLING_OPEN}\nagent-tools stuff\n{SIBLING_CLOSE}\n\n# Rest of file\n");
         let (out, mode) = compute_new_content(&existing, &block, false, true, true);
@@ -1029,7 +1108,7 @@ mod tests {
 
     #[test]
     fn compute_new_content_replaces_in_place() {
-        let block = build_block();
+        let block = build_block(true);
         let existing =
             format!("# Header\n\n{OPEN_MARKER}\nold memory body\n{CLOSE_MARKER}\n\n# Footer\n");
         let (out, mode) = compute_new_content(&existing, &block, true, false, true);
@@ -1044,7 +1123,7 @@ mod tests {
 
     #[test]
     fn compute_new_content_is_idempotent() {
-        let block = build_block();
+        let block = build_block(true);
         let existing = "# Header\n";
         let (once, _) = compute_new_content(existing, &block, false, false, true);
         let (twice, mode) = compute_new_content(&once, &block, true, false, true);
@@ -1054,7 +1133,7 @@ mod tests {
 
     #[test]
     fn compute_new_content_handles_empty_file() {
-        let block = build_block();
+        let block = build_block(true);
         // Empty-but-existing file — Prepended, not Created, because the
         // file is already on disk (possibly touched by another tool).
         let (out, mode) = compute_new_content("", &block, false, false, true);
@@ -1067,7 +1146,7 @@ mod tests {
     /// the user with something that looks intentional, not a bare block.
     #[test]
     fn compute_new_content_creates_fresh_file_with_header() {
-        let block = build_block();
+        let block = build_block(true);
         let (out, mode) = compute_new_content("", &block, false, false, false);
         assert_eq!(mode, InjectMode::Created);
         assert!(
@@ -1086,7 +1165,7 @@ mod tests {
     /// as true — the block-is-present check wins.
     #[test]
     fn compute_new_content_created_file_round_trips_to_replaced_on_refresh() {
-        let block = build_block();
+        let block = build_block(true);
         let (fresh, _) = compute_new_content("", &block, false, false, false);
         let (refreshed, mode) = compute_new_content(&fresh, &block, true, false, true);
         assert_eq!(mode, InjectMode::Replaced);
@@ -1103,7 +1182,7 @@ mod tests {
         // Later they run `agent-tools setup rules` (prepends its own block).
         // Third run of `memory setup` detects its own existing block and
         // replaces in place, *not* re-inserting after the sibling.
-        let block = build_block();
+        let block = build_block(true);
         let (first, _) = compute_new_content("# Header\n", &block, false, false, true);
         let with_sibling = format!("{SIBLING_OPEN}\nfoo\n{SIBLING_CLOSE}\n\n{first}");
         let (after_refresh, mode) = compute_new_content(&with_sibling, &block, true, true, true);
@@ -1123,7 +1202,7 @@ mod tests {
     /// cycles. This is the inverse round-trip of `compute_new_content`.
     #[test]
     fn strip_block_removes_block_and_trailing_newline() {
-        let block = build_block();
+        let block = build_block(true);
         let before_block = "# Header\n\n";
         let after_block = "# Footer\n";
         let installed = format!("{before_block}{block}\n{after_block}");
@@ -1137,7 +1216,7 @@ mod tests {
     /// so users can cleanly back out of a rules install.
     #[test]
     fn install_then_strip_is_lossless() {
-        let block = build_block();
+        let block = build_block(true);
         let original = "# Existing instructions\n\nfoo bar\n";
         let (installed, _) = compute_new_content(original, &block, false, false, true);
         let stripped = strip_block(&installed);
@@ -1197,7 +1276,7 @@ mod tests {
         let target = parent.join("AGENTS.md");
         assert!(!target.exists());
 
-        let block = build_block();
+        let block = build_block(true);
         let outcome = inject(&target, &block, false).expect("inject should succeed");
         assert!(matches!(outcome, InjectOutcome::Created));
         assert!(target.exists(), "target file should have been created");
@@ -1221,7 +1300,7 @@ mod tests {
         let parent = tmp.join(".codex");
         std::fs::create_dir_all(&parent).unwrap();
         let target = parent.join("AGENTS.md");
-        let block = build_block();
+        let block = build_block(true);
         inject(&target, &block, false).expect("first inject (create)");
         let outcome2 = inject(&target, &block, false).expect("second inject (replace)");
         assert!(matches!(outcome2, InjectOutcome::Replaced { .. }));
@@ -1238,7 +1317,7 @@ mod tests {
     fn inject_creates_parent_dir_when_using_explicit_target() {
         let tmp = tempdir_in_target();
         let target = tmp.join("fresh-dir").join("CLAUDE.md");
-        let block = build_block();
+        let block = build_block(true);
         let outcome = inject(&target, &block, false).expect("inject should succeed");
         assert!(matches!(outcome, InjectOutcome::Created));
         assert!(target.exists());

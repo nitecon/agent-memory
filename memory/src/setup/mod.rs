@@ -27,10 +27,20 @@
 //! The module only re-exports the public entry points used by `cli.rs`; the
 //! implementation details (markers, body templates, probe helpers) stay
 //! private to their respective submodules.
+//!
+//! The `hooks` installer is a separate, opt-in component (POC): it wires each
+//! agent CLI's per-turn hook system to inject relevant memory automatically
+//! via the shared `hook_script` bridge, using `json_hooks` (Claude/Gemini
+//! settings.json) and `codex_hooks_toml` (Codex config.toml) for the merges.
+//! It is intentionally NOT part of `setup all`.
 
 pub mod codex_config_toml;
+pub mod codex_hooks_toml;
 pub mod gateway;
 pub mod gemini_settings_json;
+pub mod hook_script;
+pub mod hooks;
+pub mod json_hooks;
 pub mod menu;
 pub mod rules;
 pub mod settings_json;

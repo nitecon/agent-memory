@@ -10,7 +10,7 @@
 //! CLAUDE.md able to see the new rules ahead of the model discovering the
 //! skill.
 
-use crate::setup::{gateway, rules, skill};
+use crate::setup::{gateway, hooks, rules, skill};
 use anyhow::{Context, Result};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -20,16 +20,32 @@ pub enum Component {
     Gateway,
     Rules,
     Skill,
+    Hooks,
 }
 
 impl Component {
+    /// The default install set, used by `memory setup all` and the bare-menu
+    /// "all" selection. Hooks is intentionally EXCLUDED: automatic per-turn
+    /// injection is an opt-in POC, so the default sweep must not silently turn
+    /// it on. Keep this in sync with the execution contract test below.
     pub const ALL: [Component; 3] = [Component::Gateway, Component::Rules, Component::Skill];
+
+    /// The full menu set, used ONLY by `run_interactive` for listing and
+    /// selection. Adds `Hooks` as a fourth opt-in option so a user can pick it
+    /// explicitly without it riding along in `setup all`.
+    pub const MENU: [Component; 4] = [
+        Component::Gateway,
+        Component::Rules,
+        Component::Skill,
+        Component::Hooks,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Component::Gateway => "Gateway",
             Component::Rules => "Rules",
             Component::Skill => "Skill",
+            Component::Hooks => "Hooks",
         }
     }
 }
@@ -39,7 +55,7 @@ impl Component {
 /// ones to run.
 pub fn run_interactive() -> Result<()> {
     let states: Vec<(Component, ComponentState)> =
-        Component::ALL.iter().map(|c| (*c, probe(*c))).collect();
+        Component::MENU.iter().map(|c| (*c, probe(*c))).collect();
 
     println!("memory setup — choose components to install:");
     println!();
@@ -60,7 +76,7 @@ pub fn run_interactive() -> Result<()> {
         .lock()
         .read_line(&mut input)
         .context("read selection")?;
-    let chosen = parse_selection(input.trim(), &Component::ALL)?;
+    let chosen = parse_selection(input.trim(), &Component::MENU)?;
 
     if chosen.is_empty() {
         println!("Cancelled — nothing changed.");
@@ -103,6 +119,7 @@ fn probe(c: Component) -> ComponentState {
         Component::Gateway => probe_gateway(),
         Component::Rules => probe_rules(),
         Component::Skill => probe_skill(),
+        Component::Hooks => probe_hooks(),
     }
 }
 
@@ -199,6 +216,49 @@ fn probe_skill() -> ComponentState {
     }
 }
 
+/// Probe the opt-in hooks component. Reports "installed" only when BOTH the
+/// shared bridge script exists AND at least one detected agent config carries
+/// a marker-matching hook entry — a half-installed state (script present but no
+/// agent wired, or vice versa) still prompts a re-run. The detail string lists
+/// per-agent wiring status so the user sees which frontends are covered.
+fn probe_hooks() -> ComponentState {
+    let script_present = crate::setup::hook_script::script_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+
+    let targets = detect_rule_files();
+    if targets.is_empty() {
+        return ComponentState {
+            installed: false,
+            detail: "no agent rule files detected".into(),
+        };
+    }
+
+    let mut segments: Vec<String> = Vec::with_capacity(targets.len());
+    let mut wired = 0usize;
+    for t in &targets {
+        let has = hooks::agent_has_hook(t);
+        if has {
+            wired += 1;
+        }
+        segments.push(format!(
+            "{} {}",
+            if has { "[x]" } else { "[ ]" },
+            t.display()
+        ));
+    }
+
+    let script_note = if script_present {
+        "script present"
+    } else {
+        "script missing"
+    };
+    ComponentState {
+        installed: script_present && wired > 0,
+        detail: format!("{script_note}; {}", segments.join(", ")),
+    }
+}
+
 /// Surface every rule-file target that `rules::run()` will consider on a
 /// real install. We defer to `rules::detect_agent_files()` so the menu's
 /// probe and the installer agree on which candidates are visible — a
@@ -221,6 +281,9 @@ fn run_components(components: &[Component]) -> Result<()> {
             // got user consent for *which components* to install.
             Component::Rules => rules::run(None, true, false, false, false),
             Component::Skill => skill::run(false, false, false),
+            // Hooks: install to every detected agent without prompting — the
+            // menu's selection step already got the user's opt-in consent.
+            Component::Hooks => hooks::run(true, false, false, false),
         };
         if let Err(e) = result {
             eprintln!("{} failed: {e:#}", c.label());
@@ -327,9 +390,50 @@ mod tests {
     fn component_all_order_matches_execution_contract() {
         // Pin the order so future contributors don't accidentally reorder
         // and end up installing the skill before the rules that explain it.
+        // Hooks is deliberately ABSENT from ALL: the opt-in POC must never
+        // ride along in `setup all`.
         assert_eq!(
             Component::ALL,
             [Component::Gateway, Component::Rules, Component::Skill]
+        );
+        assert!(
+            !Component::ALL.contains(&Component::Hooks),
+            "Hooks must not be in the default `setup all` sweep"
+        );
+    }
+
+    #[test]
+    fn component_menu_order_adds_hooks_last() {
+        // MENU drives the interactive listing/selection only. It mirrors ALL
+        // and appends Hooks as the opt-in fourth option.
+        assert_eq!(
+            Component::MENU,
+            [
+                Component::Gateway,
+                Component::Rules,
+                Component::Skill,
+                Component::Hooks
+            ]
+        );
+        // The first three entries must match ALL exactly so index-based menu
+        // selection stays stable for the default components.
+        assert_eq!(&Component::MENU[..3], &Component::ALL[..]);
+    }
+
+    #[test]
+    fn parse_selection_menu_can_pick_hooks() {
+        // Index 4 only exists in MENU — selecting it returns Hooks.
+        let r = parse_selection("4", &Component::MENU).unwrap();
+        assert_eq!(r, vec![Component::Hooks]);
+        // Out of range against the narrower ALL set.
+        assert!(parse_selection("4", &Component::ALL).is_err());
+    }
+
+    #[test]
+    fn parse_selection_menu_all_includes_hooks() {
+        assert_eq!(
+            parse_selection("a", &Component::MENU).unwrap(),
+            Component::MENU.to_vec()
         );
     }
 }

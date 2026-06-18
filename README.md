@@ -78,7 +78,13 @@ Fresh installs default to the user-writable `~/.agentic/` directory so first-run
 
 ## Recommended usage: CLI-first
 
-Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command — it bundles an interactive checklist that injects the rules block into your agent rule files and installs a Claude Code skill that auto-advertises the CLI to every session.
+Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command, which wires up to three complementary layers:
+
+- **Hooks — automatic per-turn RAG injection (new, recommended).** `memory setup hooks` attaches to each agent CLI's per-turn hook (Claude `UserPromptSubmit`, Gemini `BeforeAgent`, Codex `UserPromptSubmit`) so relevant memory is retrieved and injected into context **automatically, every turn — without the agent deciding to look anything up.** This is the improved successor to asking the model, via a rule, to remember to run `memory context` itself.
+- **Rules — the `<memory-rules>` block.** Injected into your agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md). Now that hooks deliver pre-task recall automatically, the block is slimmed down: it no longer carries the "run `memory context` first" rule and instead focuses on post-action saving (scope classification) and the memory quality gate.
+- **Skill.** A Claude Code skill (~100-token description) that auto-advertises the CLI to every session.
+
+Run `memory setup` with no arguments for an interactive checklist, or target a single layer (`memory setup hooks`, `memory setup rules`, `memory setup skill`).
 
 ### WorkingContext handoff
 
@@ -200,15 +206,18 @@ curation.
 
 | Command | Behavior |
 |---------|----------|
-| `memory setup` | Interactive checklist: shows the install state of each component (gateway, rules, skill) and lets you pick which to (re)install |
+| `memory setup` | Interactive checklist: shows the install state of each component (gateway, rules, skill, plus the opt-in hooks) and lets you pick which to (re)install |
 | `memory setup rules [flags]` | Inject the `<memory-rules>` block into known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md) |
 | `memory setup rules --remove` | Strip the `<memory-rules>` block and reverse every paired native-memory-disable write (Claude `autoMemoryEnabled`, Gemini `excludeTools: save_memory`, Codex `[features] memories`) |
 | `memory setup skill [flags]` | Install `SKILL.md` under **every** known agent frontend — `~/.claude/skills/agent-memory/` (Claude Code, tool-native) and `~/.agents/skills/agent-memory/` (cross-agent alias read by Gemini CLI and Codex) — so each session auto-loads a ~100-token description that nudges the model toward the CLI |
 | `memory setup skill --remove` | Delete the installed `SKILL.md` from every known target. Missing files are silently skipped — parity with `setup rules --remove` |
-| `memory setup all [-y]` | Run gateway → rules → skill non-interactively (use `-y` / `--yes` to skip confirmation). Rules land before skill so a human reading a freshly-updated CLAUDE.md sees the new rules ahead of the model discovering the skill |
+| `memory setup hooks [flags]` | **Opt-in (POC).** Wire automatic per-turn RAG injection into each agent CLI's hook system so relevant memory is injected without the agent calling `memory context` itself. Installs a shared bridge script and registers it per agent. NOT part of `setup all` |
+| `memory setup hooks --remove` | Strip our hook entries from every detected agent and delete the shared bridge script |
+| `memory setup all [-y]` | Run gateway → rules → skill non-interactively (use `-y` / `--yes` to skip confirmation). Rules land before skill so a human reading a freshly-updated CLAUDE.md sees the new rules ahead of the model discovering the skill. Hooks are **not** included — they remain opt-in |
 
 ```bash
-# Bare invocation: 3-item interactive checklist (gateway + rules + skill).
+# Bare invocation: interactive checklist (gateway + rules + skill, plus the
+# opt-in hooks component as a 4th choice).
 memory setup
 
 # Rules only — detects ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md,
@@ -228,7 +237,13 @@ memory setup skill --dry-run
 memory setup skill --print
 memory setup skill --remove     # uninstall: delete SKILL.md from every target
 
-# Everything, scripted.
+# Hooks only — automatic per-turn injection (opt-in POC; not in `setup all`):
+memory setup hooks
+memory setup hooks --dry-run    # show intended actions, write nothing
+memory setup hooks --print      # emit just the bridge script to stdout
+memory setup hooks --remove     # uninstall: strip hook entries + delete script
+
+# Everything except hooks, scripted (hooks stay opt-in).
 memory setup all --yes
 ```
 
@@ -245,6 +260,41 @@ memory setup all --yes
 All three merges are conservative: unrelated keys, tables, and array entries are preserved; corrupt input fails loudly instead of being overwritten; re-runs are no-ops once the target state is reached. Writes are atomic (`.new` + rename) so a crash mid-write cannot leave a half-serialized file behind.
 
 `memory setup skill` writes the same SKILL.md byte-for-byte to every known agent frontend — `~/.claude/skills/agent-memory/SKILL.md` (Claude Code, tool-native) and `~/.agents/skills/agent-memory/SKILL.md` (the cross-agent alias read by both Gemini CLI and Codex). All frontends honor the same YAML frontmatter + Markdown body; Gemini and Codex silently ignore the Claude-specific `allowed-tools` key. The frontmatter `description` is always loaded into sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked. Install is unconditional — no auto-detection of whether each agent is installed — because running `memory setup skill` is itself the opt-in signal. Re-runs write a `.bak` sidecar then overwrite, so the command is idempotent. The legacy `~/.gemini/skills/agent-memory/SKILL.md` path (written by v1.4.0/v1.4.1) is scrubbed on every install and `--remove` so no stale copy lingers.
+
+### Hooks (automatic per-turn injection)
+
+> **Status: opt-in POC.** `memory setup hooks` is deliberately **not** part of `memory setup all`; you must request it explicitly (or pick it as the 4th option in the interactive `memory setup` checklist).
+
+Where `memory setup rules` *tells* the agent to call `memory context` itself, `memory setup hooks` wires each agent CLI's per-turn hook system to inject relevant memory **automatically** — no model-initiated tool call required. It installs a single shared bridge script and registers it once per detected agent:
+
+| Agent  | Hook event         | Config file                                                        | Timeout |
+|--------|--------------------|--------------------------------------------------------------------|---------|
+| Claude | `UserPromptSubmit` | `~/.claude/settings.json`                                          | 10 s    |
+| Gemini | `BeforeAgent`      | `~/.gemini/settings.json`                                          | 10000 ms |
+| Codex  | `UserPromptSubmit` | `$CODEX_HOME/config.toml` (or `~/.codex/`, then `~/.config/codex/`) | (none)  |
+
+The shared bridge script lives at `~/.agentic/hooks/memory-inject.sh`. On every turn the agent passes the hook's JSON payload on stdin; the script extracts the user's prompt, runs `memory context … --no-working-context`, and emits a `hookSpecificOutput` envelope whose `additionalContext` carries the retrieved memory. It uses `--no-working-context` because WorkingContext is already injected once by the session-start hook (and refreshed across compaction) — re-emitting it every turn would just duplicate it, so the per-turn hook carries only the prompt-relevant ranked recall. When there is no prompt or no relevant memory it emits nothing (exit 0), so low-signal turns stay cheap. Two environment knobs tune it: `MEMORY_BIN` (override the resolved `memory` binary) and `MEMORY_INJECT_LIMIT` (the `-k` result count, default 5).
+
+Agent detection reuses the same logic as `memory setup rules`, so both commands agree on which agents are present and where their config lives (including `CODEX_HOME` / XDG precedence). All merges are conservative and idempotent: unrelated keys, events, and the user's own hooks are preserved; corrupt input fails loudly; re-runs replace our entry in place rather than accumulating duplicates; writes are atomic. `memory setup hooks --remove` strips only our marker-matching entries, collapses any emptied parents, and deletes the shared script.
+
+**Relationship to the rules block.** Because hooks deliver pre-task recall automatically, the `<memory-rules>` block no longer carries the mandatory "run `memory context` first" rule — it now just notes that recall is automatic and points at `memory search` / `memory get` for deeper lookups. Post-action saving (the scope-classification rule) stays rule-driven for now: the hook injects, but the agent still decides what is worth storing.
+
+**Gateway-aware save directive.** The `<memory-rules>` block is gateway-aware: when the agent-tools gateway is configured **and** `AGENT_MEMORY_GATEWAY_SAVE_REMINDER` is enabled, the block omits the post-action save directive (Rule B — scope classification — plus the memory quality gate) because the gateway's `tasks done` reminder delivers the save nudge instead. Otherwise — the default, and whenever no gateway is configured — the block keeps Rule B as the fallback save rule. The flag **defaults off**, so existing installs are unchanged until the gateway reminder ships; flip it (in the shared `gateway.conf` or as an env var) only once the gateway delivers its own save nudge.
+
+```bash
+memory setup hooks --print     # inspect the exact bridge script before installing
+```
+
+### Upgrading from an older install
+
+The `<memory-rules>` block evolves with each release — older installs carry the now-removed "run `memory context` first" rule that the per-turn hook has replaced. When you update the `memory` binary, re-run setup so your agent files and hooks pick up the new behavior:
+
+```bash
+memory setup rules --all   # replace the old block in place — drops the stale Rule A automatically
+memory setup hooks         # enable (or refresh) automatic per-turn injection
+```
+
+`memory setup rules` replaces the block between its markers, so re-running it removes the old rules and writes the current slimmed block — your rule files never accumulate stale or duplicate copies (a `.bak` sibling is written first). `memory setup hooks` is idempotent too: it refreshes the bridge script and only rewrites a config entry that actually changed. To back the experiment out entirely, reverse both: `memory setup hooks --remove` then `memory setup rules --all --remove`.
 
 ### Manual install (or inspect the live block)
 
@@ -371,7 +421,10 @@ memory setup skill                        # install SKILL.md under Claude + cros
 memory setup skill --dry-run              # skill: preview SKILL.md
 memory setup skill --print                # skill: print SKILL.md to stdout
 memory setup skill --remove               # skill: delete SKILL.md from every target
-memory setup all --yes                    # gateway → rules → skill, non-interactive
+memory setup hooks                         # hooks (opt-in POC): wire automatic per-turn injection
+memory setup hooks --print                # hooks: print the bridge script to stdout
+memory setup hooks --remove               # hooks: strip entries + delete bridge script
+memory setup all --yes                    # gateway → rules → skill, non-interactive (hooks excluded)
 ```
 
 ## Project & global scope tiers
