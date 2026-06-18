@@ -115,17 +115,6 @@ pub fn auto_sync_enabled() -> bool {
     GatewayConfig::load().auto_sync_enabled()
 }
 
-/// True only when the gateway is configured AND the `AGENT_MEMORY_GATEWAY_SAVE_REMINDER`
-/// cutover flag is enabled (accepts the shorter `MEMORY_GATEWAY_SAVE_REMINDER`
-/// alias, same as auto-sync). Used by `memory setup rules` to decide whether
-/// the gateway's `tasks done` reminder owns the post-action save nudge — in
-/// which case the injected block omits Rule B + the quality gate. Defaults
-/// OFF (absent/unparseable → false) so existing installs keep Rule B as the
-/// fallback save rule until the gateway reminder ships.
-pub fn gateway_save_reminder_ready() -> bool {
-    GatewayConfig::load().save_reminder_ready()
-}
-
 pub fn user_config_path_display() -> String {
     user_gateway_conf_path()
         .map(|path| path.display().to_string())

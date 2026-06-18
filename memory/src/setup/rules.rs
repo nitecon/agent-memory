@@ -194,13 +194,14 @@ pub fn run(
     remove: bool,
 ) -> Result<()> {
     // Gateway-awareness: drop the save-side directive (Rule B + quality gate)
-    // only when the gateway is configured AND the save-reminder cutover flag is
-    // enabled — in that case the gateway's `tasks done` reminder delivers the
-    // save nudge instead. The flag defaults OFF, so every current install (and
-    // any non-gateway install) keeps Rule B as the fallback. Computed once and
-    // shared by both the `--print` and inject paths so `--print` reflects
-    // exactly what would be written.
-    let include_save_rule = !(gateway::is_configured() && gateway::gateway_save_reminder_ready());
+    // when an agent-tools gateway is configured — in that case the gateway's
+    // `tasks done` reminder owns the post-action save nudge, so duplicating it
+    // as a rule is redundant. When no gateway is configured, the block keeps
+    // Rule B as the fallback. This is decided programmatically at runtime from
+    // config presence (no env var / manual flag). Computed once and shared by
+    // both the `--print` and inject paths so `--print` reflects exactly what
+    // would be written.
+    let include_save_rule = !gateway::is_configured();
 
     if print {
         print!("{}", build_block(include_save_rule));

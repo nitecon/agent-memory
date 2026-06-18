@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.11.1 - 2026-06-18
+
+- Gateway-aware rules block now decides **programmatically at runtime** from gateway-configured state: when a gateway is configured the injected block omits the post-action save directive (Rule B + quality gate, because the gateway's `tasks done` reminder owns the save nudge), otherwise it keeps Rule B as the fallback. Removed the `AGENT_MEMORY_GATEWAY_SAVE_REMINDER` env var / config flag introduced in v1.11.0 — derivable state should not require a manually-set environment variable.
+
 ## v1.11.0 - 2026-06-18
 
 - Added `memory setup hooks` (opt-in POC): wires automatic per-turn RAG memory injection into each agent CLI's hook system so relevant memory is injected into context every turn WITHOUT the agent calling `memory context` itself. Installs a shared bridge script at `~/.agentic/hooks/memory-inject.sh` and registers it per agent — Claude Code (`UserPromptSubmit`), Codex (`UserPromptSubmit`), Gemini CLI (`BeforeAgent`). Merges are conservative, idempotent, and atomic; `--remove` strips only our marker-matching entries, collapses emptied parents, and deletes the script. Detection reuses the same agent resolution as `memory setup rules`. This component is **not** part of `memory setup all` — it is selectable only via the explicit subcommand or the interactive checklist's 4th option.

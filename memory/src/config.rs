@@ -21,13 +21,6 @@ pub struct GatewayConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub auto_sync: Option<bool>,
-    /// Cutover flag for the gateway-delivered save nudge. When the gateway is
-    /// configured AND this is enabled, the injected `<memory-rules>` block
-    /// omits the post-action save directive (Rule B + quality gate) because
-    /// the gateway's `tasks done` reminder delivers the save nudge instead.
-    /// Defaults OFF (absent/unparseable → false) so existing installs keep
-    /// Rule B as the fallback until the gateway reminder actually ships.
-    pub save_reminder: Option<bool>,
 }
 
 impl GatewayConfig {
@@ -65,7 +58,6 @@ impl GatewayConfig {
             base_url: first_nonempty([memory_url, agent_url, gateway_url]),
             api_key: first_nonempty([memory_api_key, agent_api_key, gateway_api_key]),
             auto_sync: None,
-            save_reminder: None,
         }
     }
 
@@ -90,12 +82,6 @@ impl GatewayConfig {
         ]) {
             self.auto_sync = Some(auto_sync);
         }
-        if let Some(save_reminder) = first_bool([
-            pairs.get("AGENT_MEMORY_GATEWAY_SAVE_REMINDER").cloned(),
-            pairs.get("MEMORY_GATEWAY_SAVE_REMINDER").cloned(),
-        ]) {
-            self.save_reminder = Some(save_reminder);
-        }
     }
 
     fn apply_env_overrides(&mut self) {
@@ -119,12 +105,6 @@ impl GatewayConfig {
         ]) {
             self.auto_sync = Some(auto_sync);
         }
-        if let Some(save_reminder) = first_bool([
-            std::env::var("AGENT_MEMORY_GATEWAY_SAVE_REMINDER").ok(),
-            std::env::var("MEMORY_GATEWAY_SAVE_REMINDER").ok(),
-        ]) {
-            self.save_reminder = Some(save_reminder);
-        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -133,16 +113,6 @@ impl GatewayConfig {
 
     pub fn auto_sync_enabled(&self) -> bool {
         self.is_configured() && self.auto_sync.unwrap_or(true)
-    }
-
-    /// True only when the gateway is configured AND the cutover flag is on.
-    /// Defaults OFF: an absent or unparseable flag yields `false`, so the
-    /// injected rules block keeps Rule B as the fallback save directive until
-    /// the gateway's `tasks done` reminder ships and an operator flips the
-    /// flag. Mirrors [`auto_sync_enabled`](Self::auto_sync_enabled) except for
-    /// the inverted default (off vs. on).
-    pub fn save_reminder_ready(&self) -> bool {
-        self.is_configured() && self.save_reminder.unwrap_or(false)
     }
 }
 
@@ -468,7 +438,6 @@ mod tests {
             base_url: Some("https://gateway.example".to_string()),
             api_key: Some("key".to_string()),
             auto_sync: None,
-            save_reminder: None,
         };
 
         assert!(cfg.is_configured());
@@ -511,81 +480,6 @@ mod tests {
 
         assert_eq!(cfg.auto_sync, Some(true));
         assert!(cfg.auto_sync_enabled());
-    }
-
-    /// Helper: build a configured gateway with the save-reminder flag set from
-    /// a raw config value. Mirrors the dual-name auto-sync test style.
-    fn configured_gateway_with_save_reminder(key: &str, value: &str) -> GatewayConfig {
-        let mut pairs = HashMap::new();
-        pairs.insert(
-            "GATEWAY_URL".to_string(),
-            "https://gateway.example".to_string(),
-        );
-        pairs.insert("GATEWAY_API_KEY".to_string(), "gateway-key".to_string());
-        pairs.insert(key.to_string(), value.to_string());
-
-        let mut cfg = GatewayConfig::default();
-        cfg.apply_key_value_pairs(&pairs);
-        cfg
-    }
-
-    #[test]
-    fn gateway_save_reminder_defaults_off_when_unset() {
-        // Configured gateway but no flag → fallback save rule stays (false).
-        let cfg = GatewayConfig {
-            base_url: Some("https://gateway.example".to_string()),
-            api_key: Some("key".to_string()),
-            auto_sync: None,
-            save_reminder: None,
-        };
-
-        assert!(cfg.is_configured());
-        assert_eq!(cfg.save_reminder, None);
-        assert!(!cfg.save_reminder_ready());
-    }
-
-    #[test]
-    fn gateway_save_reminder_truthy_values_enable() {
-        for value in ["true", "1"] {
-            let cfg =
-                configured_gateway_with_save_reminder("AGENT_MEMORY_GATEWAY_SAVE_REMINDER", value);
-            assert_eq!(cfg.save_reminder, Some(true), "value {value:?} → true");
-            assert!(cfg.save_reminder_ready(), "value {value:?} → ready");
-        }
-    }
-
-    #[test]
-    fn gateway_save_reminder_falsy_values_disable() {
-        for value in ["false", "0"] {
-            let cfg =
-                configured_gateway_with_save_reminder("AGENT_MEMORY_GATEWAY_SAVE_REMINDER", value);
-            assert_eq!(cfg.save_reminder, Some(false), "value {value:?} → false");
-            assert!(!cfg.save_reminder_ready(), "value {value:?} → not ready");
-        }
-    }
-
-    #[test]
-    fn gateway_save_reminder_accepts_memory_gateway_alias() {
-        let cfg = configured_gateway_with_save_reminder("MEMORY_GATEWAY_SAVE_REMINDER", "on");
-        assert_eq!(cfg.save_reminder, Some(true));
-        assert!(cfg.save_reminder_ready());
-    }
-
-    #[test]
-    fn gateway_save_reminder_requires_configured_gateway() {
-        // Flag on but no URL/key → not configured, so still not ready. This is
-        // the guard that prevents dropping Rule B on a non-gateway install.
-        let mut pairs = HashMap::new();
-        pairs.insert(
-            "AGENT_MEMORY_GATEWAY_SAVE_REMINDER".to_string(),
-            "true".to_string(),
-        );
-        let mut cfg = GatewayConfig::default();
-        cfg.apply_key_value_pairs(&pairs);
-
-        assert!(!cfg.is_configured());
-        assert_eq!(cfg.save_reminder, Some(true));
-        assert!(!cfg.save_reminder_ready());
     }
 
     #[test]
