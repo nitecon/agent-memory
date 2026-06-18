@@ -1,17 +1,28 @@
 //! Codex `config.toml` hook merge used by `memory setup hooks`.
 //!
-//! Codex expresses per-turn hooks as an array-of-tables under `hooks.<event>`:
+//! Codex CLI 0.141 expresses per-turn hooks with a NESTED, Claude-Code-compatible
+//! shape: `hooks.<event>` is an array of *matcher groups*, and each group carries
+//! its own inner `hooks` array of handler tables:
 //!
 //! ```toml
 //! [[hooks.UserPromptSubmit]]
+//!
+//! [[hooks.UserPromptSubmit.hooks]]
 //! type = "command"
 //! command = "/abs/path/memory-inject.sh codex"
 //! ```
 //!
-//! `memory setup hooks` adds one such table to `hooks.UserPromptSubmit` so the
-//! bridge script runs on every Codex turn. No `timeout` key is written: the
-//! unit Codex expects there is uncertain for this POC, and the default
-//! behavior is fine, so we omit it rather than guess.
+//! Structurally:
+//! `hooks.UserPromptSubmit = [ { hooks = [ { type = "command", command = "…" } ] } ]`.
+//! The matcher group's top-level `matcher` key is optional and is omitted — Codex
+//! accepts an empty matcher group. A flat `{ type, command }` table at the group
+//! level has no inner `hooks` handler array, so Codex finds zero handlers and
+//! `/hooks` reports Installed 0 / Active 0; the nested shape is required.
+//!
+//! `memory setup hooks` adds one such matcher group (with a single nested handler)
+//! to `hooks.UserPromptSubmit` so the bridge script runs on every Codex turn. No
+//! `timeout` key is written: the unit Codex expects there is uncertain for this
+//! POC, and the default behavior is fine, so we omit it rather than guess.
 //!
 //! The merge discipline matches the sibling `codex_config_toml` helper that
 //! disables native memory:
@@ -138,21 +149,35 @@ pub fn remove(config_path: &Path, event: &str, marker: &str) -> Result<SettingsO
 
 // -- shape helpers -----------------------------------------------------------
 
-/// Build a fresh Codex hook table: `{ type = "command", command = "…" }`. No
-/// `timeout` key (unit uncertain for this POC, so omitted).
+/// Build a fresh Codex matcher group:
+/// `{ hooks = [ { type = "command", command = "…" } ] }`. No `matcher` key (Codex
+/// accepts an empty group) and no `timeout` key (unit uncertain for this POC, so
+/// omitted).
 fn table(command: &str) -> Value {
-    let mut t = toml::value::Table::new();
-    t.insert("type".to_string(), Value::String("command".to_string()));
-    t.insert("command".to_string(), Value::String(command.to_string()));
-    Value::Table(t)
+    let mut handler = toml::value::Table::new();
+    handler.insert("type".to_string(), Value::String("command".to_string()));
+    handler.insert("command".to_string(), Value::String(command.to_string()));
+
+    let mut group = toml::value::Table::new();
+    group.insert(
+        HOOKS_TABLE.to_string(),
+        Value::Array(vec![Value::Table(handler)]),
+    );
+    Value::Table(group)
 }
 
-/// True when the table's `command` string contains `marker` — i.e. it is one
-/// we installed.
+/// True when any handler inside the matcher group's nested `hooks` array has a
+/// `command` string containing `marker` — i.e. the group is one we installed.
 fn table_has_marker(t: &Value, marker: &str) -> bool {
-    t.get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|c| c.contains(marker))
+    t.get(HOOKS_TABLE)
+        .and_then(Value::as_array)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains(marker))
+            })
+        })
 }
 
 /// Ensure `[hooks]` exists as a table and return a mutable ref. Creates it
@@ -207,7 +232,7 @@ fn read_document(path: &Path) -> Result<Option<toml::value::Table>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(
-                anyhow::Error::new(e).context(format!("read config file {}", path.display())),
+                anyhow::Error::new(e).context(format!("read config file {}", path.display()))
             )
         }
     };
@@ -303,15 +328,19 @@ mod tests {
         Ok(TestDir::new())
     }
 
-    /// Pull command strings out of `hooks[event]`.
+    /// Pull command strings out of the nested handlers under `hooks[event]`:
+    /// for each matcher group, collect `group["hooks"][].command`.
     fn commands(doc: &toml::value::Table, event: &str) -> Vec<String> {
         doc.get(HOOKS_TABLE)
             .and_then(Value::as_table)
             .and_then(|h| h.get(event))
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.get("command").and_then(Value::as_str))
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g.get(HOOKS_TABLE).and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(|h| h.get("command").and_then(Value::as_str))
                     .map(str::to_string)
                     .collect()
             })
@@ -326,6 +355,10 @@ mod tests {
         assert_eq!(out, SettingsOutcome::Created);
         let body = read(&path);
         assert!(body.contains("[[hooks.UserPromptSubmit]]"), "got: {body}");
+        assert!(
+            body.contains("[[hooks.UserPromptSubmit.hooks]]"),
+            "got: {body}"
+        );
         assert!(body.contains(CMD), "got: {body}");
         // No timeout key per the POC contract.
         assert!(!body.contains("timeout"), "got: {body}");
@@ -394,6 +427,7 @@ theme = "dark"
         fs::write(
             &path,
             r#"[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
 type = "command"
 command = "user-hook.sh"
 "#,
@@ -474,6 +508,7 @@ command = "user-hook.sh"
         fs::write(
             &path,
             r#"[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
 type = "command"
 command = "user-hook.sh"
 "#,
