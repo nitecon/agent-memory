@@ -23,8 +23,8 @@
 //! Claude Code wires the bridge into `UserPromptSubmit` (timeout in seconds);
 //! Gemini CLI wires it into `BeforeAgent` (timeout in milliseconds). The
 //! merge logic is identical; the caller supplies the event, command, timeout,
-//! and the [`crate::setup::hook_script::INJECT_SCRIPT_MARKER`] used to find
-//! our own entries.
+//! and the marker (see [`crate::setup::hook_command::HOOK_MARKER`]) used to
+//! find our own entries.
 //!
 //! The merge is deliberately conservative, matching the sibling per-agent
 //! settings helpers:
@@ -581,6 +581,9 @@ mod tests {
         let out = install(&path, "BeforeAgent", gemini_cmd, 10000, MARKER).unwrap();
         assert_eq!(out, SettingsOutcome::Created);
         let parsed: Value = serde_json::from_str(&read(&path)).unwrap();
-        assert_eq!(commands(&parsed, "BeforeAgent"), vec![gemini_cmd.to_string()]);
+        assert_eq!(
+            commands(&parsed, "BeforeAgent"),
+            vec![gemini_cmd.to_string()]
+        );
     }
 }

@@ -29,16 +29,16 @@
 //! private to their respective submodules.
 //!
 //! The `hooks` installer is a separate, opt-in component (POC): it wires each
-//! agent CLI's per-turn hook system to inject relevant memory automatically
-//! via the shared `hook_script` bridge, using `json_hooks` (Claude/Gemini
-//! settings.json) and `codex_hooks_toml` (Codex config.toml) for the merges.
-//! It is intentionally NOT part of `setup all`.
+//! agent CLI's per-turn hook system to inject relevant memory automatically by
+//! invoking the `memory hook` subcommand (see `hook_command`), using
+//! `json_hooks` (Claude/Gemini settings.json) and `codex_hooks_toml` (Codex
+//! config.toml) for the merges. It is intentionally NOT part of `setup all`.
 
 pub mod codex_config_toml;
 pub mod codex_hooks_toml;
 pub mod gateway;
 pub mod gemini_settings_json;
-pub mod hook_script;
+pub mod hook_command;
 pub mod hooks;
 pub mod json_hooks;
 pub mod menu;

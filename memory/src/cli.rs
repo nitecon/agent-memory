@@ -319,6 +319,19 @@ pub enum Cli {
     },
     /// Start MCP stdio server.
     Serve,
+    /// Runtime hook entrypoint invoked by an agent CLI's per-turn hook (installed
+    /// by `memory setup hooks`). Reads the hook JSON payload on stdin, runs the
+    /// per-turn memory retrieval, and emits a `hookSpecificOutput` envelope on
+    /// stdout for the agent to inject as additionalContext. Fail-soft: always
+    /// exits 0.
+    Hook {
+        /// Agent name (claude, codex, gemini). Selects the hook event name.
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// Number of memories to retrieve.
+        #[arg(short = 'k', long, default_value = "5")]
+        limit: usize,
+    },
     /// Dual-mode command:
     ///
     ///   - `memory update`                  → check for and install the
@@ -465,22 +478,29 @@ pub enum SetupCommands {
     /// Wire automatic per-turn RAG memory injection into each agent CLI's
     /// hook system (POC — opt-in, NOT part of `setup all`).
     ///
-    /// Installs a shared bridge script at `~/.agentic/hooks/memory-inject.sh`
-    /// and registers it in each detected agent's per-turn hook:
+    /// Scriptless: registers the `memory hook --agent <agent>` subcommand
+    /// directly in each detected agent's per-turn hook (no shared `.sh`
+    /// script — a binary subcommand is cross-platform, with no bash/jq
+    /// dependency and no `.sh` file-association surprises on Windows):
     ///   - Claude Code → `UserPromptSubmit` in `~/.claude/settings.json`
+    ///     → `memory hook --agent claude`
     ///   - Gemini CLI  → `BeforeAgent` in `~/.gemini/settings.json`
+    ///     → `memory hook --agent gemini`
     ///   - Codex CLI   → `UserPromptSubmit` in Codex `config.toml`
+    ///     → `memory hook --agent codex`
     ///
-    /// The script reads the turn's prompt, runs `memory context`, and injects
-    /// the result via `additionalContext` — so the agent no longer has to call
-    /// `memory context` itself. Idempotent: re-runs replace our entry in place.
-    /// This complements (and lets you trim) the manual-recall part of the
+    /// On each turn the subcommand reads the prompt from the hook payload,
+    /// runs `memory context`, and injects the result via `additionalContext`
+    /// — so the agent no longer has to call `memory context` itself.
+    /// Idempotent: re-runs replace our entry in place, and upgrades strip any
+    /// stale `memory-inject.sh` script entry left by older installs. This
+    /// complements (and lets you trim) the manual-recall part of the
     /// `<memory-rules>` block written by `setup rules`.
     Hooks {
         /// Show the intended actions without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Print the bridge script to stdout and exit (no file IO).
+        /// Print the per-agent installed commands to stdout and exit (no file IO).
         #[arg(long)]
         print: bool,
         /// Strip our hook entries from each detected agent and delete the
@@ -625,34 +645,22 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             format: _,
             preview_chars: _,
         } => {
-            let boosts =
-                resolve_boosts(project.as_deref(), cwd_project.as_deref(), no_project_boost);
-            let opts = SearchOptions {
-                limit,
-                current_project: boosts.current_project,
-                boost_factor: boosts.project_boost,
-                only_project: only.as_deref(),
-                global_project: boosts.global_project,
-                global_boost_factor: boosts.global_boost,
-            };
-            let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
-            // When `--no-working-context` is set, skip the fetch entirely and
-            // suppress the absence hint too — the caller (the per-turn hook)
-            // does not want any WorkingContext signal, present or absent.
-            let working_context = if no_working_context {
-                None
-            } else if let Some(project) = boosts.current_project {
-                queries::get_working_context(conn, project)?
-            } else {
-                None
-            };
-            print_ranked(
-                &results,
-                &boosts,
+            // Shared retrieval+render path (also used by `memory hook`): keeps
+            // the `memory context` output byte-for-byte identical while letting
+            // the hook reuse the exact same logic. `println!` re-adds the
+            // trailing newline `print_ranked` would have emitted.
+            let block = retrieve_context_block(
+                conn,
+                &config,
                 &description,
-                working_context.as_ref(),
-                !no_working_context,
-            );
+                limit,
+                no_working_context,
+                project.as_deref(),
+                cwd_project.as_deref(),
+                no_project_boost,
+                only.as_deref(),
+            )?;
+            println!("{block}");
         }
         Cli::Recall {
             project,
@@ -910,6 +918,9 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
         }
+        Cli::Hook { .. } => {
+            unreachable!("Hook is handled in main.rs (fail-soft path)");
+        }
         Cli::Update {
             id,
             content,
@@ -967,6 +978,32 @@ fn print_ranked(
     working_context: Option<&WorkingContext>,
     include_working_absence_hint: bool,
 ) {
+    println!(
+        "{}",
+        render_ranked(
+            results,
+            boosts,
+            query,
+            working_context,
+            include_working_absence_hint
+        )
+    );
+}
+
+/// Render a ranked result set (`search`/`context`) to a `String`, identical to
+/// what [`print_ranked`] prints (sans the trailing newline `println!` adds).
+///
+/// Factored out so both the `Cli::Context` arm and the per-turn `hook::run`
+/// path can reuse the exact same rendering — DRY: there is one code path for
+/// turning ranked results + hints + working-context into the emitted block.
+/// See [`print_ranked`] for the `query` canonical-state-intent semantics.
+fn render_ranked(
+    results: &[SearchResult],
+    boosts: &BoostConfig<'_>,
+    query: &str,
+    working_context: Option<&WorkingContext>,
+    include_working_absence_hint: bool,
+) -> String {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
     let cross = if boosts.current_project.is_some() {
@@ -990,12 +1027,60 @@ fn print_ranked(
     );
     // Empty input yields an empty render; emit an explicit empty marker so
     // callers can tell "query ran, zero hits" from a silent failure.
-    if rendered.is_empty() {
-        println!("<results count=\"0\"/>");
+    let body = if rendered.is_empty() {
+        "<results count=\"0\"/>".to_string()
     } else {
-        println!("{rendered}");
-    }
-    println!("{}", render::render_usage_legend());
+        rendered
+    };
+    format!("{body}\n{}", render::render_usage_legend())
+}
+
+/// Run the `memory context` retrieval+render and RETURN the block as a String,
+/// byte-for-byte equal to what `memory context` prints (sans the final
+/// newline). Shared by the `Cli::Context` arm and the per-turn `hook::run`
+/// path so there is no duplicated retrieval logic between them.
+///
+/// `no_working_context` mirrors the `--no-working-context` flag: when true the
+/// WorkingContext fetch is skipped and its absence hint suppressed. Boost
+/// resolution follows the same `--no-project-boost`-off defaults the CLI uses
+/// (explicit project override, then cwd; global scope always on). `only`
+/// mirrors `--only <project>`.
+#[allow(clippy::too_many_arguments)]
+pub fn retrieve_context_block(
+    conn: &Connection,
+    config: &Config,
+    description: &str,
+    limit: usize,
+    no_working_context: bool,
+    project: Option<&str>,
+    cwd_project: Option<&str>,
+    no_project_boost: bool,
+    only: Option<&str>,
+) -> Result<String, MemoryError> {
+    let boosts = resolve_boosts(project, cwd_project, no_project_boost);
+    let opts = SearchOptions {
+        limit,
+        current_project: boosts.current_project,
+        boost_factor: boosts.project_boost,
+        only_project: only,
+        global_project: boosts.global_project,
+        global_boost_factor: boosts.global_boost,
+    };
+    let results = search::hybrid_search(conn, description, opts, &config.model_cache_dir)?;
+    let working_context = if no_working_context {
+        None
+    } else if let Some(project) = boosts.current_project {
+        queries::get_working_context(conn, project)?
+    } else {
+        None
+    };
+    Ok(render_ranked(
+        &results,
+        &boosts,
+        description,
+        working_context.as_ref(),
+        !no_working_context,
+    ))
 }
 
 fn combine_hints(primary: Option<String>, secondary: Option<String>) -> Option<String> {
@@ -2689,6 +2774,33 @@ mod tests {
     use crate::sync::PushMemoryResult;
     use clap::Parser;
     use serde_json::{json, Value};
+
+    /// `memory hook --agent codex` parses to `Cli::Hook` with the chosen agent
+    /// and the default limit of 5.
+    #[test]
+    fn parse_hook_agent_and_default_limit() {
+        let cli = Cli::try_parse_from(["memory", "hook", "--agent", "codex"]).unwrap();
+        match cli {
+            Cli::Hook { agent, limit } => {
+                assert_eq!(agent, "codex");
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Hook variant"),
+        }
+    }
+
+    /// `memory hook` with no `--agent` defaults to "claude".
+    #[test]
+    fn parse_hook_defaults_to_claude() {
+        let cli = Cli::try_parse_from(["memory", "hook"]).unwrap();
+        match cli {
+            Cli::Hook { agent, limit } => {
+                assert_eq!(agent, "claude");
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Hook variant"),
+        }
+    }
 
     /// `--scope global` should parse to `MemoryScope::Global` and leave other
     /// flags untouched.

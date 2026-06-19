@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod embedding;
 mod error;
+mod hook;
 mod mcp;
 mod project;
 mod render;
@@ -24,8 +25,34 @@ fn main() -> anyhow::Result<()> {
 
     match cli {
         Cli::Serve => run_server(),
+        // The hook path is special-cased like `Serve`: it must NEVER return a
+        // non-zero exit, because on `UserPromptSubmit` a non-zero exit can block
+        // the user's prompt in Claude. `run_hook_failsoft` swallows every error
+        // and returns Ok(()) unconditionally.
+        Cli::Hook { agent, limit } => {
+            run_hook_failsoft(&agent, limit);
+            Ok(())
+        }
         other => run_cli(other),
     }
+}
+
+/// Fully fail-soft driver for `memory hook`. Wraps config load, DB open, and
+/// retrieval so ANY error results in a clean exit 0 with no stdout. Unlike
+/// [`run_cli`], this path deliberately does NOT run the auto-updater or install
+/// noisy logging — the hook must be quiet and fast, and stdout must carry only
+/// the envelope (or nothing). Diagnostics, if any, go to stderr.
+fn run_hook_failsoft(agent: &str, limit: usize) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    if config.ensure_dirs().is_err() {
+        return;
+    }
+    let Ok(conn) = open_database(&config.db_path) else {
+        return;
+    };
+    hook::run(agent, limit, &conn, &config);
 }
 
 fn run_cli(cli: Cli) -> anyhow::Result<()> {

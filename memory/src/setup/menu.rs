@@ -216,16 +216,12 @@ fn probe_skill() -> ComponentState {
     }
 }
 
-/// Probe the opt-in hooks component. Reports "installed" only when BOTH the
-/// shared bridge script exists AND at least one detected agent config carries
-/// a marker-matching hook entry — a half-installed state (script present but no
-/// agent wired, or vice versa) still prompts a re-run. The detail string lists
-/// per-agent wiring status so the user sees which frontends are covered.
+/// Probe the opt-in hooks component. Scriptless: reports "installed" when at
+/// least one detected agent config carries a marker-matching `memory hook`
+/// entry (or a legacy `memory-inject` entry, while mid-upgrade). The detail
+/// string lists per-agent wiring status so the user sees which frontends are
+/// covered.
 fn probe_hooks() -> ComponentState {
-    let script_present = crate::setup::hook_script::script_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
-
     let targets = detect_rule_files();
     if targets.is_empty() {
         return ComponentState {
@@ -248,14 +244,9 @@ fn probe_hooks() -> ComponentState {
         ));
     }
 
-    let script_note = if script_present {
-        "script present"
-    } else {
-        "script missing"
-    };
     ComponentState {
-        installed: script_present && wired > 0,
-        detail: format!("{script_note}; {}", segments.join(", ")),
+        installed: wired > 0,
+        detail: segments.join(", "),
     }
 }
 

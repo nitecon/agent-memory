@@ -3,9 +3,9 @@
 //! Where `memory setup rules` injects a `<memory-rules>` block instructing the
 //! agent to *call* `memory context` itself, this installer wires each agent
 //! CLI's per-turn hook system to inject relevant memory automatically — no
-//! model-initiated tool call required. The shared bridge script
-//! ([`hook_script`]) does the retrieval; this module wires it into each
-//! detected agent's config:
+//! model-initiated tool call required. The `memory hook` subcommand
+//! ([`hook_command`]) does the retrieval; this module registers the per-agent
+//! `memory hook --agent <agent>` command into each detected agent's config:
 //!
 //! | Agent  | Rule file   | Config file (resolver)                          | Event              | Timeout |
 //! |--------|-------------|-------------------------------------------------|--------------------|---------|
@@ -15,8 +15,8 @@
 //!
 //! Agent detection reuses [`rules::detect_agent_files`] verbatim so this
 //! installer and `setup rules` agree on which agents are present and where
-//! their config lives (including `CODEX_HOME` / XDG precedence). The script is
-//! written once, shared by all three.
+//! their config lives (including `CODEX_HOME` / XDG precedence). The same
+//! `memory hook --agent <agent>` command shape is registered for all three.
 //!
 //! This is opt-in: it is NOT part of `memory setup all`. The default sweep
 //! still installs only gateway + rules + skill. Hooks must be requested
@@ -28,11 +28,11 @@
 use crate::setup::codex_config_toml;
 use crate::setup::codex_hooks_toml;
 use crate::setup::gemini_settings_json;
-use crate::setup::hook_script::{self, ScriptOutcome, INJECT_SCRIPT_MARKER};
+use crate::setup::hook_command::{self, HOOK_MARKER, LEGACY_SCRIPT_MARKER};
 use crate::setup::json_hooks;
 use crate::setup::rules;
 use crate::setup::settings_json::{self, SettingsOutcome};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Claude Code hook timeout, in seconds.
@@ -49,19 +49,16 @@ const GEMINI_TIMEOUT_MS: i64 = 10_000;
 ///   `rules::run` signature so the menu dispatch stays uniform, and is always
 ///   passed `true` by the current callers.)
 /// - `dry_run` — print intended actions and write nothing.
-/// - `print` — emit the bridge script body to stdout and exit (no IO).
-/// - `remove` — inverse of install: strip our hook entries from each agent,
-///   then delete the shared bridge script.
+/// - `print` — emit the per-agent installed commands to stdout and exit (no IO).
+/// - `remove` — inverse of install: strip our hook entries (new + legacy) from
+///   each agent, and best-effort delete any stale legacy bridge script.
 pub fn run(all: bool, dry_run: bool, print: bool, remove: bool) -> Result<()> {
     let _ = all; // accepted for signature parity with rules::run; see doc.
 
     if print {
-        hook_script::print_script();
+        print_installed_commands();
         return Ok(());
     }
-
-    let script = hook_script::script_path()
-        .context("resolve home directory for hook script path")?;
 
     let candidates = rules::detect_agent_files();
     if candidates.is_empty() {
@@ -78,21 +75,19 @@ pub fn run(all: bool, dry_run: bool, print: bool, remove: bool) -> Result<()> {
     let mut any_failed = false;
 
     if remove {
-        // Strip per-agent hook entries first, then remove the now-unreferenced
-        // bridge script. Order matters only cosmetically (the script removal
-        // is independent), but stripping first keeps a partially-failed run
-        // from leaving configs pointing at a missing script.
         for rule_file in &candidates {
             remove_for_agent(rule_file, dry_run, &mut any_failed);
         }
-        remove_script(dry_run, &mut any_failed);
     } else {
-        // Write the shared script once up front; all agents reference it.
-        write_script(dry_run, &mut any_failed);
         for rule_file in &candidates {
-            install_for_agent(rule_file, &script, dry_run, &mut any_failed);
+            install_for_agent(rule_file, dry_run, &mut any_failed);
         }
     }
+
+    // Either path may leave behind a stale `memory-inject.sh` from an old
+    // script-based install; clean it up so upgraded users don't keep a dead
+    // file. Best-effort: a removal failure flags but does not abort.
+    remove_legacy_script(dry_run, &mut any_failed);
 
     if any_failed {
         anyhow::bail!("one or more agents could not be updated");
@@ -100,64 +95,50 @@ pub fn run(all: bool, dry_run: bool, print: bool, remove: bool) -> Result<()> {
     Ok(())
 }
 
-// -- script management -------------------------------------------------------
+// -- informational + legacy cleanup ------------------------------------------
 
-/// Write the bridge script, emitting a status line for the outcome. Failures
-/// flag `any_failed` but don't abort the run — per-agent wiring can still be
-/// reported.
-fn write_script(dry_run: bool, any_failed: &mut bool) {
-    if dry_run {
-        if let Some(path) = hook_script::script_path() {
-            println!(
-                r#"<setup status="hook_script_dry_run" path="{}"/>"#,
-                path.display()
-            );
-        }
-        return;
-    }
-    match hook_script::write_script(false) {
-        Ok(outcome) => {
-            let status = match outcome {
-                ScriptOutcome::Created => "hook_script_created",
-                ScriptOutcome::Updated => "hook_script_updated",
-                ScriptOutcome::AlreadyCurrent => "hook_script_already_current",
-                ScriptOutcome::DryRun => "hook_script_dry_run",
-            };
-            if let Some(path) = hook_script::script_path() {
-                println!(r#"<setup status="{}" path="{}"/>"#, status, path.display());
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to write hook script: {e:#}");
-            *any_failed = true;
-        }
+/// Back `memory setup hooks --print`: emit the per-agent command each writer
+/// would embed. Informational only — no filesystem touched.
+fn print_installed_commands() {
+    for agent in ["claude", "gemini", "codex"] {
+        println!(
+            r#"<setup status="hook_command" agent="{}" command="{}"/>"#,
+            agent,
+            hook_command::installed_command(agent)
+        );
     }
 }
 
-/// Remove the bridge script, emitting a status line for the outcome.
-fn remove_script(dry_run: bool, any_failed: &mut bool) {
+/// Best-effort delete the legacy `~/.agentic/hooks/memory-inject.sh` script
+/// left by pre-scriptless installs. A missing file is a silent no-op; only a
+/// real deletion emits a status line. Removal errors (other than NotFound) flag
+/// `any_failed` but don't abort the run.
+fn remove_legacy_script(dry_run: bool, any_failed: &mut bool) {
+    let Some(path) = hook_command::legacy_script_path() else {
+        return;
+    };
     if dry_run {
-        if let Some(path) = hook_script::script_path() {
+        if path.exists() {
             println!(
-                r#"<setup status="hook_script_remove_dry_run" path="{}"/>"#,
+                r#"<setup status="legacy_script_remove_dry_run" path="{}"/>"#,
                 path.display()
             );
         }
         return;
     }
-    match hook_script::remove_script() {
-        Ok(removed) => {
-            let status = if removed {
-                "hook_script_removed"
-            } else {
-                "hook_script_already_absent"
-            };
-            if let Some(path) = hook_script::script_path() {
-                println!(r#"<setup status="{}" path="{}"/>"#, status, path.display());
-            }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!(
+                r#"<setup status="legacy_script_removed" path="{}"/>"#,
+                path.display()
+            );
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            eprintln!("Failed to remove hook script: {e:#}");
+            eprintln!(
+                "Failed to remove legacy hook script {}: {e:#}",
+                path.display()
+            );
             *any_failed = true;
         }
     }
@@ -169,11 +150,24 @@ fn remove_script(dry_run: bool, any_failed: &mut bool) {
 /// Dispatches by the rule file's name (claude.md / gemini.md / agents.md) and
 /// reuses each agent's existing settings-path resolver — no path logic is
 /// duplicated here.
-fn install_for_agent(rule_file: &Path, script: &Path, dry_run: bool, any_failed: &mut bool) {
+///
+/// UPGRADE-SAFE: before installing the new `memory hook --agent <agent>`
+/// command we first strip any stale entry from an old script-based install
+/// (matched by [`LEGACY_SCRIPT_MARKER`]). The new install's own marker-based
+/// retain (keyed on [`HOOK_MARKER`]) then handles idempotency for our entries.
+fn install_for_agent(rule_file: &Path, dry_run: bool, any_failed: &mut bool) {
     // Claude — settings.json, UserPromptSubmit, timeout in seconds.
     if let Some(settings_path) = settings_json::settings_path_for_rule_file(rule_file) {
-        let command = hook_script::installed_command("claude", script);
-        run_json_op(
+        let command = hook_command::installed_command("claude");
+        json_remove(
+            "claude",
+            &settings_path,
+            "UserPromptSubmit",
+            LEGACY_SCRIPT_MARKER,
+            dry_run,
+            any_failed,
+        );
+        json_install(
             "claude",
             &settings_path,
             "UserPromptSubmit",
@@ -181,15 +175,22 @@ fn install_for_agent(rule_file: &Path, script: &Path, dry_run: bool, any_failed:
             CLAUDE_TIMEOUT_SECS,
             dry_run,
             any_failed,
-            JsonHookAction::Install,
         );
         return;
     }
 
     // Gemini — settings.json, BeforeAgent, timeout in milliseconds.
     if let Some(settings_path) = gemini_settings_json::settings_path_for_rule_file(rule_file) {
-        let command = hook_script::installed_command("gemini", script);
-        run_json_op(
+        let command = hook_command::installed_command("gemini");
+        json_remove(
+            "gemini",
+            &settings_path,
+            "BeforeAgent",
+            LEGACY_SCRIPT_MARKER,
+            dry_run,
+            any_failed,
+        );
+        json_install(
             "gemini",
             &settings_path,
             "BeforeAgent",
@@ -197,63 +198,71 @@ fn install_for_agent(rule_file: &Path, script: &Path, dry_run: bool, any_failed:
             GEMINI_TIMEOUT_MS,
             dry_run,
             any_failed,
-            JsonHookAction::Install,
         );
         return;
     }
 
     // Codex — config.toml, UserPromptSubmit, no timeout key.
     if let Some(config_path) = resolve_codex_config(rule_file) {
-        let command = hook_script::installed_command("codex", script);
-        run_toml_op(
+        let command = hook_command::installed_command("codex");
+        toml_remove(
+            &config_path,
+            "UserPromptSubmit",
+            LEGACY_SCRIPT_MARKER,
+            dry_run,
+            any_failed,
+        );
+        toml_install(
             &config_path,
             "UserPromptSubmit",
             &command,
             dry_run,
             any_failed,
-            TomlHookAction::Install,
         );
     }
     // Any other rule file → no hook surface to touch.
 }
 
-/// Remove the per-turn hook for whichever agent `rule_file` identifies.
+/// Remove the per-turn hook for whichever agent `rule_file` identifies. Strips
+/// BOTH our new entries ([`HOOK_MARKER`]) and any legacy script-based entries
+/// ([`LEGACY_SCRIPT_MARKER`]) so an upgrade-then-remove leaves nothing behind.
 fn remove_for_agent(rule_file: &Path, dry_run: bool, any_failed: &mut bool) {
     if let Some(settings_path) = settings_json::settings_path_for_rule_file(rule_file) {
-        run_json_op(
-            "claude",
-            &settings_path,
-            "UserPromptSubmit",
-            "",
-            CLAUDE_TIMEOUT_SECS,
-            dry_run,
-            any_failed,
-            JsonHookAction::Remove,
-        );
+        for marker in [HOOK_MARKER, LEGACY_SCRIPT_MARKER] {
+            json_remove(
+                "claude",
+                &settings_path,
+                "UserPromptSubmit",
+                marker,
+                dry_run,
+                any_failed,
+            );
+        }
         return;
     }
     if let Some(settings_path) = gemini_settings_json::settings_path_for_rule_file(rule_file) {
-        run_json_op(
-            "gemini",
-            &settings_path,
-            "BeforeAgent",
-            "",
-            GEMINI_TIMEOUT_MS,
-            dry_run,
-            any_failed,
-            JsonHookAction::Remove,
-        );
+        for marker in [HOOK_MARKER, LEGACY_SCRIPT_MARKER] {
+            json_remove(
+                "gemini",
+                &settings_path,
+                "BeforeAgent",
+                marker,
+                dry_run,
+                any_failed,
+            );
+        }
         return;
     }
     if let Some(config_path) = resolve_codex_config(rule_file) {
-        run_toml_op(
-            &config_path,
-            "UserPromptSubmit",
-            "",
-            dry_run,
-            any_failed,
-            TomlHookAction::Remove,
-        );
+        for marker in [HOOK_MARKER, LEGACY_SCRIPT_MARKER] {
+            toml_remove(
+                &config_path,
+                "UserPromptSubmit",
+                marker,
+                dry_run,
+                any_failed,
+            );
+        }
     }
 }
 
@@ -268,23 +277,10 @@ fn resolve_codex_config(rule_file: &Path) -> Option<PathBuf> {
 
 // -- shared executors --------------------------------------------------------
 
-#[derive(Clone, Copy)]
-enum JsonHookAction {
-    Install,
-    Remove,
-}
-
-#[derive(Clone, Copy)]
-enum TomlHookAction {
-    Install,
-    Remove,
-}
-
-/// Drive a Claude/Gemini JSON hook mutation and emit the status line. Folds
-/// dry-run handling, outcome-to-status mapping, and error flagging into one
-/// place so the per-agent callers stay declarative.
+/// Install our hook command into a Claude/Gemini JSON settings file's `event`,
+/// keyed on [`HOOK_MARKER`] for idempotent retain, and emit the status line.
 #[allow(clippy::too_many_arguments)]
-fn run_json_op(
+fn json_install(
     agent: &str,
     settings_path: &Path,
     event: &str,
@@ -292,59 +288,65 @@ fn run_json_op(
     timeout: i64,
     dry_run: bool,
     any_failed: &mut bool,
-    action: JsonHookAction,
 ) {
     if dry_run {
-        emit_dry_run(agent, settings_path, event, action_label_json(action));
+        emit_dry_run(agent, settings_path, event, "install");
         return;
     }
-    let outcome = match action {
-        JsonHookAction::Install => {
-            json_hooks::install(settings_path, event, command, timeout, INJECT_SCRIPT_MARKER)
-        }
-        JsonHookAction::Remove => {
-            json_hooks::remove(settings_path, event, INJECT_SCRIPT_MARKER)
-        }
-    };
+    let outcome = json_hooks::install(settings_path, event, command, timeout, HOOK_MARKER);
     report_outcome(agent, settings_path, event, outcome, any_failed);
 }
 
-/// Drive a Codex TOML hook mutation and emit the status line.
-fn run_toml_op(
+/// Remove `marker`-matching hook groups from a Claude/Gemini JSON settings
+/// file's `event`, and emit the status line.
+fn json_remove(
+    agent: &str,
+    settings_path: &Path,
+    event: &str,
+    marker: &str,
+    dry_run: bool,
+    any_failed: &mut bool,
+) {
+    if dry_run {
+        emit_dry_run(agent, settings_path, event, "remove");
+        return;
+    }
+    let outcome = json_hooks::remove(settings_path, event, marker);
+    report_outcome(agent, settings_path, event, outcome, any_failed);
+}
+
+/// Install our hook command into a Codex `config.toml`'s `event`, keyed on
+/// [`HOOK_MARKER`], and emit the status line.
+fn toml_install(
     config_path: &Path,
     event: &str,
     command: &str,
     dry_run: bool,
     any_failed: &mut bool,
-    action: TomlHookAction,
 ) {
     if dry_run {
-        emit_dry_run("codex", config_path, event, action_label_toml(action));
+        emit_dry_run("codex", config_path, event, "install");
         return;
     }
-    let outcome = match action {
-        TomlHookAction::Install => {
-            codex_hooks_toml::install(config_path, event, command, INJECT_SCRIPT_MARKER)
-        }
-        TomlHookAction::Remove => {
-            codex_hooks_toml::remove(config_path, event, INJECT_SCRIPT_MARKER)
-        }
-    };
+    let outcome = codex_hooks_toml::install(config_path, event, command, HOOK_MARKER);
     report_outcome("codex", config_path, event, outcome, any_failed);
 }
 
-fn action_label_json(action: JsonHookAction) -> &'static str {
-    match action {
-        JsonHookAction::Install => "install",
-        JsonHookAction::Remove => "remove",
+/// Remove `marker`-matching hook tables from a Codex `config.toml`'s `event`,
+/// and emit the status line.
+fn toml_remove(
+    config_path: &Path,
+    event: &str,
+    marker: &str,
+    dry_run: bool,
+    any_failed: &mut bool,
+) {
+    if dry_run {
+        emit_dry_run("codex", config_path, event, "remove");
+        return;
     }
-}
-
-fn action_label_toml(action: TomlHookAction) -> &'static str {
-    match action {
-        TomlHookAction::Install => "install",
-        TomlHookAction::Remove => "remove",
-    }
+    let outcome = codex_hooks_toml::remove(config_path, event, marker);
+    report_outcome("codex", config_path, event, outcome, any_failed);
 }
 
 fn emit_dry_run(agent: &str, path: &Path, event: &str, action: &str) {
@@ -406,9 +408,11 @@ pub(crate) fn agent_has_hook(rule_file: &Path) -> bool {
     false
 }
 
-/// True when the JSON settings file at `path` mentions our marker anywhere in
-/// a hook command. Best-effort: unreadable / unparseable files read as
-/// "no hook" so the probe never errors the menu.
+/// True when the JSON settings file at `path` mentions EITHER our new marker
+/// ([`HOOK_MARKER`]) or a legacy script marker ([`LEGACY_SCRIPT_MARKER`])
+/// anywhere — so the menu reports "installed" both for the new command and for
+/// a not-yet-upgraded legacy entry. Best-effort: unreadable / unparseable files
+/// read as "no hook" so the probe never errors the menu.
 fn json_config_has_marker(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
@@ -417,18 +421,18 @@ fn json_config_has_marker(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// True when the TOML config at `path` mentions our marker anywhere.
+/// True when the TOML config at `path` mentions either marker anywhere.
 fn toml_config_has_marker(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
-        .map(|raw| raw.contains(INJECT_SCRIPT_MARKER))
+        .map(|raw| raw.contains(HOOK_MARKER) || raw.contains(LEGACY_SCRIPT_MARKER))
         .unwrap_or(false)
 }
 
-/// Recursively check whether any string in a JSON value contains our marker.
+/// Recursively check whether any string in a JSON value contains either marker.
 fn value_mentions_marker(v: &serde_json::Value) -> bool {
     match v {
-        serde_json::Value::String(s) => s.contains(INJECT_SCRIPT_MARKER),
+        serde_json::Value::String(s) => s.contains(HOOK_MARKER) || s.contains(LEGACY_SCRIPT_MARKER),
         serde_json::Value::Array(a) => a.iter().any(value_mentions_marker),
         serde_json::Value::Object(o) => o.values().any(value_mentions_marker),
         _ => false,
@@ -470,7 +474,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Pull command strings out of a Codex config's `hooks[event]`.
+    /// Pull NESTED handler command strings out of a Codex config's
+    /// `hooks[event]`: for each matcher group, collect `group.hooks[].command`.
+    /// Mirrors `json_commands` — Codex hooks use the same nested matcher-group
+    /// shape as Claude Code, so a flat top-level `command` read would miss them.
     fn toml_commands(path: &Path, event: &str) -> Vec<String> {
         let raw = fs::read_to_string(path).unwrap();
         let doc: toml::value::Table = toml::from_str(&raw).unwrap();
@@ -478,9 +485,12 @@ mod tests {
             .and_then(toml::Value::as_table)
             .and_then(|h| h.get(event))
             .and_then(toml::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.get("command").and_then(toml::Value::as_str))
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g.get("hooks").and_then(toml::Value::as_array))
+                    .flatten()
+                    .filter_map(|h| h.get("command").and_then(toml::Value::as_str))
                     .map(str::to_string)
                     .collect()
             })
@@ -497,7 +507,6 @@ mod tests {
     #[test]
     fn install_and_remove_cycle_across_all_agents() {
         let home = tempdir_in_target();
-        let script = home.join(".agentic").join("hooks").join("memory-inject.sh");
 
         // -- Claude: theme + an unrelated PreToolUse hook the user added. ----
         let claude_dir = home.join(".claude");
@@ -550,21 +559,22 @@ mod tests {
             r#"model = "gpt-5"
 
 [[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
 type = "command"
 command = "user-codex-hook.sh"
 "#,
         )
         .unwrap();
 
-        let claude_cmd = hook_script::installed_command("claude", &script);
-        let gemini_cmd = hook_script::installed_command("gemini", &script);
-        let codex_cmd = hook_script::installed_command("codex", &script);
+        let claude_cmd = hook_command::installed_command("claude");
+        let gemini_cmd = hook_command::installed_command("gemini");
+        let codex_cmd = hook_command::installed_command("codex");
 
         // -- install (drive helpers directly) -------------------------------
         let mut any_failed = false;
-        install_for_agent(&claude_rule, &script, false, &mut any_failed);
-        install_for_agent(&gemini_rule, &script, false, &mut any_failed);
-        install_for_agent(&codex_rule, &script, false, &mut any_failed);
+        install_for_agent(&claude_rule, false, &mut any_failed);
+        install_for_agent(&gemini_rule, false, &mut any_failed);
+        install_for_agent(&codex_rule, false, &mut any_failed);
         assert!(!any_failed, "install must not surface failures");
 
         // Claude: ours added to UserPromptSubmit, user's PreToolUse intact,
@@ -634,7 +644,6 @@ command = "user-codex-hook.sh"
     #[test]
     fn agent_has_hook_detects_installed_entry() {
         let home = tempdir_in_target();
-        let script = home.join(".agentic").join("hooks").join("memory-inject.sh");
         let claude_dir = home.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let claude_rule = claude_dir.join("CLAUDE.md");
@@ -644,10 +653,62 @@ command = "user-codex-hook.sh"
         assert!(!agent_has_hook(&claude_rule));
 
         let mut any_failed = false;
-        install_for_agent(&claude_rule, &script, false, &mut any_failed);
+        install_for_agent(&claude_rule, false, &mut any_failed);
         assert!(!any_failed);
 
         // After install: detected.
         assert!(agent_has_hook(&claude_rule));
+    }
+
+    /// Upgrade path: a pre-existing LEGACY script-based entry (command contains
+    /// `memory-inject`) must be stripped on install and replaced by the new
+    /// binary command. Exercised on Codex, whose seed carries a legacy nested
+    /// handler plus an unrelated user hook + model that must survive.
+    #[test]
+    fn install_strips_legacy_script_entry() {
+        let home = tempdir_in_target();
+        let codex_dir = home.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_rule = codex_dir.join("AGENTS.md");
+        std::fs::write(&codex_rule, "# Codex\n").unwrap();
+        let codex_config = codex_dir.join("config.toml");
+        // Seed: model + an unrelated user hook + a LEGACY memory-inject entry.
+        std::fs::write(
+            &codex_config,
+            r#"model = "gpt-5"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "user-codex-hook.sh"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/home/u/.agentic/hooks/memory-inject.sh codex"
+"#,
+        )
+        .unwrap();
+
+        let codex_cmd = hook_command::installed_command("codex");
+
+        let mut any_failed = false;
+        install_for_agent(&codex_rule, false, &mut any_failed);
+        assert!(!any_failed, "install must not surface failures");
+
+        let cmds = toml_commands(&codex_config, "UserPromptSubmit");
+        // Legacy entry gone, new binary command present, user's hook intact.
+        assert!(
+            !cmds.iter().any(|c| c.contains(LEGACY_SCRIPT_MARKER)),
+            "legacy memory-inject entry must be stripped, got {cmds:?}"
+        );
+        assert!(cmds.contains(&codex_cmd), "new command missing: {cmds:?}");
+        assert!(
+            cmds.contains(&"user-codex-hook.sh".to_string()),
+            "user's hook must survive: {cmds:?}"
+        );
+        let parsed: toml::value::Table =
+            toml::from_str(&fs::read_to_string(&codex_config).unwrap()).unwrap();
+        assert_eq!(parsed.get("model").unwrap().as_str(), Some("gpt-5"));
     }
 }
