@@ -38,23 +38,27 @@ pub const HOOK_MARKER: &str = "hook --agent";
 pub const LEGACY_SCRIPT_MARKER: &str = "memory-inject";
 
 /// Build the command string a config writer embeds for `agent`, e.g.
-/// (unix) `"/opt/agentic/bin/memory" hook --agent codex` or
-/// (windows) `"C:\Users\me\.agentic\bin\memory.exe" hook --agent codex`.
+/// (unix) `/opt/agentic/bin/memory hook --agent codex` or
+/// (windows) `C:\Users\me\.agentic\bin\memory.exe hook --agent codex`.
 ///
 /// The executable path is resolved via [`std::env::current_exe`] so the
 /// installed command points at the exact binary the user ran `setup` with. On
 /// failure (rare — e.g. the binary was unlinked), we fall back to the bare
 /// program name on `PATH` (`memory` / `memory.exe`).
 ///
-/// The path is wrapped in double quotes so install paths containing spaces —
-/// common on Windows under `C:\Users\<name with space>\…` — survive being run
-/// through a shell. The string always contains [`HOOK_MARKER`].
+/// The exe path is emitted BARE — not wrapped in double quotes. Codex's
+/// per-turn hook launcher on Windows does not run `command` through a
+/// quote-aware shell (unlike Claude Code / Gemini, which go through
+/// `settings.json` + a shell): a leading `"` becomes part of the program path,
+/// the binary isn't found, and Codex reports `hook exited with code 1`. The
+/// sibling `agent-tools` installer emits the same bare shape and works across
+/// all three agents, so we match it. The string always contains [`HOOK_MARKER`].
 pub fn installed_command(agent: &str) -> String {
     let exe = std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_else(default_program_name);
-    format!("\"{exe}\" hook --agent {agent}")
+    format!("{exe} hook --agent {agent}")
 }
 
 /// Bare program name used when [`std::env::current_exe`] can't resolve the
@@ -93,15 +97,17 @@ mod tests {
     }
 
     #[test]
-    fn installed_command_quotes_executable_path() {
+    fn installed_command_emits_bare_unquoted_executable() {
         let cmd = installed_command("gemini");
-        // The executable path is the first token and must be double-quoted so
-        // paths with spaces survive a shell.
-        assert!(cmd.starts_with('"'), "exe path not quoted: {cmd:?}");
-        // Closing quote precedes the ` hook --agent` tail.
+        // The exe path must NOT be wrapped in double quotes: Codex's Windows
+        // hook launcher takes `command` literally (no quote-aware shell), so a
+        // leading `"` breaks process spawn (exit 1). Mirrors agent-tools.
+        assert!(!cmd.starts_with('"'), "exe path must be unquoted: {cmd:?}");
+        assert!(!cmd.contains('"'), "no quotes anywhere: {cmd:?}");
+        // The ` hook --agent` tail follows the bare path directly.
         assert!(
-            cmd.contains("\" hook --agent gemini"),
-            "closing quote missing: {cmd:?}"
+            cmd.contains(" hook --agent gemini"),
+            "wrong tail: {cmd:?}"
         );
     }
 
