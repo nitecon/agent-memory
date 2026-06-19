@@ -38,38 +38,19 @@ pub const HOOK_MARKER: &str = "hook --agent";
 pub const LEGACY_SCRIPT_MARKER: &str = "memory-inject";
 
 /// Build the command string a config writer embeds for `agent`, e.g.
-/// (unix) `/opt/agentic/bin/memory hook --agent codex` or
-/// (windows) `C:\Users\me\.agentic\bin\memory.exe hook --agent codex`.
+/// `memory hook --agent codex`.
 ///
-/// The executable path is resolved via [`std::env::current_exe`] so the
-/// installed command points at the exact binary the user ran `setup` with. On
-/// failure (rare — e.g. the binary was unlinked), we fall back to the bare
-/// program name on `PATH` (`memory` / `memory.exe`).
-///
-/// The exe path is emitted BARE — not wrapped in double quotes. Codex's
-/// per-turn hook launcher on Windows does not run `command` through a
-/// quote-aware shell (unlike Claude Code / Gemini, which go through
-/// `settings.json` + a shell): a leading `"` becomes part of the program path,
-/// the binary isn't found, and Codex reports `hook exited with code 1`. The
-/// sibling `agent-tools` installer emits the same bare shape and works across
-/// all three agents, so we match it. The string always contains [`HOOK_MARKER`].
+/// The command is the bare program name `memory` — NOT an absolute path. The
+/// agent hooks run their `command` through a shell (on Windows that is
+/// git-bash, `/usr/bin/bash -c`), and bash treats the backslashes in a Windows
+/// path as escape characters: `C:\Users\me\.agentic\bin\memory.exe` collapses
+/// to `C:Usersme.agenticbinmemory.exe` → `command not found`. A bare name is
+/// resolved via `PATH` by every shell on every platform, sidestepping the
+/// quoting/escaping minefield entirely. If `memory` isn't on `PATH` the user
+/// gets a clear `command not found`, which is the right signal anyway. The
+/// string always contains [`HOOK_MARKER`].
 pub fn installed_command(agent: &str) -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(default_program_name);
-    format!("{exe} hook --agent {agent}")
-}
-
-/// Bare program name used when [`std::env::current_exe`] can't resolve the
-/// running binary: `memory.exe` on Windows, `memory` elsewhere. Relies on the
-/// binary being discoverable on `PATH`.
-fn default_program_name() -> String {
-    if cfg!(windows) {
-        "memory.exe".to_string()
-    } else {
-        "memory".to_string()
-    }
+    format!("memory hook --agent {agent}")
 }
 
 /// Absolute path of a bridge script left by an OLD script-based install:
@@ -97,18 +78,16 @@ mod tests {
     }
 
     #[test]
-    fn installed_command_emits_bare_unquoted_executable() {
+    fn installed_command_is_bare_program_name_no_path() {
         let cmd = installed_command("gemini");
-        // The exe path must NOT be wrapped in double quotes: Codex's Windows
-        // hook launcher takes `command` literally (no quote-aware shell), so a
-        // leading `"` breaks process spawn (exit 1). Mirrors agent-tools.
-        assert!(!cmd.starts_with('"'), "exe path must be unquoted: {cmd:?}");
-        assert!(!cmd.contains('"'), "no quotes anywhere: {cmd:?}");
-        // The ` hook --agent` tail follows the bare path directly.
-        assert!(
-            cmd.contains(" hook --agent gemini"),
-            "wrong tail: {cmd:?}"
-        );
+        // MUST be the bare `memory` program name — no absolute path, no quotes.
+        // A Windows path's backslashes get eaten by git-bash (`\U` -> `U`), so
+        // any path at all breaks the hook on Windows; a bare name resolves via
+        // PATH on every shell.
+        assert_eq!(cmd, "memory hook --agent gemini", "got: {cmd:?}");
+        assert!(!cmd.contains('"'), "no quotes: {cmd:?}");
+        assert!(!cmd.contains('/'), "no path separator: {cmd:?}");
+        assert!(!cmd.contains('\\'), "no path separator: {cmd:?}");
     }
 
     #[test]
