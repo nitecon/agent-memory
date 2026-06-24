@@ -1587,19 +1587,45 @@ fn build_push_candidates(
     project: &str,
 ) -> Result<Vec<PushCandidate>, MemoryError> {
     let memories = queries::list_memories_by_project(conn, Some(project))?;
-    let mut candidates = Vec::new();
+    let mut memory_syncs = Vec::new();
+    let mut synced_by_hash: HashMap<String, MemoryGatewaySync> = HashMap::new();
     for memory in memories {
         let sync = queries::get_memory_gateway_sync(conn, &memory.id)?;
+        if let Some(record) = sync.as_ref() {
+            if !record.tombstone_deleted {
+                if let Some(hash) = sync_content_hash(record) {
+                    synced_by_hash
+                        .entry(hash.to_string())
+                        .or_insert_with(|| record.clone());
+                }
+            }
+        }
+        memory_syncs.push((memory, sync));
+    }
+
+    let mut candidates = Vec::new();
+    for (memory, sync) in memory_syncs {
         let gateway_memory = gateway_memory_from_local(&memory, project, sync.as_ref())?;
-        let action = match sync.as_ref() {
-            None => "create",
-            Some(record)
-                if record.last_pushed_content_hash.as_deref()
-                    == Some(gateway_memory.content_hash.as_str()) =>
-            {
+        let duplicate_sync = if sync.is_none() {
+            synced_by_hash.get(&gateway_memory.content_hash)
+        } else {
+            None
+        };
+        let action = match (sync.as_ref(), duplicate_sync) {
+            (Some(record), _) if sync_record_matches_hash(record, &gateway_memory.content_hash) => {
                 "skipped"
             }
-            Some(_) => "update",
+            (Some(_), _) => "update",
+            (None, Some(record)) => {
+                let gateway_memory = gateway_memory_from_local(&memory, project, Some(record))?;
+                candidates.push(PushCandidate {
+                    local_memory_id: memory.id,
+                    gateway_memory,
+                    action: "skipped",
+                });
+                continue;
+            }
+            (None, None) => "create",
         };
         candidates.push(PushCandidate {
             local_memory_id: memory.id,
@@ -1608,6 +1634,18 @@ fn build_push_candidates(
         });
     }
     Ok(candidates)
+}
+
+fn sync_content_hash(record: &MemoryGatewaySync) -> Option<&str> {
+    record
+        .last_pushed_content_hash
+        .as_deref()
+        .or(record.last_pulled_content_hash.as_deref())
+}
+
+fn sync_record_matches_hash(record: &MemoryGatewaySync, content_hash: &str) -> bool {
+    record.last_pushed_content_hash.as_deref() == Some(content_hash)
+        || record.last_pulled_content_hash.as_deref() == Some(content_hash)
 }
 
 fn gateway_memory_from_local(
@@ -1694,6 +1732,24 @@ fn apply_push_response(
             .content_hash
             .clone()
             .or_else(|| hashes_by_local_id.get(local_memory_id).cloned());
+
+        if let Some(existing) =
+            queries::get_memory_gateway_sync_by_gateway_id(conn, project, gateway_memory_id)?
+        {
+            if existing.local_memory_id != local_memory_id {
+                let existing_matches = content_hash
+                    .as_deref()
+                    .map(|hash| sync_record_matches_hash(&existing, hash))
+                    .unwrap_or(false);
+                if matches!(result.action, PushMemoryAction::Linked) || existing_matches {
+                    continue;
+                }
+                return Err(MemoryError::Config(format!(
+                    "gateway push response mapped local memory {local_memory_id} to gateway memory {gateway_memory_id}, but that gateway memory is already linked to local memory {}",
+                    existing.local_memory_id
+                )));
+            }
+        }
 
         queries::upsert_memory_gateway_sync(
             conn,
@@ -3140,6 +3196,65 @@ mod tests {
     }
 
     #[test]
+    fn push_candidates_skip_unsynced_exact_duplicate_of_synced_record() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let first = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000013",
+            "same project memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let second = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000014",
+            "same project memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let hash = local_memory_hash(&first);
+
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: first.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-duplicate".to_string(),
+                last_seen_server_revision: 9,
+                last_pushed_content_hash: Some(hash.clone()),
+                last_pulled_content_hash: None,
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        let first_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.local_memory_id == first.id)
+            .unwrap();
+        let second_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.local_memory_id == second.id)
+            .unwrap();
+
+        assert_eq!(first_candidate.action, "skipped");
+        assert_eq!(second_candidate.action, "skipped");
+        assert_eq!(
+            second_candidate.gateway_memory.gateway_memory_id.as_deref(),
+            Some("gw-duplicate")
+        );
+        assert_eq!(
+            second_candidate.gateway_memory.base_server_revision,
+            Some(9)
+        );
+        assert_eq!(second_candidate.gateway_memory.content_hash, hash);
+    }
+
+    #[test]
     fn local_gateway_projects_include_global_and_exclude_unscoped() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         crate::db::run_migrations(&conn).expect("migrate");
@@ -3287,6 +3402,70 @@ mod tests {
         assert_eq!(remaining_pending.len(), 1);
         assert_eq!(remaining_pending[0].local_memory_id, third.id);
         assert_eq!(remaining_pending[0].action, "create");
+    }
+
+    #[test]
+    fn push_apply_ignores_linked_duplicate_already_mapped_to_same_gateway_id() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let first = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000104",
+            "same pushed memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let second = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000105",
+            "same pushed memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let hash = local_memory_hash(&first);
+
+        queries::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: first.id.clone(),
+                project: "agent-memory".to_string(),
+                gateway_memory_id: "gw-duplicate".to_string(),
+                last_seen_server_revision: 9,
+                last_pushed_content_hash: Some(hash.clone()),
+                last_pulled_content_hash: None,
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        let response = PushMemoriesResponse {
+            project: "agent-memory".to_string(),
+            server_revision: Some(10),
+            results: vec![PushMemoryResult {
+                local_memory_id: Some(second.id.clone()),
+                client_id: None,
+                gateway_memory_id: Some("gw-duplicate".to_string()),
+                server_revision: Some(10),
+                action: PushMemoryAction::Linked,
+                content_hash: Some(hash),
+                conflict: None,
+                error: None,
+                errors: Vec::new(),
+            }],
+        };
+        let hashes = HashMap::new();
+
+        apply_push_response(&conn, "agent-memory", &response, &hashes).unwrap();
+
+        let first_sync = queries::get_memory_gateway_sync(&conn, &first.id)
+            .unwrap()
+            .expect("first sync row");
+        assert_eq!(first_sync.gateway_memory_id, "gw-duplicate");
+        assert!(queries::get_memory_gateway_sync(&conn, &second.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
