@@ -35,6 +35,7 @@ pub mod prompt;
 
 use std::path::Path;
 
+use agent_memory::config::GatewayConfig;
 use agent_memory::db::models::Memory;
 use agent_memory::db::queries as q;
 use agent_memory::embedding::embed_text;
@@ -97,6 +98,10 @@ pub struct DreamConfig<'a> {
     /// retained so existing automation keeps parsing. Ignored by the
     /// v1.5.0 orchestrator.
     pub batch_size_override: usize,
+    /// Optional gateway configuration for direct update/tombstone writes.
+    /// Tests default this off; the production CLI passes the loaded memory
+    /// config so dream mutations stay in sync with the gateway when enabled.
+    pub gateway_config: Option<&'a GatewayConfig>,
 }
 
 impl<'a> DreamConfig<'a> {
@@ -111,6 +116,7 @@ impl<'a> DreamConfig<'a> {
             cosine_threshold: dedup::DEFAULT_COSINE_THRESHOLD,
             full: false,
             batch_size_override: 0,
+            gateway_config: None,
         }
     }
 }
@@ -352,6 +358,7 @@ fn run_stage_0_project_review(
         candidates.clone(),
         cfg.model_name,
         cfg.embedding_cache_dir,
+        cfg.gateway_config,
         apply,
     ) {
         Ok(outcome) => {
@@ -443,8 +450,34 @@ fn run_stage_a_dedup(
             dedup::DedupDecision::Distinct => survivors.push(mem.clone()),
             _ => {
                 if cfg.mode == DreamMode::Apply {
+                    if let Some(gateway_config) = cfg.gateway_config {
+                        if let Some(older) = dedup_superseded_memory(mem, &decision) {
+                            if let Err(e) =
+                                agent_memory::gateway_sync::tombstone_memory_before_local_removal(
+                                    conn,
+                                    gateway_config,
+                                    &older,
+                                    "memory-dream dedup superseded memory",
+                                )
+                            {
+                                stats.failed += 1;
+                                tracing::warn!(id = %older.id, error = %e,
+                                    "stage A gateway tombstone failed; keeping memory");
+                                survivors.push(mem.clone());
+                                continue;
+                            }
+                        }
+                    }
                     match dedup::apply_policy(conn, mem, &decision) {
                         Ok(Some((older, newer))) => {
+                            if let Err(e) = q::prepare_memory_gateway_sync_for_delete(conn, &older)
+                            {
+                                stats.failed += 1;
+                                tracing::warn!(id = %older, error = %e,
+                                    "stage A gateway sync cleanup failed");
+                                survivors.push(mem.clone());
+                                continue;
+                            }
                             stats.superseded += 1;
                             println!(
                                 "{}",
@@ -492,6 +525,19 @@ fn run_stage_a_dedup(
     survivors
 }
 
+fn dedup_superseded_memory(source: &Memory, decision: &dedup::DedupDecision<'_>) -> Option<Memory> {
+    let candidate = match decision {
+        dedup::DedupDecision::ExactMatch(candidate) => *candidate,
+        dedup::DedupDecision::NearMatch { candidate, .. } => *candidate,
+        dedup::DedupDecision::Distinct => return None,
+    };
+    if candidate.created_at <= source.created_at {
+        Some(candidate.clone())
+    } else {
+        Some(source.clone())
+    }
+}
+
 /// Stage B — per-memory condense using the three-way response contract.
 ///
 /// Inference and embedding run with NO sqlite lock held; only the final
@@ -531,6 +577,29 @@ fn run_stage_b_condense(
         }
         Ok(condense::Decision::Forget) => {
             if cfg.mode == DreamMode::Apply {
+                if let Some(gateway_config) = cfg.gateway_config {
+                    if let Err(e) =
+                        agent_memory::gateway_sync::tombstone_memory_before_local_removal(
+                            conn,
+                            gateway_config,
+                            source,
+                            "memory-dream condense forgot memory",
+                        )
+                    {
+                        stats.failed += 1;
+                        println!(
+                            "{}",
+                            render::render_action_result(
+                                "condense_failed",
+                                &[
+                                    ("id", render::short_id(&source.id).to_string()),
+                                    ("reason", format!("gateway tombstone: {e}")),
+                                ]
+                            )
+                        );
+                        return;
+                    }
+                }
                 match agent_memory::db::queries::delete_memory(conn, &source.id) {
                     Ok(_) => {
                         stats.forgot += 1;
@@ -606,6 +675,30 @@ fn run_stage_b_condense(
                     EMBEDDING_MODEL_NAME,
                 ) {
                     Ok(()) => {
+                        if let Some(gateway_config) = cfg.gateway_config {
+                            match q::get_memory_by_id(conn, &source.id).and_then(|memory| {
+                                agent_memory::gateway_sync::push_memory_update_if_configured(
+                                    conn,
+                                    gateway_config,
+                                    &memory,
+                                )
+                            }) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    stats.failed += 1;
+                                    println!(
+                                        "{}",
+                                        render::render_action_result(
+                                            "condense_gateway_sync_failed",
+                                            &[
+                                                ("id", render::short_id(&source.id).to_string()),
+                                                ("reason", format!("{e}")),
+                                            ]
+                                        )
+                                    );
+                                }
+                            }
+                        }
                         stats.rewritten += 1;
                         println!(
                             "{}",

@@ -370,6 +370,72 @@ pub fn get_memory_gateway_sync_by_gateway_id(
     }
 }
 
+pub fn list_memory_gateway_sync_delete_pending_by_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<MemoryGatewaySync>, MemoryError> {
+    validate_gateway_project(project)?;
+    let mut stmt = conn.prepare(
+        "SELECT q.local_memory_id, q.project, q.gateway_memory_id,
+             q.last_seen_server_revision, q.last_pushed_content_hash,
+             q.last_pulled_content_hash, 'delete_pending' AS sync_state,
+             1 AS tombstone_deleted, q.tombstone_at,
+             q.created_at, q.updated_at
+         FROM memory_gateway_delete_queue q
+         LEFT JOIN memories m ON m.id = q.local_memory_id
+         WHERE q.project = ?1
+           AND (m.id IS NULL OR m.superseded_by IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map(params![project], map_memory_gateway_sync_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_memory_gateway_delete_pending(
+    conn: &Connection,
+    local_memory_id: &str,
+) -> Result<Option<MemoryGatewaySync>, MemoryError> {
+    let res = conn.query_row(
+        "SELECT q.local_memory_id, q.project, q.gateway_memory_id,
+             q.last_seen_server_revision, q.last_pushed_content_hash,
+             q.last_pulled_content_hash, 'delete_pending' AS sync_state,
+             1 AS tombstone_deleted, q.tombstone_at,
+             q.created_at, q.updated_at
+         FROM memory_gateway_delete_queue q
+         WHERE q.local_memory_id = ?1",
+        params![local_memory_id],
+        map_memory_gateway_sync_row,
+    );
+    match res {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+pub fn list_memory_gateway_sync_delete_pending_projects(
+    conn: &Connection,
+) -> Result<Vec<String>, MemoryError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT q.project
+         FROM memory_gateway_delete_queue q
+         LEFT JOIN memories m ON m.id = q.local_memory_id
+         WHERE q.project IS NOT NULL
+           AND TRIM(q.project) <> ''
+           AND (m.id IS NULL OR m.superseded_by IS NOT NULL)
+         ORDER BY q.project",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub fn upsert_memory_gateway_sync(
     conn: &Connection,
     record: &MemoryGatewaySyncUpsert,
@@ -407,6 +473,7 @@ pub fn upsert_memory_gateway_sync(
             now,
         ],
     )?;
+    clear_memory_gateway_delete_pending(conn, &record.local_memory_id)?;
 
     get_memory_gateway_sync(conn, &record.local_memory_id)?.ok_or_else(|| {
         MemoryError::NotFound(format!(
@@ -416,6 +483,60 @@ pub fn upsert_memory_gateway_sync(
     })
 }
 
+pub fn prepare_memory_gateway_sync_for_delete(
+    conn: &Connection,
+    local_memory_id: &str,
+) -> Result<(), MemoryError> {
+    let Some(sync) = get_memory_gateway_sync(conn, local_memory_id)? else {
+        return Ok(());
+    };
+
+    if sync.tombstone_deleted && sync.sync_state != "delete_pending" {
+        clear_memory_gateway_sync(conn, local_memory_id)?;
+        clear_memory_gateway_delete_pending(conn, local_memory_id)?;
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let tombstone_at = sync.tombstone_at.clone().unwrap_or_else(|| now.clone());
+    conn.execute(
+        "INSERT INTO memory_gateway_delete_queue (
+             local_memory_id, project, gateway_memory_id,
+             last_seen_server_revision, last_pushed_content_hash,
+             last_pulled_content_hash, tombstone_at, created_at, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(local_memory_id) DO UPDATE SET
+             project = excluded.project,
+             gateway_memory_id = excluded.gateway_memory_id,
+             last_seen_server_revision = excluded.last_seen_server_revision,
+             last_pushed_content_hash = excluded.last_pushed_content_hash,
+             last_pulled_content_hash = excluded.last_pulled_content_hash,
+             tombstone_at = excluded.tombstone_at,
+             updated_at = excluded.updated_at",
+        params![
+            sync.local_memory_id,
+            sync.project,
+            sync.gateway_memory_id,
+            sync.last_seen_server_revision,
+            sync.last_pushed_content_hash,
+            sync.last_pulled_content_hash,
+            tombstone_at,
+            now,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE memory_gateway_sync
+         SET sync_state = 'delete_pending',
+             tombstone_deleted = 1,
+             tombstone_at = COALESCE(tombstone_at, ?1),
+             updated_at = ?1
+         WHERE local_memory_id = ?2",
+        params![now, local_memory_id],
+    )?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn clear_memory_gateway_sync(
     conn: &Connection,
@@ -423,6 +544,17 @@ pub fn clear_memory_gateway_sync(
 ) -> Result<bool, MemoryError> {
     let changed = conn.execute(
         "DELETE FROM memory_gateway_sync WHERE local_memory_id = ?1",
+        params![local_memory_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn clear_memory_gateway_delete_pending(
+    conn: &Connection,
+    local_memory_id: &str,
+) -> Result<bool, MemoryError> {
+    let changed = conn.execute(
+        "DELETE FROM memory_gateway_delete_queue WHERE local_memory_id = ?1",
         params![local_memory_id],
     )?;
     Ok(changed > 0)
@@ -624,6 +756,7 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>, 
 }
 
 pub fn delete_memory(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
+    prepare_memory_gateway_sync_for_delete(conn, id)?;
     let changed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
     Ok(changed > 0)
 }
@@ -822,11 +955,9 @@ pub fn prune_memories(
     }
 
     if !dry_run {
-        conn.execute(
-            "DELETE FROM memories WHERE updated_at < ?1 AND access_count <= ?2
-             AND superseded_by IS NULL",
-            params![cutoff_str, min_access_count],
-        )?;
+        for memory in &to_prune {
+            delete_memory(conn, &memory.id)?;
+        }
     }
 
     Ok(to_prune)
@@ -1729,6 +1860,68 @@ mod resolve_id_tests {
             "clearing sync metadata must not delete memory"
         );
         assert!(!clear_memory_gateway_sync(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn delete_memory_marks_gateway_sync_delete_pending_before_removing_row() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: id.to_string(),
+                project: "test".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 7,
+                last_pushed_content_hash: Some("sha256:pushed".to_string()),
+                last_pulled_content_hash: None,
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+
+        assert!(delete_memory(&conn, id).unwrap());
+
+        assert!(get_memory_by_id(&conn, id).is_err());
+        assert!(get_memory_gateway_sync(&conn, id).unwrap().is_none());
+        let sync = get_memory_gateway_delete_pending(&conn, id)
+            .unwrap()
+            .expect("delete-pending queue row");
+        assert_eq!(sync.gateway_memory_id, "gw-1");
+        assert_eq!(sync.last_seen_server_revision, 7);
+        assert_eq!(sync.sync_state, "delete_pending");
+        assert!(sync.tombstone_deleted);
+        assert!(sync.tombstone_at.is_some());
+    }
+
+    #[test]
+    fn delete_memory_clears_sync_after_gateway_tombstone_was_recorded() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: id.to_string(),
+                project: "test".to_string(),
+                gateway_memory_id: "gw-1".to_string(),
+                last_seen_server_revision: 8,
+                last_pushed_content_hash: Some("sha256:pushed".to_string()),
+                last_pulled_content_hash: None,
+                sync_state: "tombstoned".to_string(),
+                tombstone_deleted: true,
+                tombstone_at: Some("2026-07-02T00:00:00Z".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(delete_memory(&conn, id).unwrap());
+
+        assert!(get_memory_by_id(&conn, id).is_err());
+        assert!(get_memory_gateway_sync(&conn, id).unwrap().is_none());
     }
 
     #[test]

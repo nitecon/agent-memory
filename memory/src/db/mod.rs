@@ -294,6 +294,36 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         )?;
     }
 
+    if version < 8 {
+        // Schema v8 — local delete queue for gateway tombstones.
+        //
+        // `memory_gateway_sync` intentionally cascades with `memories`, which
+        // is right for normal metadata but wrong for "deleted locally, still
+        // needs gateway tombstone" reconciliation. This queue is not
+        // foreign-keyed to `memories` so `memory push --all` can still discover
+        // gateway records that vanished locally before a successful push.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_gateway_delete_queue (
+                 local_memory_id TEXT PRIMARY KEY NOT NULL,
+                 project TEXT NOT NULL,
+                 gateway_memory_id TEXT NOT NULL,
+                 last_seen_server_revision INTEGER NOT NULL,
+                 last_pushed_content_hash TEXT,
+                 last_pulled_content_hash TEXT,
+                 tombstone_at TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 UNIQUE(project, gateway_memory_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_delete_queue_project
+                 ON memory_gateway_delete_queue(project);
+             CREATE INDEX IF NOT EXISTS idx_memory_gateway_delete_queue_gateway_id
+                 ON memory_gateway_delete_queue(project, gateway_memory_id);
+
+             INSERT OR IGNORE INTO schema_version (version) VALUES (8);",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -348,7 +378,7 @@ mod migration_tests {
         )
         .expect("seed v2 db");
 
-        // Apply migrations — should run v3, v4, v5, v6, and v7 steps in sequence.
+        // Apply migrations — should run every step after v2 in sequence.
         run_migrations(&conn).expect("migrate to latest");
 
         // Schema version advanced to latest.
@@ -357,7 +387,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -400,7 +430,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
     }
 
     #[test]
@@ -465,7 +495,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -544,7 +574,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
 
         let existing: String = conn
             .query_row(
@@ -556,10 +586,10 @@ mod migration_tests {
         assert_eq!(existing, "body");
     }
 
-    /// v6/v7 migrations from a v5 fixture DB must add gateway exchange
+    /// v6+ migrations from a v5 fixture DB must add gateway exchange
     /// metadata tables without disturbing WorkingContext or durable memory rows.
     #[test]
-    fn v5_database_upgrades_to_v7_creating_gateway_sync_tables() {
+    fn v5_database_upgrades_to_latest_creating_gateway_sync_tables() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
 
         conn.execute_batch(
@@ -607,7 +637,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
 
         let sync_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
@@ -624,6 +654,15 @@ mod migration_tests {
             )
             .expect("query project_gateway_sync_state");
         assert_eq!(project_sync_count, 0);
+
+        let delete_queue_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_gateway_delete_queue",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query memory_gateway_delete_queue");
+        assert_eq!(delete_queue_count, 0);
 
         let handoff: String = conn
             .query_row(
@@ -645,7 +684,7 @@ mod migration_tests {
     }
 
     #[test]
-    fn v6_database_upgrades_to_v7_allowing_global_gateway_sync() {
+    fn v6_database_upgrades_to_latest_allowing_global_gateway_sync() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
 
         conn.execute_batch(
@@ -700,7 +739,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 7);
+        assert_eq!(max_v, 8);
 
         conn.execute(
             "INSERT INTO memory_gateway_sync (

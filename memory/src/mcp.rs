@@ -354,17 +354,31 @@ impl MemoryServer {
 
         if let Some(id) = args.id {
             match queries::resolve_id_prefix(&conn, &id) {
-                Ok(ResolvedId::Exact(full_id)) => match queries::delete_memory(&conn, &full_id) {
-                    Ok(true) => render::render_action_result(
-                        "forgot",
-                        &[("id", render::short_id(&full_id).to_string())],
-                    ),
-                    Ok(false) => render::render_action_result(
-                        "not_found",
-                        &[("id", render::short_id(&full_id).to_string())],
-                    ),
-                    Err(e) => Self::err_xml(e),
-                },
+                Ok(ResolvedId::Exact(full_id)) => {
+                    let memory = match queries::get_memory_by_id(&conn, &full_id) {
+                        Ok(memory) => memory,
+                        Err(e) => return Self::err_xml(e),
+                    };
+                    if let Err(e) = crate::gateway_sync::tombstone_memory_before_local_removal(
+                        &conn,
+                        &self.config.gateway,
+                        &memory,
+                        "memory forgotten locally",
+                    ) {
+                        return Self::err_xml(e);
+                    }
+                    match queries::delete_memory(&conn, &full_id) {
+                        Ok(true) => render::render_action_result(
+                            "forgot",
+                            &[("id", render::short_id(&full_id).to_string())],
+                        ),
+                        Ok(false) => render::render_action_result(
+                            "not_found",
+                            &[("id", render::short_id(&full_id).to_string())],
+                        ),
+                        Err(e) => Self::err_xml(e),
+                    }
+                }
                 Ok(ResolvedId::Ambiguous(cands)) => render::render_ambiguous(&id, &cands),
                 Ok(ResolvedId::NotFound) => {
                     render::render_action_result("not_found", &[("id", id)])
@@ -385,6 +399,14 @@ impl MemoryServer {
 
             let mut deleted = 0usize;
             for r in &results {
+                if let Err(e) = crate::gateway_sync::tombstone_memory_before_local_removal(
+                    &conn,
+                    &self.config.gateway,
+                    &r.memory,
+                    "memory forgotten locally",
+                ) {
+                    return Self::err_xml(e);
+                }
                 if let Ok(true) = queries::delete_memory(&conn, &r.memory.id) {
                     deleted += 1;
                 }

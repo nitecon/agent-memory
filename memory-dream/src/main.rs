@@ -297,6 +297,7 @@ fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Re
     // fold into it here so downstream code only needs one code path.
     cfg.full = cli.full || cli.refresh;
     cfg.batch_size_override = cli.batch_size;
+    cfg.gateway_config = Some(&config.gateway);
 
     let summary = memory_dream::dream::run(&mut conn, inference.as_ref(), &cfg)
         .map_err(|e| anyhow::anyhow!("dream pass failed: {e}"))?;

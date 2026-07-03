@@ -2,6 +2,7 @@ pub mod config;
 pub mod db;
 pub mod embedding;
 pub mod error;
+pub mod gateway_sync;
 pub mod project;
 pub mod render;
 pub mod search;

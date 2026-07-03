@@ -43,6 +43,13 @@ content:
         - Leave AGENT_MEMORY_GATEWAY_AUTO_SYNC unset or true to use the default-on behavior when URL/API key exist.
         - Run memory store from a project directory; project-scoped stores push pending local memories and then pull remote memories.
         - If auto-sync emits a retry hint, the local store succeeded; use memory push or memory pull manually to retry gateway exchange.
+    - name: Mutate synced memories
+      steps:
+        - Leave AGENT_MEMORY_GATEWAY_AUTO_SYNC unset or true to make memory update and memory forget write directly to the gateway when URL/API key exist.
+        - memory update <id> --content ... rewrites the local row first, then pushes that single updated memory to the gateway; on gateway failure the local update remains and memory push is the retry surface.
+        - memory forget --id or --query pushes a gateway tombstone before deleting a linked local row; if the tombstone fails, the local row is kept so the delete can be retried safely.
+        - If a linked row is deleted locally without a successful direct gateway tombstone, memory records a pending delete queue item so the next memory push or memory push --all can tombstone the gateway record.
+        - memory-dream uses the same direct gateway write helpers for condense rewrites, forget/drop decisions, and superseded memories when gateway auto-sync is enabled.
     - name: Clear a completed handoff
       steps:
         - Run memory working clear when the project thread completes or the user directs cleanup.
@@ -52,9 +59,9 @@ content:
         - Configure the shared gateway with memory setup gateway or agent-tools setup gateway.
         - Environment overrides also work via AGENT_MEMORY_GATEWAY_*, AGENT_GATEWAY_*, or GATEWAY_*.
         - Run memory push status to inspect local current-project memories that would be sent; this status command does not contact the gateway.
-        - Run memory push --all status to inspect all local durable-memory project idents that would be sent, including __global__; this status command does not contact the gateway.
-        - Run memory push to POST pending create/update records for the current project.
-        - Run memory push --all to POST pending create/update records for every local durable-memory project ident, including __global__.
+        - Run memory push --all status to inspect all local durable-memory project idents that would be sent, including __global__ and projects that only have pending gateway deletes; this status command does not contact the gateway.
+        - Run memory push to POST pending create/update/delete records for the current project.
+        - Run memory push --all to POST pending create/update/delete records for every local durable-memory project ident or pending-delete project ident, including __global__.
         - Keep host, OS, agent, and client-origin metadata in GatewayMemory.provenance, not in normal memory tags.
         - Resolve any conflict results reported by the gateway before expecting the local sync metadata to advance.
     - name: Pull durable memories from the gateway
@@ -141,7 +148,7 @@ content:
             - --no-project-boost
         output: Optional <working_context present="true"> block, grouped memory sections, hints, and usage.
       - name: memory push status
-        purpose: Show durable memories that would be created or updated on the gateway for the current project, or for every local durable-memory project ident when --all is set.
+        purpose: Show durable memories that would be created, updated, or deleted on the gateway for the current project, or for every local durable-memory project ident when --all is set.
         args:
           optional:
             - --all
@@ -149,7 +156,7 @@ content:
         behavior:
           - Local read-only status; does not require gateway configuration and does not write sync metadata.
           - Scoped mode excludes the reserved __global__ project, unscoped memories, and WorkingContext state.
-          - --all mode includes every local durable-memory project ident, including __global__; WorkingContext and unscoped memories remain excluded.
+          - --all mode includes every local durable-memory project ident, including __global__, plus projects with pending gateway deletes; WorkingContext and unscoped memories remain excluded.
       - name: memory push
         purpose: Send pending durable memories to the gateway as arrays of memory structs for the current project, or for every local durable-memory project ident when --all is set.
         args:
@@ -158,8 +165,10 @@ content:
             - --batch-size
         output: Light-XML gateway_push section followed by push_result entries and push_complete when nothing is pending; --all mode is grouped or repeated by project ident.
         behavior:
-          - Posts only create/update candidates; skipped rows are not sent.
-          - Records local sync metadata only for created, updated, or linked gateway results.
+          - Posts create/update candidates from live local rows and delete candidates from memory_gateway_delete_queue; skipped rows are not sent.
+          - Direct mutation helpers can also send one-record tombstone pushes for linked rows being forgotten or superseded.
+          - Successful deleted, tombstoned, or gateway-updated tombstone results clear the pending delete queue and any remaining local sync metadata.
+          - Records local sync metadata only for created, updated, or linked gateway results on live rows.
           - Leaves local sync metadata unchanged for conflict or rejected gateway results.
           - Scoped mode requires a non-global current project ident and configured gateway URL/API key.
           - --all mode walks every local durable-memory project ident, including __global__, and does not require a cwd-derived current project.
@@ -198,6 +207,11 @@ content:
         purpose: List recent memories, optionally by project or memory type.
       - name: memory forget
         purpose: Delete memories by ID or by top search matches.
+        behavior:
+          - If gateway auto-sync is enabled and the memory has gateway sync metadata, pushes a tombstone for the linked gateway memory before deleting locally.
+          - If that tombstone push conflicts, is rejected, or fails transport/config validation, the local row is kept so a retry still has gateway ID and base revision metadata.
+          - Unlinked or unscoped memories delete locally without contacting the gateway.
+          - Auto-sync-disabled linked memories delete locally without contacting the gateway, but leave a pending gateway delete for a later manual memory push.
       - name: memory prune
         purpose: Delete stale/low-access memories, with dry-run support.
       - name: memory move
@@ -217,6 +231,10 @@ content:
           - Lists durable memory projects only; WorkingContext-only projects are omitted.
       - name: memory update
         purpose: With no ID, run the self-updater; with ID plus --content, re-author a memory.
+        behavior:
+          - The content-update form rewrites and re-embeds the local row first.
+          - If gateway auto-sync is enabled and the memory has a project/global scope, pushes that single updated memory to the gateway immediately.
+          - Gateway push failure is rendered as a retry hint and does not roll back the local update; memory push remains the manual retry surface.
       - name: memory setup
         purpose: Configure the shared gateway connection and install/remove injected agent rules and bundled skill guidance.
       - name: memory working get
@@ -319,7 +337,7 @@ content:
           required:
             - memories
           fields:
-            route_project: Current project ident in /v1/projects/{project}; must not be __global__.
+            route_project: Current project ident in /v1/projects/{project}; --all mode may also send __global__.
             memories: Array of GatewayMemory structs. Each item serializes project as project_ident for gateway validation.
         PushMemoriesResponse:
           required:
@@ -329,11 +347,11 @@ content:
           fields:
             project_ident: Current project ident.
             server_revision: Project-wide gateway memory revision after the batch.
-            results: Array of per-memory created, updated, linked, conflict, or rejected results.
+            results: Array of per-memory created, updated, linked, deleted/tombstoned, conflict, or rejected results.
         PullMemoriesRequest:
           required: []
           fields:
-            route_project: Current project ident in /v1/projects/{project}; must not be __global__.
+            route_project: Current project ident in /v1/projects/{project}; --all mode may also pull __global__ when discovered by the gateway.
             since_revision: Optional server revision watermark from project_gateway_sync_state.
             known: Optional array of known gateway_memory_id, server_revision, and content_hash values.
             page_size: Optional maximum remote records; CLI defaults to 100.
@@ -371,6 +389,8 @@ content:
             - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
             - content_hash is the gateway-compatible lowercase SHA-256 hex digest of content bytes, with no sha256: prefix.
             - memory serializes created_at and updated_at to the gateway as Unix epoch milliseconds, and accepts either epoch milliseconds or RFC3339 strings on responses.
+            - Direct forget/supersede flows send tombstone.deleted=true with gateway_memory_id and base_gateway_revision before hiding or deleting the local row.
+            - Deferred delete pushes synthesize tombstone.deleted=true from memory_gateway_delete_queue after the local row has been deleted or superseded.
           guidance:
             - tags are content/domain labels only; do not add hostnames, OS names, source machines, or client-origin labels to tags.
             - origin metadata belongs in provenance.

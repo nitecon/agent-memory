@@ -321,6 +321,8 @@ pub enum PushMemoryAction {
     Created,
     Updated,
     Linked,
+    Deleted,
+    Tombstoned,
     Conflict,
     Rejected,
 }

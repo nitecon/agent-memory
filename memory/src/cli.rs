@@ -693,6 +693,13 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             if let Some(id) = id {
                 match queries::resolve_id_prefix(conn, &id)? {
                     ResolvedId::Exact(full_id) => {
+                        let memory = queries::get_memory_by_id(conn, &full_id)?;
+                        crate::gateway_sync::tombstone_memory_before_local_removal(
+                            conn,
+                            &config.gateway,
+                            &memory,
+                            "memory forgotten locally",
+                        )?;
                         let deleted = queries::delete_memory(conn, &full_id)?;
                         let status = if deleted { "forgot" } else { "not_found" };
                         let short = render::short_id(&full_id).to_string();
@@ -716,6 +723,12 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 } else {
                     let mut deleted = 0usize;
                     for r in &results {
+                        crate::gateway_sync::tombstone_memory_before_local_removal(
+                            conn,
+                            &config.gateway,
+                            &r.memory,
+                            "memory forgotten locally",
+                        )?;
                         if queries::delete_memory(conn, &r.memory.id)? {
                             deleted += 1;
                         }
@@ -1212,6 +1225,8 @@ fn run_update_content(
         ],
     )?;
 
+    maybe_auto_push_after_memory_update(conn, config, &full_id);
+
     println!(
         "{}",
         render::render_action_result("updated", &[("id", render::short_id(&full_id).to_string())])
@@ -1275,6 +1290,43 @@ fn maybe_auto_sync_after_store(conn: &Connection, config: &Config, memory: &Memo
             "{}",
             render::render_hint(&format!(
                 "gateway auto-sync skipped after store: {err}. The memory was saved locally; run `memory push` or `memory pull` to retry manually."
+            ))
+        ),
+    }
+}
+
+fn maybe_auto_push_after_memory_update(conn: &Connection, config: &Config, memory_id: &str) {
+    let memory = match queries::get_memory_by_id(conn, memory_id) {
+        Ok(memory) => memory,
+        Err(err) => {
+            println!(
+                "{}",
+                render::render_hint(&format!(
+                    "gateway auto-sync skipped after update: {err}. The memory was updated locally; run `memory push` to retry manually."
+                ))
+            );
+            return;
+        }
+    };
+
+    match crate::gateway_sync::push_memory_update_if_configured(conn, &config.gateway, &memory) {
+        Ok(outcome) if outcome.was_synced() => {
+            println!(
+                "{}",
+                render::render_action_result(
+                    "gateway_auto_sync",
+                    &[
+                        ("operation", "update".to_string()),
+                        ("id", render::short_id(memory_id).to_string()),
+                    ],
+                )
+            );
+        }
+        Ok(_) => {}
+        Err(err) => println!(
+            "{}",
+            render::render_hint(&format!(
+                "gateway auto-sync skipped after update: {err}. The memory was updated locally; run `memory push` to retry manually."
             ))
         ),
     }
@@ -1391,6 +1443,7 @@ fn print_auto_sync_complete(project: &str, push: &AutoPushSummary, pull: &AutoPu
                 ("push_created", push.counts.created.to_string()),
                 ("push_updated", push.counts.updated.to_string()),
                 ("push_linked", push.counts.linked.to_string()),
+                ("push_deleted", push.counts.deleted.to_string()),
                 ("push_conflicts", push.counts.conflicts.to_string()),
                 ("push_rejected", push.counts.rejected.to_string()),
                 ("pull_remote", pull.remote.to_string()),
@@ -1456,6 +1509,7 @@ fn run_push_all(
                 ("created", total.counts.created.to_string()),
                 ("updated", total.counts.updated.to_string()),
                 ("linked", total.counts.linked.to_string()),
+                ("deleted", total.counts.deleted.to_string()),
                 ("conflicts", total.counts.conflicts.to_string()),
                 ("rejected", total.counts.rejected.to_string()),
             ],
@@ -1547,6 +1601,9 @@ fn list_local_gateway_projects(conn: &Connection) -> Result<Vec<String>, MemoryE
         .filter_map(|(project, _)| project)
         .filter(|project| !project.trim().is_empty())
         .collect();
+    projects.extend(queries::list_memory_gateway_sync_delete_pending_projects(
+        conn,
+    )?);
     projects.sort();
     projects.dedup();
     Ok(projects)
@@ -1633,6 +1690,16 @@ fn build_push_candidates(
             action,
         });
     }
+    for sync in queries::list_memory_gateway_sync_delete_pending_by_project(conn, project)? {
+        candidates.push(PushCandidate {
+            local_memory_id: sync.local_memory_id.clone(),
+            gateway_memory: crate::gateway_sync::gateway_tombstone_from_sync(
+                &sync,
+                "memory deleted locally",
+            ),
+            action: "delete",
+        });
+    }
     Ok(candidates)
 }
 
@@ -1712,6 +1779,40 @@ fn apply_push_response(
     hashes_by_local_id: &HashMap<String, String>,
 ) -> Result<(), MemoryError> {
     for result in &response.results {
+        let Some(local_memory_id) = result.local_memory_id.as_deref() else {
+            continue;
+        };
+        let existing_local_sync = queries::get_memory_gateway_sync(conn, local_memory_id)?;
+        let queued_delete = queries::get_memory_gateway_delete_pending(conn, local_memory_id)?;
+        let pending_delete = queued_delete.is_some()
+            || existing_local_sync.as_ref().is_some_and(|record| {
+                record.tombstone_deleted && record.sync_state == "delete_pending"
+            });
+        if matches!(
+            result.action,
+            PushMemoryAction::Deleted | PushMemoryAction::Tombstoned
+        ) {
+            queries::clear_memory_gateway_sync(conn, local_memory_id)?;
+            queries::clear_memory_gateway_delete_pending(conn, local_memory_id)?;
+            continue;
+        }
+        if pending_delete && matches!(result.action, PushMemoryAction::Updated) {
+            queries::clear_memory_gateway_sync(conn, local_memory_id)?;
+            queries::clear_memory_gateway_delete_pending(conn, local_memory_id)?;
+            continue;
+        }
+        if pending_delete
+            && matches!(
+                result.action,
+                PushMemoryAction::Created | PushMemoryAction::Linked
+            )
+        {
+            return Err(MemoryError::Config(format!(
+                "gateway push returned unexpected action {:?} for pending delete {local_memory_id}",
+                result.action
+            )));
+        }
+
         let should_record = matches!(
             result.action,
             PushMemoryAction::Created | PushMemoryAction::Updated | PushMemoryAction::Linked
@@ -1719,9 +1820,6 @@ fn apply_push_response(
         if !should_record {
             continue;
         }
-        let Some(local_memory_id) = result.local_memory_id.as_deref() else {
-            continue;
-        };
         let Some(gateway_memory_id) = result.gateway_memory_id.as_deref() else {
             continue;
         };
@@ -1829,6 +1927,7 @@ struct PushResponseCounts {
     created: usize,
     updated: usize,
     linked: usize,
+    deleted: usize,
     conflicts: usize,
     rejected: usize,
 }
@@ -1839,6 +1938,7 @@ impl PushResponseCounts {
             PushMemoryAction::Created => self.created += 1,
             PushMemoryAction::Updated => self.updated += 1,
             PushMemoryAction::Linked => self.linked += 1,
+            PushMemoryAction::Deleted | PushMemoryAction::Tombstoned => self.deleted += 1,
             PushMemoryAction::Conflict => self.conflicts += 1,
             PushMemoryAction::Rejected => self.rejected += 1,
         }
@@ -1848,6 +1948,7 @@ impl PushResponseCounts {
         self.created += other.created;
         self.updated += other.updated;
         self.linked += other.linked;
+        self.deleted += other.deleted;
         self.conflicts += other.conflicts;
         self.rejected += other.rejected;
     }
@@ -1904,6 +2005,7 @@ fn print_push_complete(project: &str, counts: &PushResponseCounts) {
                 ("created", counts.created.to_string()),
                 ("updated", counts.updated.to_string()),
                 ("linked", counts.linked.to_string()),
+                ("deleted", counts.deleted.to_string()),
                 ("conflicts", counts.conflicts.to_string()),
                 ("rejected", counts.rejected.to_string()),
             ],
@@ -1916,6 +2018,8 @@ fn push_action_label(action: &PushMemoryAction) -> &'static str {
         PushMemoryAction::Created => "created",
         PushMemoryAction::Updated => "updated",
         PushMemoryAction::Linked => "linked",
+        PushMemoryAction::Deleted => "deleted",
+        PushMemoryAction::Tombstoned => "tombstoned",
         PushMemoryAction::Conflict => "conflict",
         PushMemoryAction::Rejected => "rejected",
     }
@@ -3287,6 +3391,63 @@ mod tests {
     }
 
     #[test]
+    fn local_gateway_projects_include_pending_delete_without_live_memory() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000023",
+            "delete-only project memory",
+            vec!["gateway"],
+            "delete-only",
+        );
+        link_cli_test_memory(&conn, &memory, "gw-delete-only", 17);
+
+        queries::delete_memory(&conn, &memory.id).unwrap();
+
+        let projects = list_local_gateway_projects(&conn).unwrap();
+        assert_eq!(projects, vec!["delete-only".to_string()]);
+    }
+
+    #[test]
+    fn push_candidates_include_pending_gateway_delete_after_local_delete() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000024",
+            "locally forgotten memory",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let hash = local_memory_hash(&memory);
+        link_cli_test_memory(&conn, &memory, "gw-forgotten", 23);
+
+        queries::delete_memory(&conn, &memory.id).unwrap();
+
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.local_memory_id, memory.id);
+        assert_eq!(candidate.action, "delete");
+        assert_eq!(
+            candidate.gateway_memory.gateway_memory_id.as_deref(),
+            Some("gw-forgotten")
+        );
+        assert_eq!(candidate.gateway_memory.base_server_revision, Some(23));
+        assert_eq!(candidate.gateway_memory.content_hash, hash);
+        assert_eq!(candidate.gateway_memory.content, "");
+        assert_eq!(
+            candidate
+                .gateway_memory
+                .tombstone
+                .as_ref()
+                .map(|tombstone| tombstone.deleted),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn push_batch_size_validation_respects_gateway_cap() {
         assert_eq!(validate_push_batch_size(1).unwrap(), 1);
         assert_eq!(
@@ -3464,6 +3625,68 @@ mod tests {
             .expect("first sync row");
         assert_eq!(first_sync.gateway_memory_id, "gw-duplicate");
         assert!(queries::get_memory_gateway_sync(&conn, &second.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn push_apply_clears_pending_delete_after_gateway_ack() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+        let tombstoned = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000106",
+            "pending tombstone",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        let updated = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000107",
+            "pending update tombstone",
+            vec!["gateway"],
+            "agent-memory",
+        );
+        link_cli_test_memory(&conn, &tombstoned, "gw-tombstoned", 10);
+        link_cli_test_memory(&conn, &updated, "gw-updated-tombstone", 11);
+        queries::delete_memory(&conn, &tombstoned.id).unwrap();
+        queries::delete_memory(&conn, &updated.id).unwrap();
+
+        let response = PushMemoriesResponse {
+            project: "agent-memory".to_string(),
+            server_revision: Some(12),
+            results: vec![
+                PushMemoryResult {
+                    local_memory_id: Some(tombstoned.id.clone()),
+                    client_id: None,
+                    gateway_memory_id: Some("gw-tombstoned".to_string()),
+                    server_revision: Some(12),
+                    action: PushMemoryAction::Tombstoned,
+                    content_hash: None,
+                    conflict: None,
+                    error: None,
+                    errors: Vec::new(),
+                },
+                PushMemoryResult {
+                    local_memory_id: Some(updated.id.clone()),
+                    client_id: None,
+                    gateway_memory_id: Some("gw-updated-tombstone".to_string()),
+                    server_revision: Some(13),
+                    action: PushMemoryAction::Updated,
+                    content_hash: None,
+                    conflict: None,
+                    error: None,
+                    errors: Vec::new(),
+                },
+            ],
+        };
+
+        apply_push_response(&conn, "agent-memory", &response, &HashMap::new()).unwrap();
+
+        assert!(queries::get_memory_gateway_sync(&conn, &tombstoned.id)
+            .unwrap()
+            .is_none());
+        assert!(queries::get_memory_gateway_sync(&conn, &updated.id)
             .unwrap()
             .is_none());
     }
@@ -3663,6 +3886,29 @@ mod tests {
         memory.id = id.to_string();
         queries::insert_memory(conn, &memory).unwrap();
         memory
+    }
+
+    fn link_cli_test_memory(
+        conn: &Connection,
+        memory: &Memory,
+        gateway_memory_id: &str,
+        server_revision: i64,
+    ) {
+        queries::upsert_memory_gateway_sync(
+            conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: memory.id.clone(),
+                project: memory.project.clone().unwrap(),
+                gateway_memory_id: gateway_memory_id.to_string(),
+                last_seen_server_revision: server_revision,
+                last_pushed_content_hash: Some(local_memory_hash(memory)),
+                last_pulled_content_hash: None,
+                sync_state: "created".to_string(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
     }
 
     fn spawn_auto_sync_gateway() -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {

@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use agent_memory::config::GatewayConfig;
 use agent_memory::db::models::Memory;
 use agent_memory::db::queries as q;
 use agent_memory::embedding::embed_text;
@@ -211,6 +212,7 @@ pub fn run_project(
     candidates: Vec<Memory>,
     model_name: &str,
     embedding_cache_dir: &std::path::Path,
+    gateway_config: Option<&GatewayConfig>,
     apply: bool,
 ) -> Result<ProjectReviewOutcome, ProjectReviewError> {
     let mut stats = ProjectReviewStats::default();
@@ -254,6 +256,7 @@ pub fn run_project(
             decisions,
             model_name,
             embedding_cache_dir,
+            gateway_config,
             apply,
             &mut stats,
             &mut survivors,
@@ -479,6 +482,7 @@ fn apply_decisions(
     decisions: HashMap<String, Decision>,
     model_name: &str,
     embedding_cache_dir: &std::path::Path,
+    gateway_config: Option<&GatewayConfig>,
     apply: bool,
     stats: &mut ProjectReviewStats,
     survivors: &mut Vec<Memory>,
@@ -508,11 +512,59 @@ fn apply_decisions(
         }
     }
 
+    let mut gateway_creates: Vec<Memory> = Vec::new();
+
+    let mut gateway_blocked: HashMap<String, String> = HashMap::new();
+    if apply {
+        for mem in batch {
+            let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
+            let removes_or_hides = match &decision {
+                Decision::Keep => false,
+                Decision::Drop | Decision::MergeInto { .. } => true,
+                Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
+                    !materialize_failed.contains(&mem.id)
+                }
+            };
+            if !removes_or_hides {
+                continue;
+            }
+            let Some(gateway_config) = gateway_config else {
+                continue;
+            };
+            if let Err(e) = agent_memory::gateway_sync::tombstone_memory_before_local_removal(
+                conn,
+                gateway_config,
+                mem,
+                "memory-dream project review removed memory",
+            ) {
+                stats.failed += 1;
+                tracing::warn!(id = %mem.id, error = %e,
+                    "review gateway tombstone failed; keeping source memory alive");
+                gateway_blocked.insert(mem.id.clone(), e.to_string());
+            }
+        }
+    }
+
     // Phase 2 — apply writes inside a short `BEGIN IMMEDIATE` tx.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     for mem in batch {
         let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
+        if let Some(reason) = gateway_blocked.get(&mem.id) {
+            survivors.push(mem.clone());
+            println!(
+                "{}",
+                render::render_action_result(
+                    "review_gateway_sync_failed",
+                    &[
+                        ("id", render::short_id(&mem.id).to_string()),
+                        ("project", project_label.to_string()),
+                        ("reason", reason.clone()),
+                    ]
+                )
+            );
+            continue;
+        }
 
         match decision {
             Decision::Keep => {
@@ -560,6 +612,12 @@ fn apply_decisions(
                         stats.failed += 1;
                         tracing::warn!(id = %mem.id, target = %target_id, error = %e,
                             "review merge failed");
+                        continue;
+                    }
+                    if let Err(e) = q::prepare_memory_gateway_sync_for_delete(&tx, &mem.id) {
+                        stats.failed += 1;
+                        tracing::warn!(id = %mem.id, error = %e,
+                            "review merge gateway sync cleanup failed");
                         continue;
                     }
                 }
@@ -614,6 +672,7 @@ fn apply_decisions(
                         let _ = tx.rollback();
                         return Ok(());
                     }
+                    gateway_creates.push(new_mem.clone());
                 }
                 survivors.push(new_mem.clone());
                 let tag = if apply {
@@ -644,6 +703,30 @@ fn apply_decisions(
 
     if apply {
         tx.commit()?;
+        if let Some(gateway_config) = gateway_config {
+            for mem in &gateway_creates {
+                if let Err(e) = agent_memory::gateway_sync::push_memory_update_if_configured(
+                    conn,
+                    gateway_config,
+                    mem,
+                ) {
+                    stats.failed += 1;
+                    tracing::warn!(id = %mem.id, error = %e,
+                        "review replacement gateway push failed");
+                    println!(
+                        "{}",
+                        render::render_action_result(
+                            "review_gateway_sync_failed",
+                            &[
+                                ("id", render::short_id(&mem.id).to_string()),
+                                ("project", project_label.to_string()),
+                                ("reason", format!("{e}")),
+                            ]
+                        )
+                    );
+                }
+            }
+        }
     } else {
         tx.rollback()?;
     }

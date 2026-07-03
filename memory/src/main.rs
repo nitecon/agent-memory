@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod embedding;
 mod error;
+mod gateway_sync;
 mod hook;
 mod mcp;
 mod project;

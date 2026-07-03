@@ -79,6 +79,7 @@ fn dropped_memories_are_deleted_in_apply_mode() {
         vec![mem],
         "sonnet",
         &tmp_cache(),
+        None,
         true,
     )
     .expect("run_project ok");
@@ -113,6 +114,7 @@ fn dropped_memories_are_not_deleted_in_dry_mode() {
         vec![mem],
         "sonnet",
         &tmp_cache(),
+        None,
         false, // Dry mode.
     )
     .expect("run_project ok");
@@ -159,6 +161,7 @@ fn merged_memory_gets_superseded_by_pointer() {
         vec![loser, winner],
         "sonnet",
         &tmp_cache(),
+        None,
         true,
     )
     .expect("run_project ok");
@@ -182,6 +185,7 @@ fn empty_candidates_exits_cleanly() {
         vec![],
         "sonnet",
         &tmp_cache(),
+        None,
         true,
     )
     .expect("run_project ok on empty input");
@@ -206,6 +210,7 @@ fn malformed_json_response_falls_through_to_all_keep() {
         vec![mem],
         "sonnet",
         &tmp_cache(),
+        None,
         true,
     )
     .expect("run_project ok even on bad response");
@@ -317,6 +322,7 @@ fn version_log_example_surfaces_drop_decision() {
         vec![m1, m2, m3],
         "sonnet",
         &tmp_cache(),
+        None,
         true,
     )
     .expect("run_project ok");
