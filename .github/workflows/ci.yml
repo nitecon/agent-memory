@@ -31,5 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The shell_injection_probe integration test drives the release
+      # binaries end-to-end and fails fast when they are missing.
+      - name: build release binaries (shell-injection probe fixture)
+        run: cargo build --release -p agent-memory -p memory-dream
       - name: cargo test
         run: cargo test --workspace
