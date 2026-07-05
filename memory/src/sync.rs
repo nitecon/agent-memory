@@ -444,6 +444,7 @@ pub struct GatewayMemory {
     #[serde(
         default,
         deserialize_with = "deserialize_optional_tombstone",
+        serialize_with = "serialize_optional_tombstone",
         skip_serializing_if = "Option::is_none"
     )]
     pub tombstone: Option<GatewayMemoryTombstone>,
@@ -602,6 +603,23 @@ where
     }
 }
 
+/// The gateway wire format for `tombstone` is a plain boolean on both push
+/// requests (`MemoryPushItem`) and pull records; `deleted_at`/`reason` are
+/// client-side metadata the gateway never reads, so they must not reach the
+/// wire — the gateway's strict deserializer rejects an object here with a 400.
+fn serialize_optional_tombstone<S>(
+    value: &Option<GatewayMemoryTombstone>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_none(),
+        Some(tombstone) => serializer.serialize_bool(tombstone.deleted),
+    }
+}
+
 fn serialize_optional_timestamp<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -730,6 +748,38 @@ mod tests {
     use reqwest::StatusCode;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn tombstone_serializes_as_wire_boolean_and_round_trips() {
+        let memory = GatewayMemory {
+            project: "agent-memory".to_string(),
+            content: String::new(),
+            memory_type: "project".to_string(),
+            tags: Vec::new(),
+            content_hash: "hash".to_string(),
+            local_memory_id: Some("local-1".to_string()),
+            client_id: None,
+            gateway_memory_id: Some("gw-1".to_string()),
+            base_server_revision: Some(4),
+            server_revision: None,
+            created_at: None,
+            updated_at: None,
+            provenance: None,
+            tombstone: Some(GatewayMemoryTombstone {
+                deleted: true,
+                deleted_at: Some("2026-07-04T00:00:00+00:00".to_string()),
+                reason: Some("forget".to_string()),
+            }),
+        };
+
+        // The gateway's MemoryPushItem declares `tombstone: bool`, so anything
+        // other than a boolean on the wire is rejected with a 400.
+        let value = serde_json::to_value(&memory).unwrap();
+        assert_eq!(value["tombstone"], serde_json::json!(true));
+
+        let round_trip: GatewayMemory = serde_json::from_value(value).unwrap();
+        assert!(round_trip.tombstone.unwrap().deleted);
+    }
 
     #[test]
     fn client_normalizes_endpoint_paths() {

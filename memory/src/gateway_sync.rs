@@ -480,7 +480,7 @@ mod tests {
             let memory = request["memories"].as_array().unwrap().first().unwrap();
             assert_eq!(memory["gateway_memory_id"], json!("gw-delete"));
             assert_eq!(memory["base_gateway_revision"], json!(8));
-            assert_eq!(memory["tombstone"]["deleted"], json!(true));
+            assert_eq!(memory["tombstone"], json!(true));
             json!({
                 "project_ident": "agent-memory",
                 "server_revision": 12,
@@ -510,10 +510,7 @@ mod tests {
         assert_eq!(sync.last_seen_server_revision, 12);
         assert_eq!(sync.sync_state, "tombstoned");
         assert!(sync.tombstone_deleted);
-        assert_eq!(
-            server.join().unwrap()["memories"][0]["tombstone"]["deleted"],
-            true
-        );
+        assert_eq!(server.join().unwrap()["memories"][0]["tombstone"], true);
     }
 
     #[test]

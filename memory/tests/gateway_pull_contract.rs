@@ -109,11 +109,13 @@ fn pull_response_carries_tombstones_without_content_deletion_policy() {
         has_more: false,
     };
 
+    // The gateway wire format for `tombstone` is a plain boolean; the richer
+    // deleted_at/reason metadata stays client-side only.
     let value = serde_json::to_value(&response).unwrap();
-    assert_eq!(value["memories"][0]["tombstone"]["deleted"], true);
+    assert_eq!(value["memories"][0]["tombstone"], true);
     assert_eq!(
-        value["memories"][0]["tombstone"]["reason"],
-        "remote memory deleted"
+        response.memories[0].tombstone.as_ref().unwrap().reason,
+        Some("remote memory deleted".to_string())
     );
 }
 
