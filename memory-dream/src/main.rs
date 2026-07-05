@@ -159,11 +159,7 @@ fn build_progress_renderer() -> memory_dream::model_manager::ProgressFn {
                 let mut map = last_emit.lock().unwrap();
                 let prev = map.get(&file).copied().unwrap_or(0);
                 let byte_delta = bytes_done.saturating_sub(prev);
-                let pct_delta = if bytes_total > 0 {
-                    (byte_delta * 100) / bytes_total
-                } else {
-                    100
-                };
+                let pct_delta = (byte_delta * 100).checked_div(bytes_total).unwrap_or(100);
                 // Emit when BOTH thresholds pass — sparser of the two
                 // wins, so tiny files (<16MiB total) emit on percent
                 // and huge files emit on absolute delta.
@@ -175,11 +171,10 @@ fn build_progress_renderer() -> memory_dream::model_manager::ProgressFn {
                 }
             };
             if should_emit {
-                let pct = if bytes_total > 0 {
-                    (bytes_done * 100 / bytes_total).to_string()
-                } else {
-                    "0".to_string()
-                };
+                let pct = (bytes_done * 100)
+                    .checked_div(bytes_total)
+                    .unwrap_or(0)
+                    .to_string();
                 println!(
                     "{}",
                     render::render_action_result(

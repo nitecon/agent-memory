@@ -179,8 +179,8 @@ mod tests {
         // Simulate fastembed output: sorted descending by score, `index`
         // pointing back to the original doc position. Three input docs.
         let ranked = [
-            (1_usize, 2.0_f32), // doc 1 scored highest
-            (2_usize, 0.0_f32), // doc 2 in the middle
+            (1_usize, 2.0_f32),  // doc 1 scored highest
+            (2_usize, 0.0_f32),  // doc 2 in the middle
             (0_usize, -2.0_f32), // doc 0 scored lowest
         ];
 

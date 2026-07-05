@@ -205,6 +205,7 @@ pub struct ProjectReviewOutcome {
 /// The `embedding_cache_dir` is needed because `supersede_by` and
 /// `extract` both create new content whose embedding must match the rest
 /// of the store for Stage A cosine similarity to remain meaningful.
+#[allow(clippy::too_many_arguments)]
 pub fn run_project(
     conn: &mut Connection,
     inference: &dyn Inference,
@@ -244,7 +245,7 @@ pub fn run_project(
                 tracing::warn!(project = ?project, error = %e,
                     "project review inference failed; treating batch as all-keep");
                 // Keep everything in this batch so Stage B still runs.
-                survivors.extend(batch.into_iter());
+                survivors.extend(batch);
                 continue;
             }
         };

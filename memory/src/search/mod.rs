@@ -418,7 +418,10 @@ mod tests {
             assert!(rerank_enabled(), "expected {v:?} to keep rerank enabled");
         }
         std::env::remove_var("MEMORY_RERANK");
-        assert!(rerank_enabled(), "unset MEMORY_RERANK should keep rerank on");
+        assert!(
+            rerank_enabled(),
+            "unset MEMORY_RERANK should keep rerank on"
+        );
     }
 
     /// Global boost alone (no current-project boost) still elevates global
