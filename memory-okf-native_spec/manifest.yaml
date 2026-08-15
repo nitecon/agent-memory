@@ -1,0 +1,103 @@
+spec_version: 1
+source_doc: ../memory-okf-native.md
+generated_at: 2026-08-15T00:00:00Z
+metadata:
+  title: "OKF-Native Agent Memory"
+  scope: "Make SQLite-backed durable memories canonical OKF concepts with virtual document/bundle handlers, revisions, graph relations, retrieval, Dream, and gateway support."
+phases:
+  - id: phase-1
+    name: "Phase 1 - Contract and Persistence"
+    tasks:
+      - id: T001
+        gateway_task_id: 01a005df-ccac-73c2-a40e-30912ea5c647
+        team: backend
+        title: "Define OKF-native concept model and codec"
+        depends_on: []
+        spec_file: backend/T001-concept-codec.md
+        status: completed
+      - id: T002
+        gateway_task_id: 01a005df-ccd4-7223-9d69-3bc59cad1e13
+        team: backend
+        title: "Add concept, revision, provenance, and graph schema"
+        depends_on: [T001]
+        spec_file: backend/T002-schema-migration.md
+        status: completed
+      - id: T003
+        gateway_task_id: 01a005df-ccf8-7691-b079-67a648f03f4c
+        team: backend
+        title: "Route semantic memory writes through revision-aware persistence"
+        depends_on: [T001, T002]
+        spec_file: backend/T003-revision-persistence.md
+        status: completed
+  - id: phase-2
+    name: "Phase 2 - Virtual OKF Surface"
+    tasks:
+      - id: T004
+        gateway_task_id: 01a005df-cd1f-7a61-b605-d05473498b03
+        team: backend
+        title: "Implement virtual document and bundle handlers"
+        depends_on: [T003]
+        spec_file: backend/T004-virtual-handlers.md
+        status: completed
+      - id: T005
+        gateway_task_id: 01a005df-cd42-75f0-b26c-40da84ecc733
+        team: backend
+        title: "Implement relationships and bounded graph traversal"
+        depends_on: [T003, T004]
+        spec_file: backend/T005-graph.md
+        status: completed
+      - id: T006
+        gateway_task_id: 01a005df-cd66-7e92-8c76-fbdff20feceb
+        team: backend
+        title: "Expose OKF-native CLI and physical interchange"
+        depends_on: [T004, T005]
+        spec_file: backend/T006-cli-interchange.md
+        status: completed
+      - id: T007
+        gateway_task_id: 01a005df-cd8b-76c2-ae2f-75288d44ad65
+        team: backend
+        title: "Expose OKF-native MCP tools and resources"
+        depends_on: [T004, T005]
+        spec_file: backend/T007-mcp.md
+        status: completed
+  - id: phase-3
+    name: "Phase 3 - Intelligence and Synchronization"
+    tasks:
+      - id: T008
+        gateway_task_id: 01a005df-cdae-70f3-8af8-89d1d7beda63
+        team: backend
+        title: "Integrate OKF metadata and graph expansion into retrieval and hooks"
+        depends_on: [T003, T005]
+        spec_file: backend/T008-retrieval-hook.md
+        status: completed
+      - id: T009
+        gateway_task_id: 01a005df-cdd2-7c02-9f48-d5731e718ca4
+        team: backend
+        title: "Make Dream curation revision- and provenance-aware"
+        depends_on: [T003, T005]
+        spec_file: backend/T009-dream.md
+        status: completed
+      - id: T010
+        gateway_task_id: 01a005df-cdf7-79d1-acad-660bf62ecf23
+        team: backend
+        title: "Add capability-gated OKF gateway envelope"
+        depends_on: [T003]
+        spec_file: backend/T010-gateway.md
+        status: completed
+  - id: phase-4
+    name: "Phase 4 - Conformance and Release"
+    tasks:
+      - id: T011
+        gateway_task_id: 01a005df-ce1b-7670-9309-b67d54e1eb76
+        team: qa
+        title: "Add migration, conformance, security, concurrency, and end-to-end coverage"
+        depends_on: [T006, T007, T008, T009, T010]
+        spec_file: qa/T011-e2e.md
+        status: completed
+      - id: T012
+        gateway_task_id: 01a005df-ce40-7402-ba93-378331a41f94
+        team: docs
+        title: "Document and publish the OKF-native memory contract"
+        depends_on: [T006, T007, T008, T009, T010]
+        spec_file: docs/T012-docs.md
+        status: completed

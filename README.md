@@ -1,14 +1,97 @@
 # agent-memory
 
-Persistent hybrid-search memory system for AI coding agents. Replaces markdown-based memory with selective retrieval, cross-project search, and agent-scoped memories that scale without context cost.
+Persistent OKF-native hybrid-search memory for AI coding agents. Durable SQLite
+memories are canonical structured concepts; lossless Markdown documents,
+indexes, logs, and bundles are virtual handler projections. This provides
+selective retrieval, knowledge-graph traversal, cross-project search, and
+agent-scoped memories without turning a file tree or Git into the source of
+truth.
 
 ## Architecture
 
 - **SQLite** -- single-file backing store, portable, zero config
+- **OKF-native concepts** -- every durable SQLite memory is canonical structured knowledge; Markdown is a lossless virtual projection, not the source of truth
 - **fastembed-rs** -- local embeddings via all-MiniLM-L6-v2 ONNX model (semantic similarity, no API calls)
 - **Hybrid ranking** -- BM25 (FTS5) + cosine similarity fused via Reciprocal Rank Fusion (RRF), then re-ordered by a local cross-encoder reranker (fastembed, on by default)
 - **MCP server** -- stdio JSON-RPC server for native Claude Code tool integration
 - **CLI** -- direct command-line interface for humans, scripts, and AI agents
+
+## OKF-native memory
+
+Every durable memory is an OKF concept stored canonically in SQLite. Its body
+is ordinary Markdown-compatible text; normalized metadata, sources,
+verification, lifecycle state, typed relationships, extensions, and immutable
+revisions live in relational tables. `memory okf` handlers make that state act
+like Markdown files and bundles without requiring physical files or Git.
+
+Virtual bundle URIs are `okf+memory://project/<project>`,
+`okf+memory://global`, and `okf+memory://unscoped`. They expose writable
+`/memories/<uuid>.md` documents plus generated, read-only indexes and a
+paginated log. Physical Markdown exists only when explicitly imported or
+exported; the database remains canonical.
+
+```bash
+# Render and validate a virtual document (no file is created).
+memory okf get <uuid> > memory.md
+memory okf validate memory.md
+
+# Preview an update, then apply it with compare-and-swap protection.
+memory okf put <uuid> --file memory.md --expect-revision 3 --dry-run
+memory okf put <uuid> --file memory.md --expect-revision 3
+
+# Browse generated bundle surfaces.
+memory okf list 'okf+memory://project/agent-memory' /
+memory okf index 'okf+memory://project/agent-memory' --type Reference
+memory okf read 'okf+memory://project/agent-memory' /index.md
+memory okf log 'okf+memory://project/agent-memory' -k 50
+
+# Audit revisions and traverse typed relationships.
+memory okf history <uuid>
+memory okf diff <uuid> 2 3
+memory okf graph <uuid> --direction both --depth 2 --limit 100
+
+# Optional physical interchange. Dry-run before writing or importing.
+memory okf export 'okf+memory://project/agent-memory' ./okf-export --dry-run
+memory okf export 'okf+memory://project/agent-memory' ./okf-export
+memory okf import ./okf-export --project agent-memory --dry-run
+memory okf import ./okf-export --project agent-memory
+```
+
+`memory_type` (`user`, `feedback`, `project`, or `reference`) controls
+agent-memory behavior and scope conventions. The OKF frontmatter `type` is an
+independent, arbitrary concept classification such as `Runbook`, `Decision`,
+or `Reference`; changing one does not silently rewrite the other.
+
+Each semantic mutation appends an immutable revision. `--expect-revision`
+provides optimistic concurrency: the matching revision updates atomically,
+while a stale value fails without mutation. Search indexes title, description,
+OKF type, tags, headings, and body, can add bounded one-hop graph neighbors,
+downranks stale concepts, and reports verification/trust signals. Deprecated
+concepts do not surface in normal search.
+
+Dream reads bounded OKF provenance and graph context. Condensation records a
+revision and actor, preserves sources/extensions/relationships, and clears
+verification because rewritten content must be re-verified. Contradictions are
+kept as review findings rather than silently collapsed.
+
+WorkingContext is deliberately separate transient state. It is never exposed
+by OKF documents, bundles, graph traversal, export, Dream candidates, or
+gateway envelopes. Attested Computation metadata is parsed and validated only;
+agent-memory never executes it or fetches external links.
+
+Recovery is database-first:
+
+- Migrations run atomically. On failure, fix the cause and reopen; the schema
+  version and prior data remain unchanged.
+- FTS/segment indexes and bundle indexes are derived projections. Reopening an
+  older database rebuilds required projections; canonical concepts and
+  revisions remain authoritative.
+- A stale `--expect-revision` or gateway conflict requires rereading the latest
+  document and explicitly reconciling it; no last-writer-wins overwrite occurs.
+- Import/export rejects unsafe paths, symlink traversal, oversized/hostile
+  documents, secret markers, and an existing export destination. Use
+  `--dry-run`, choose a new destination, and treat exports as interchange or
+  backup artifacts rather than live state.
 
 ## Install
 
@@ -142,12 +225,22 @@ saved locally if the gateway is unavailable, and the command emits a retry hint.
 Disable it by setting `AGENT_MEMORY_GATEWAY_AUTO_SYNC=false` in the shared
 gateway config; `memory setup gateway` prompts for this setting.
 
+OKF-aware exchange is an additive, explicitly capability-gated contract. Set
+`AGENT_MEMORY_GATEWAY_OKF=true` (or `MEMORY_GATEWAY_OKF=true`) only when the
+gateway accepts the versioned `okf-markdown` envelope. Capable pushes carry the
+canonical text, revision, semantic hash, and unknown envelope extensions while
+retaining the legacy body and `content_hash`. With the flag absent or false,
+the wire payload and conflict/tombstone behavior are unchanged. New clients
+accept legacy records without an envelope, and unknown envelope fields survive
+pull/no-op/push cycles.
+
 Environment variables still override the shared file when set:
 
 ```bash
 export AGENT_MEMORY_GATEWAY_URL="https://gateway.example"
 export AGENT_MEMORY_GATEWAY_API_KEY="..."
 export AGENT_MEMORY_GATEWAY_AUTO_SYNC="false" # optional opt-out
+export AGENT_MEMORY_GATEWAY_OKF="true"         # optional; capable gateways only
 
 # Fallback names also work:
 export AGENT_GATEWAY_URL="https://gateway.example"
@@ -749,6 +842,18 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 | `memory_working_get` | Return the current project's WorkingContext handoff (`present="false"` when none) |
 | `memory_working_set` | Replace the current project's WorkingContext handoff (65,536-char cap) |
 | `memory_working_clear` | Delete the current project's WorkingContext handoff (idempotent) |
+| `okf_validate` | Parse and validate OKF Markdown without mutation or execution |
+| `okf_get` | Render a canonical memory as a virtual OKF Markdown document |
+| `okf_put` | Create/update a concept with dry-run and expected-revision CAS support |
+| `okf_list` | List virtual bundle entries and generated paths |
+| `okf_history` | List immutable semantic revisions for one memory |
+| `okf_diff` | Diff two immutable revisions deterministically |
+| `okf_graph` | Traverse bounded typed relationships in either direction |
+
+MCP also advertises `okf+memory://project/<project>/...`,
+`okf+memory://global/...`, and `okf+memory://unscoped/...` Markdown resources.
+Generated indexes and logs are read-only; `/memories/<uuid>.md` is the writable
+document surface. WorkingContext is not an OKF resource.
 
 ## Memory types
 

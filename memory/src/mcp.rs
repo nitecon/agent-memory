@@ -1,10 +1,17 @@
+use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    AnnotateAble, ListResourcesResult, PaginatedRequestParams, RawResource,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::schemars;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use rusqlite::Connection;
 use serde::Deserialize;
 
@@ -67,6 +74,12 @@ pub struct SearchArgs {
     pub only: Option<String>,
     /// If true, disable the current-project boost entirely (flat ranking).
     pub no_project_boost: Option<bool>,
+    /// Exact OKF concept type filter.
+    pub concept_type: Option<String>,
+    /// Exact tag filter.
+    pub tag: Option<String>,
+    /// Text-seeded graph expansion depth; 0 disables, default 1.
+    pub graph_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -113,6 +126,12 @@ pub struct ContextArgs {
     pub only: Option<String>,
     /// If true, disable the current-project boost entirely (flat ranking).
     pub no_project_boost: Option<bool>,
+    /// Exact OKF concept type filter.
+    pub concept_type: Option<String>,
+    /// Exact tag filter.
+    pub tag: Option<String>,
+    /// Text-seeded graph expansion depth; 0 disables, default 1.
+    pub graph_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -168,6 +187,68 @@ pub struct CopyArgs {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfValidateArgs {
+    /// Complete OKF Markdown document text.
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfGetArgs {
+    /// Full memory ID, exact canonical memory URI, or /memories/<id>.md path.
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfPutArgs {
+    /// Virtual bundle URI controlling project/global/unscoped authorization.
+    pub bundle: String,
+    /// Existing ID/URI/path, or omit to allocate a new UUID.
+    pub target: Option<String>,
+    /// Complete OKF Markdown document. This tool mutates durable memory.
+    pub content: String,
+    /// Compare-and-swap revision; stale values reject without mutation.
+    pub expected_revision: Option<i64>,
+    /// Validate and diff without mutating durable memory.
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfListArgs {
+    /// Virtual bundle URI.
+    pub bundle: String,
+    /// Virtual directory path, default /.
+    pub path: Option<String>,
+    /// Maximum entries, capped at 200.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfHistoryArgs {
+    pub id: String,
+    /// Maximum revisions, capped at 100.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfDiffArgs {
+    pub id: String,
+    pub revision_a: i64,
+    pub revision_b: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OkfGraphArgs {
+    pub target: String,
+    pub relation: Option<String>,
+    /// Traversal direction: in, out, or both.
+    pub direction: Option<String>,
+    /// Maximum traversal depth, hard-capped by the graph service.
+    pub depth: Option<usize>,
+    /// Maximum returned paths, capped at 1000.
+    pub limit: Option<usize>,
+}
+
 impl MemoryServer {
     pub fn new(config: Config, conn: Connection) -> Self {
         Self {
@@ -183,6 +264,125 @@ impl MemoryServer {
     /// MCP-specific concept.
     fn err_xml(e: MemoryError) -> String {
         render::render_action_result("error", &[("message", e.to_string())])
+    }
+
+    fn okf_err(error: impl std::fmt::Display) -> String {
+        render::render_action_result("error", &[("message", error.to_string())])
+    }
+
+    fn resolve_okf_target(conn: &Connection, target: &str) -> Result<String, MemoryError> {
+        let raw = if let Some(path) = target.strip_prefix("/memories/") {
+            path.strip_suffix(".md").unwrap_or(path)
+        } else if target.starts_with("memory://") {
+            target
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(target)
+        } else {
+            target
+        };
+        match queries::resolve_id_prefix(conn, raw)? {
+            ResolvedId::Exact(id) => Ok(id),
+            ResolvedId::Ambiguous(_) => {
+                Err(MemoryError::Config(format!("ambiguous memory ID `{raw}`")))
+            }
+            ResolvedId::NotFound => Err(MemoryError::NotFound(raw.to_string())),
+        }
+    }
+
+    fn okf_scope_for_id(
+        conn: &Connection,
+        id: &str,
+    ) -> Result<agent_memory::okf::BundleScope, MemoryError> {
+        let project = conn.query_row(
+            "SELECT project FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        Ok(match project.as_deref() {
+            Some(GLOBAL_PROJECT_IDENT) => agent_memory::okf::BundleScope::Global,
+            Some(project) => agent_memory::okf::BundleScope::Project(project.to_string()),
+            None => agent_memory::okf::BundleScope::Unscoped,
+        })
+    }
+
+    fn parse_okf_resource_uri(
+        uri: &str,
+    ) -> Result<(agent_memory::okf::BundleScope, String), String> {
+        let (bundle, path) = if let Some(path) = uri.strip_prefix("okf+memory://global/") {
+            ("okf+memory://global/".to_string(), path)
+        } else if let Some(path) = uri.strip_prefix("okf+memory://unscoped/") {
+            ("okf+memory://unscoped/".to_string(), path)
+        } else if let Some(rest) = uri.strip_prefix("okf+memory://project/") {
+            let Some((project, path)) = rest.split_once('/') else {
+                return Err(format!("OKF resource URI has no virtual path: {uri}"));
+            };
+            (format!("okf+memory://project/{project}/"), path)
+        } else {
+            return Err(format!("unsupported OKF resource URI: {uri}"));
+        };
+        if path.is_empty() || path.contains('?') || path.contains('#') {
+            return Err(format!("invalid OKF resource path in URI: {uri}"));
+        }
+        let scope = agent_memory::okf::BundleScope::parse_uri(&bundle)
+            .map_err(|error| error.to_string())?;
+        Ok((scope, format!("/{path}")))
+    }
+
+    fn read_okf_resource(&self, uri: &str) -> Result<String, String> {
+        let (scope, path) = Self::parse_okf_resource_uri(uri)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "memory database lock poisoned".to_string())?;
+        agent_memory::okf::OkfBundleHandler::new(&conn, scope)
+            .read(&path)
+            .map(|entry| entry.content)
+            .map_err(|error| error.to_string())
+    }
+
+    fn okf_resources(&self) -> Result<Vec<rmcp::model::Resource>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "memory database lock poisoned".to_string())?;
+        let rows = queries::list_projects(&conn).map_err(|error| error.to_string())?;
+        let mut scopes = rows
+            .into_iter()
+            .map(|(project, _)| match project.as_deref() {
+                Some(GLOBAL_PROJECT_IDENT) => agent_memory::okf::BundleScope::Global,
+                Some(project) => agent_memory::okf::BundleScope::Project(project.to_string()),
+                None => agent_memory::okf::BundleScope::Unscoped,
+            })
+            .collect::<Vec<_>>();
+        scopes.sort_by_key(agent_memory::okf::BundleScope::uri);
+        scopes.dedup_by(|left, right| left.uri() == right.uri());
+
+        let mut resources = Vec::with_capacity(scopes.len() * 2);
+        for scope in scopes {
+            let root = scope.uri();
+            for (path, name, description) in [
+                (
+                    "index.md",
+                    "OKF memory index",
+                    "Generated index of canonical OKF concepts",
+                ),
+                (
+                    "log.md",
+                    "OKF memory log",
+                    "Generated immutable OKF revision log",
+                ),
+            ] {
+                resources.push(
+                    RawResource::new(format!("{root}{path}"), name)
+                        .with_description(description)
+                        .with_mime_type("text/markdown")
+                        .no_annotation(),
+                );
+            }
+        }
+        Ok(resources)
     }
 
     fn resolve_working_project(explicit: Option<String>) -> Result<String, MemoryError> {
@@ -301,6 +501,9 @@ impl MemoryServer {
             only_project: args.only.as_deref(),
             global_project: boosts.global_project,
             global_boost_factor: boosts.global_boost,
+            concept_type: args.concept_type.as_deref(),
+            tag: args.tag.as_deref(),
+            graph_depth: args.graph_depth.unwrap_or(1),
         };
 
         let conn = self.conn.lock().unwrap();
@@ -464,6 +667,9 @@ impl MemoryServer {
             only_project: args.only.as_deref(),
             global_project: boosts.global_project,
             global_boost_factor: boosts.global_boost,
+            concept_type: args.concept_type.as_deref(),
+            tag: args.tag.as_deref(),
+            graph_depth: args.graph_depth.unwrap_or(1),
         };
 
         let conn = self.conn.lock().unwrap();
@@ -699,6 +905,317 @@ impl MemoryServer {
             Err(e) => return Self::err_xml(e),
         };
         render::render_projects(&rows, cwd_project.as_deref())
+    }
+
+    /// Validate bounded OKF Markdown without mutating memory.
+    #[tool(name = "memory_okf_validate")]
+    fn okf_validate(&self, Parameters(args): Parameters<OkfValidateArgs>) -> String {
+        match agent_memory::okf::parse_document(&args.content) {
+            Ok(parsed) => render::render_action_result(
+                "okf_valid",
+                &[("diagnostics", parsed.diagnostics.len().to_string())],
+            ),
+            Err(error) => Self::okf_err(error),
+        }
+    }
+
+    /// Render one canonical durable memory as complete OKF Markdown. WorkingContext is never
+    /// addressable through this tool.
+    #[tool(name = "memory_okf_get")]
+    fn okf_get(&self, Parameters(args): Parameters<OkfGetArgs>) -> String {
+        let conn = self.conn.lock().unwrap();
+        let id = match Self::resolve_okf_target(&conn, &args.target) {
+            Ok(id) => id,
+            Err(error) => return Self::err_xml(error),
+        };
+        let scope = match Self::okf_scope_for_id(&conn, &id) {
+            Ok(scope) => scope,
+            Err(error) => return Self::err_xml(error),
+        };
+        match agent_memory::okf::OkfDocumentHandler::new(&conn, scope).render(&id) {
+            Ok(document) => document.text,
+            Err(error) => Self::okf_err(error),
+        }
+    }
+
+    /// MUTATES DURABLE MEMORY: create or update a canonical OKF concept from explicit complete
+    /// document content. Use expected_revision for compare-and-swap safety; dry_run performs no
+    /// mutation. The bundle URI explicitly authorizes project/global/unscoped scope.
+    #[tool(name = "memory_okf_put")]
+    fn okf_put(&self, Parameters(args): Parameters<OkfPutArgs>) -> String {
+        let parsed = match agent_memory::okf::parse_document(&args.content) {
+            Ok(parsed) => parsed,
+            Err(error) => return Self::okf_err(error),
+        };
+        let scope = match agent_memory::okf::BundleScope::parse_uri(&args.bundle) {
+            Ok(scope) => scope,
+            Err(error) => return Self::okf_err(error),
+        };
+        let dry_run = args.dry_run.unwrap_or(false);
+        let embedding = if dry_run {
+            None
+        } else {
+            match embedding::embed_text(&parsed.concept.body, &self.config.model_cache_dir) {
+                Ok(value) => Some(value),
+                Err(error) => return Self::err_xml(error),
+            }
+        };
+        let conn = self.conn.lock().unwrap();
+        let result = match agent_memory::okf::OkfDocumentHandler::new(&conn, scope).put(
+            args.target.as_deref(),
+            &parsed,
+            args.expected_revision,
+            dry_run,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Self::okf_err(error),
+        };
+        if let Some(embedding) = embedding {
+            let blob = crate::db::models::embedding_to_blob(&embedding);
+            if let Err(error) = conn.execute(
+                "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    blob,
+                    crate::db::models::EMBEDDING_MODEL_NAME_DEFAULT,
+                    result.id
+                ],
+            ) {
+                return Self::err_xml(MemoryError::from(error));
+            }
+        }
+        render::render_action_result(
+            if dry_run {
+                "okf_put_dry_run"
+            } else {
+                "okf_put"
+            },
+            &[
+                ("id", result.id),
+                ("revision", result.revision.to_string()),
+                ("created", result.created.to_string()),
+                ("changed", result.changed.to_string()),
+            ],
+        )
+    }
+
+    /// List a bounded virtual OKF bundle directory. Generated index/log paths are read-only and
+    /// WorkingContext is never included.
+    #[tool(name = "memory_okf_list")]
+    fn okf_list(&self, Parameters(args): Parameters<OkfListArgs>) -> String {
+        let scope = match agent_memory::okf::BundleScope::parse_uri(&args.bundle) {
+            Ok(scope) => scope,
+            Err(error) => return Self::okf_err(error),
+        };
+        let conn = self.conn.lock().unwrap();
+        let entries = match agent_memory::okf::OkfBundleHandler::new(&conn, scope)
+            .list(args.path.as_deref().unwrap_or("/"))
+        {
+            Ok(entries) => entries,
+            Err(error) => return Self::okf_err(error),
+        };
+        let limit = args.limit.unwrap_or(100).clamp(1, 200);
+        entries
+            .into_iter()
+            .take(limit)
+            .map(|entry| {
+                render::render_action_result(
+                    "okf_entry",
+                    &[
+                        ("path", entry.path),
+                        ("kind", format!("{:?}", entry.kind).to_ascii_lowercase()),
+                        ("read_only", entry.read_only.to_string()),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Return bounded immutable revision metadata for one durable memory.
+    #[tool(name = "memory_okf_history")]
+    fn okf_history(&self, Parameters(args): Parameters<OkfHistoryArgs>) -> String {
+        let conn = self.conn.lock().unwrap();
+        let id = match Self::resolve_okf_target(&conn, &args.id) {
+            Ok(id) => id,
+            Err(error) => return Self::err_xml(error),
+        };
+        let limit = args.limit.unwrap_or(20).clamp(1, 100);
+        let mut stmt = match conn.prepare(
+            "SELECT revision, operation, actor, content_hash, created_at
+             FROM memory_revisions WHERE memory_id = ?1
+             ORDER BY revision DESC LIMIT ?2",
+        ) {
+            Ok(stmt) => stmt,
+            Err(error) => return Self::err_xml(error.into()),
+        };
+        let rows = match stmt.query_map(rusqlite::params![id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) {
+            Ok(rows) => match rows.collect::<Result<Vec<_>, _>>() {
+                Ok(rows) => rows,
+                Err(error) => return Self::err_xml(error.into()),
+            },
+            Err(error) => return Self::err_xml(error.into()),
+        };
+        rows.into_iter()
+            .map(|(revision, operation, actor, hash, at)| {
+                let mut attrs = vec![
+                    ("id", id.clone()),
+                    ("revision", revision.to_string()),
+                    ("operation", operation),
+                    ("hash", hash),
+                    ("at", at),
+                ];
+                if let Some(actor) = actor {
+                    attrs.push(("actor", actor));
+                }
+                render::render_action_result("okf_revision", &attrs)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Compare two immutable semantic revision snapshots with bounded field summaries.
+    #[tool(name = "memory_okf_diff")]
+    fn okf_diff(&self, Parameters(args): Parameters<OkfDiffArgs>) -> String {
+        let conn = self.conn.lock().unwrap();
+        let id = match Self::resolve_okf_target(&conn, &args.id) {
+            Ok(id) => id,
+            Err(error) => return Self::err_xml(error),
+        };
+        let left = match mcp_revision_snapshot(&conn, &id, args.revision_a) {
+            Ok(value) => value,
+            Err(error) => return Self::err_xml(error),
+        };
+        let right = match mcp_revision_snapshot(&conn, &id, args.revision_b) {
+            Ok(value) => value,
+            Err(error) => return Self::err_xml(error),
+        };
+        let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+            return Self::okf_err("revision snapshot is not an object");
+        };
+        left.keys()
+            .chain(right.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|field| left.get(field) != right.get(field))
+            .map(|field| {
+                render::render_action_result(
+                    "okf_diff",
+                    &[
+                        ("id", id.clone()),
+                        ("field", field.clone()),
+                        (
+                            "before",
+                            mcp_bounded_value(left.get(&field).map(ToString::to_string)),
+                        ),
+                        (
+                            "after",
+                            mcp_bounded_value(right.get(&field).map(ToString::to_string)),
+                        ),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Traverse bounded typed memory relationships with direction, relation, depth, cycles,
+    /// paths, and unresolved-reference diagnostics.
+    #[tool(name = "memory_okf_graph")]
+    fn okf_graph(&self, Parameters(args): Parameters<OkfGraphArgs>) -> String {
+        use crate::concepts::graph::{self, Direction, TraversalOptions};
+
+        let conn = self.conn.lock().unwrap();
+        let id = match Self::resolve_okf_target(&conn, &args.target) {
+            Ok(id) => id,
+            Err(error) => return Self::err_xml(error),
+        };
+        let direction = match args.direction.as_deref().unwrap_or("out") {
+            "in" => Direction::Incoming,
+            "out" => Direction::Outgoing,
+            "both" => Direction::Both,
+            other => return Self::okf_err(format!("invalid graph direction `{other}`")),
+        };
+        let result = match graph::traverse(
+            &conn,
+            std::slice::from_ref(&id),
+            &TraversalOptions {
+                direction,
+                relations: args.relation.into_iter().collect(),
+                max_depth: args.depth.unwrap_or(2),
+                max_results: args.limit.unwrap_or(100),
+                ..TraversalOptions::default()
+            },
+        ) {
+            Ok(result) => result,
+            Err(error) => return Self::err_xml(error),
+        };
+        let mut lines = result
+            .paths
+            .into_iter()
+            .map(|path| {
+                render::render_action_result(
+                    "okf_graph_path",
+                    &[
+                        ("root", id.clone()),
+                        ("path", path.nodes.join(" -> ")),
+                        ("depth", path.steps.len().to_string()),
+                        ("cycle", path.cycle.to_string()),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.extend(result.diagnostics.into_iter().map(|diagnostic| {
+            render::render_action_result(
+                "okf_graph_unresolved",
+                &[
+                    ("source", diagnostic.source),
+                    ("reference", diagnostic.reference),
+                    ("relation", diagnostic.relation),
+                ],
+            )
+        }));
+        lines.join("\n")
+    }
+}
+
+fn mcp_revision_snapshot(
+    conn: &Connection,
+    id: &str,
+    revision: i64,
+) -> Result<serde_json::Value, MemoryError> {
+    let json: String = conn
+        .query_row(
+            "SELECT snapshot_json FROM memory_revisions
+             WHERE memory_id = ?1 AND revision = ?2",
+            rusqlite::params![id, revision],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                MemoryError::NotFound(format!("{id}@{revision}"))
+            }
+            other => MemoryError::Database(other),
+        })?;
+    serde_json::from_str(&json).map_err(MemoryError::from)
+}
+
+fn mcp_bounded_value(value: Option<String>) -> String {
+    let value = value.unwrap_or_else(|| "null".to_string());
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
     }
 }
 
@@ -1066,7 +1583,13 @@ fn results_hint(
 #[tool_handler]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions(
             "Persistent memory system for AI coding agents. All tools return light-XML \
                  text (sectioned tags with numbered content lines — no JSON). \
                  memory_store saves context (auto-tagged with cwd project), \
@@ -1080,6 +1603,35 @@ impl ServerHandler for MemoryServer {
                  idents (spot aliases), memory_move reassigns the project ident on memories \
                  (project-wide moves also transfer or clear WorkingContext), memory_copy duplicates memories \
                  under a new ident without copying WorkingContext.",
+        )
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(
+            self.okf_resources()
+                .map(ListResourcesResult::with_all_items)
+                .map_err(|error| McpError::internal_error(error, None)),
+        )
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        let uri = request.uri;
+        std::future::ready(
+            self.read_okf_resource(&uri)
+                .map(|text| {
+                    ReadResourceResult::new(vec![
+                        ResourceContents::text(text, uri).with_mime_type("text/markdown")
+                    ])
+                })
+                .map_err(|error| McpError::resource_not_found(error, None)),
         )
     }
 }
@@ -1102,6 +1654,20 @@ mod tests {
             },
             conn,
         )
+    }
+
+    fn insert_memory(server: &MemoryServer, content: &str, project: Option<&str>) -> String {
+        let memory = Memory::new(
+            content.to_string(),
+            Some(vec!["okf-test".to_string()]),
+            project.map(str::to_string),
+            Some("test-agent".to_string()),
+            None,
+            Some("project".to_string()),
+        );
+        let id = memory.id.clone();
+        queries::insert_memory(&server.conn.lock().unwrap(), &memory).expect("insert memory");
+        id
     }
 
     #[test]
@@ -1210,5 +1776,132 @@ mod tests {
                 .content,
             "handoff"
         );
+    }
+
+    #[test]
+    fn okf_tools_cover_validate_get_put_list_history_diff_and_graph() {
+        let server = test_server();
+        let first = insert_memory(&server, "first body", Some("alpha/project"));
+        let second = insert_memory(&server, "second body", Some("alpha/project"));
+        {
+            let conn = server.conn.lock().unwrap();
+            queries::update_content(&conn, &first, "updated body", None, None).unwrap();
+            crate::concepts::insert_relationship(
+                &conn,
+                &first,
+                Some(&second),
+                &agent_memory::concepts::canonical_uri(&second, Some("alpha/project")),
+                "supports",
+                2,
+                Some(0),
+            )
+            .unwrap();
+        }
+
+        let document = server.okf_get(Parameters(OkfGetArgs {
+            target: first.clone(),
+        }));
+        assert!(document.contains("updated body"));
+        assert!(document.starts_with("---\n"));
+        assert!(server
+            .okf_validate(Parameters(OkfValidateArgs {
+                content: document.clone(),
+            }))
+            .contains("status=\"okf_valid\""));
+
+        let listed = server.okf_list(Parameters(OkfListArgs {
+            bundle: agent_memory::okf::BundleScope::Project("alpha/project".into()).uri(),
+            path: Some("/memories/".into()),
+            limit: Some(10),
+        }));
+        assert!(listed.contains(&first));
+        assert!(listed.contains(&second));
+
+        let history = server.okf_history(Parameters(OkfHistoryArgs {
+            id: first.clone(),
+            limit: Some(10),
+        }));
+        assert!(history.contains("revision=\"2\""));
+        assert!(history.contains("revision=\"1\""));
+
+        let diff = server.okf_diff(Parameters(OkfDiffArgs {
+            id: first.clone(),
+            revision_a: 1,
+            revision_b: 2,
+        }));
+        assert!(diff.contains("field=\"body\""));
+
+        let graph = server.okf_graph(Parameters(OkfGraphArgs {
+            target: first.clone(),
+            relation: Some("supports".into()),
+            direction: Some("out".into()),
+            depth: Some(2),
+            limit: Some(10),
+        }));
+        assert!(graph.contains("status=\"okf_graph_path\""));
+        assert!(graph.contains(&second));
+
+        let dry_run = server.okf_put(Parameters(OkfPutArgs {
+            bundle: agent_memory::okf::BundleScope::Project("alpha/project".into()).uri(),
+            target: Some(first),
+            content: document,
+            expected_revision: Some(2),
+            dry_run: Some(true),
+        }));
+        assert!(dry_run.contains("status=\"okf_put_dry_run\""));
+    }
+
+    #[test]
+    fn okf_resources_are_markdown_scope_isolated_and_exclude_working_context() {
+        let server = test_server();
+        let id = insert_memory(&server, "resource body", Some("resource-project"));
+        queries::set_working_context(
+            &server.conn.lock().unwrap(),
+            "resource-project",
+            "secret handoff marker",
+        )
+        .unwrap();
+
+        let resources = server.okf_resources().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().all(|resource| {
+            resource
+                .uri
+                .starts_with("okf+memory://project/resource-project/")
+                && resource.mime_type.as_deref() == Some("text/markdown")
+        }));
+        let index = server
+            .read_okf_resource("okf+memory://project/resource-project/index.md")
+            .unwrap();
+        assert!(index.contains(&id));
+        assert!(!index.contains("secret handoff marker"));
+        let document = server
+            .read_okf_resource(&format!(
+                "okf+memory://project/resource-project/memories/{id}.md"
+            ))
+            .unwrap();
+        assert!(document.contains("resource body"));
+        let other = server
+            .read_okf_resource("okf+memory://project/other/index.md")
+            .unwrap();
+        assert!(!other.contains(&id));
+        assert!(!other.contains("resource body"));
+        assert!(server
+            .read_okf_resource("okf+memory://project/resource-project/working-context.md")
+            .is_err());
+    }
+
+    #[test]
+    fn all_okf_tool_argument_schemas_serialize() {
+        let schemas = [
+            serde_json::to_value(schemars::schema_for!(OkfValidateArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfGetArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfPutArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfListArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfHistoryArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfDiffArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(OkfGraphArgs)).unwrap(),
+        ];
+        assert!(schemas.iter().all(serde_json::Value::is_object));
     }
 }

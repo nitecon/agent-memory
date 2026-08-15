@@ -1,6 +1,6 @@
 app: memory
 title: Agent Memory CLI and MCP context
-summary: Persistent project/global memory, per-project WorkingContext handoff, and scoped/all-scope gateway memory exchange for AI coding agents.
+summary: SQLite-canonical OKF concepts, virtual Markdown bundles, hybrid/graph retrieval, WorkingContext handoff, and capability-gated gateway exchange.
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/memory.yaml
@@ -12,10 +12,14 @@ labels:
   - working-context
   - gateway-sync
   - all-scope-sync
+  - okf
+  - knowledge-graph
 content:
   purpose: >
-    The memory binary stores durable project/global memories and exposes
-    ranked context retrieval for AI agents. WorkingContext is a separate
+    The memory binary stores every durable project/global memory as a canonical
+    OKF concept in SQLite and exposes ranked context retrieval for AI agents.
+    Markdown documents, indexes, and logs are virtual projections over the
+    database; physical files are explicit interchange only. WorkingContext is a separate
     per-project handoff row for transient active-work state; it is not a
     durable memory and does not participate in ranking or dream curation.
     Gateway exchange moves durable memories between machines: default scoped
@@ -27,6 +31,14 @@ content:
     push/pull includes __global__ as the durable global scope. WorkingContext
     state is always excluded.
   workflows:
+    - name: Work with canonical OKF memory
+      steps:
+        - Render a memory with memory okf get <id>; this creates no physical file.
+        - Validate or dry-run a proposed document before mutation.
+        - Apply with memory okf put <id> --file PATH --expect-revision N for compare-and-swap safety.
+        - Browse generated indexes/logs with memory okf list, read, index, and log against an okf+memory bundle URI.
+        - Audit immutable revisions with history/diff and traverse bounded typed relationships with graph.
+        - Use export/import only for explicit physical interchange; SQLite remains canonical.
     - name: Start a task
       steps:
         - Run memory context "<task>" from the project directory.
@@ -104,9 +116,38 @@ content:
           - "0"
           - "no"
           - "off"
+      okf_capability:
+        key: AGENT_MEMORY_GATEWAY_OKF
+        alias: MEMORY_GATEWAY_OKF
+        default: false
+        behavior: When explicitly true, send a versioned okf-markdown envelope and semantic hash alongside all legacy fields.
       transport: Authorization Bearer token on gateway HTTP requests.
   cli:
     commands:
+      - name: memory okf
+        purpose: Operate on SQLite-canonical OKF concepts through virtual Markdown document and bundle handlers.
+        subcommands:
+          validate: Validate an OKF Markdown document without mutation or execution.
+          get: Render one canonical memory as OKF Markdown without creating a file.
+          put: Create/update from --file or stdin; supports --dry-run and --expect-revision CAS.
+          read: Read a virtual document or generated bundle path.
+          list: List a virtual bundle directory.
+          index: Render the root, OKF type, or tag index.
+          log: Render paginated immutable bundle history.
+          history: List immutable revisions for one memory.
+          diff: Compare two immutable revisions.
+          graph: Traverse bounded typed relationships with relation, direction, depth, and limit filters.
+          export: Materialize an explicit physical bundle; refuses unsafe paths, secrets, and existing destinations.
+          import: Validate and ingest a physical bundle through canonical handlers; supports --dry-run.
+        bundle_uris:
+          - okf+memory://project/<project>
+          - okf+memory://global
+          - okf+memory://unscoped
+        invariants:
+          - SQLite is authoritative; documents, indexes, and logs are projections.
+          - /memories/<uuid>.md is writable; generated index and log paths are read-only.
+          - WorkingContext is not addressable.
+          - Attested Computation metadata is validated but never executed.
       - name: memory store
         purpose: Store a durable memory with embedding and lexical index rows.
         args:
@@ -114,6 +155,7 @@ content:
             - content
           optional:
             - --tags
+            - --okf-file
             - --project
             - --agent
             - --source-file
@@ -135,6 +177,9 @@ content:
             - --project
             - --only
             - --no-project-boost
+            - --type
+            - --tag
+            - --graph-depth
         output: Grouped light-XML sections project_memories, general_knowledge, other_projects.
       - name: memory context
         purpose: Task-start retrieval. Includes active WorkingContext before ranked memories.
@@ -146,6 +191,9 @@ content:
             - --project
             - --only
             - --no-project-boost
+            - --type
+            - --tag
+            - --graph-depth
         output: Optional <working_context present="true"> block, grouped memory sections, hints, and usage.
       - name: memory push status
         purpose: Show durable memories that would be created, updated, or deleted on the gateway for the current project, or for every local durable-memory project ident when --all is set.
@@ -297,7 +345,58 @@ content:
         purpose: Replace WorkingContext; enforces the 65536 character cap and project-only scope.
       - name: memory_working_clear
         purpose: Delete WorkingContext; idempotent when absent.
+      - name: okf_validate
+        purpose: Validate OKF Markdown without mutation, fetching, or computation execution.
+      - name: okf_get
+        purpose: Render one canonical SQLite memory as virtual OKF Markdown.
+      - name: okf_put
+        purpose: Create/update a canonical concept with dry-run and expected-revision CAS support.
+      - name: okf_list
+        purpose: List virtual bundle entries and generated paths.
+      - name: okf_history
+        purpose: List immutable semantic revisions for one memory.
+      - name: okf_diff
+        purpose: Compare two immutable revisions deterministically.
+      - name: okf_graph
+        purpose: Traverse bounded typed relationships by direction, relation, depth, and limit.
+    resources:
+      uri_templates:
+        - okf+memory://project/<project>/<path>
+        - okf+memory://global/<path>
+        - okf+memory://unscoped/<path>
+      mime_type: text/markdown
+      writable_paths: /memories/<uuid>.md via okf_put
+      read_only_paths: Generated root/type/tag indexes and log.
+      excludes: WorkingContext
   contracts:
+    okf_native_memory:
+      canonical_store: SQLite durable-memory and OKF relational tables.
+      text_model: The memory body is Markdown-compatible text; Markdown files are virtual or explicit interchange projections.
+      type_distinction:
+        memory_type: Closed agent-memory behavior class; user, feedback, project, or reference.
+        okf_type: Arbitrary concept classification such as Runbook, Decision, or Reference.
+      revisions:
+        semantics: Every semantic mutation creates an immutable revision; semantic no-ops do not.
+        compare_and_swap: expected_revision mismatch fails without mutation.
+        verification: Semantic rewrites, including Dream condensation, clear verification for explicit re-attestation.
+      trust_and_freshness:
+        trust: Human verification ranks above machine verification above unverified.
+        stale: stale_after concepts are downranked.
+        deprecated: Excluded from normal search.
+      graph:
+        storage: Typed directed relationships with unresolved references retained for diagnosis.
+        traversal: Text-seeded, cycle-safe, and bounded by depth/result/fan-out budgets.
+      dream:
+        actor: memory-dream
+        preservation: Sources, extensions, and unrelated relationships survive condensation.
+        contradictions: Preserve both concepts and surface a review finding.
+      execution_boundary: External links are not fetched and Attested Computation metadata is never executed.
+      working_context: Fully excluded from OKF documents, resources, graphs, export, Dream, and gateway envelopes.
+      recovery:
+        migrations: Whole upgrade chain is transactional; failure preserves prior schema/data and can be retried on reopen.
+        indexes: FTS segments and generated bundle indexes are derived and rebuildable.
+        conflicts: Reread and reconcile; no last-writer-wins overwrite.
+        interchange: Dry-run first; exports refuse existing destinations and unsafe/secret-bearing content.
     gateway_memory_exchange:
       scope:
         scoped_mode:
@@ -384,6 +483,8 @@ content:
             - updated_at
             - provenance
             - tombstone
+            - concept_hash
+            - okf
           compatibility:
             - memory accepts project as an alias for project_ident on responses.
             - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
@@ -391,6 +492,11 @@ content:
             - memory serializes created_at and updated_at to the gateway as Unix epoch milliseconds, and accepts either epoch milliseconds or RFC3339 strings on responses.
             - Direct forget/supersede flows send tombstone.deleted=true with gateway_memory_id and base_gateway_revision before hiding or deleting the local row.
             - Deferred delete pushes synthesize tombstone.deleted=true from memory_gateway_delete_queue after the local row has been deleted or superseded.
+            - OKF fields are omitted unless AGENT_MEMORY_GATEWAY_OKF or MEMORY_GATEWAY_OKF is explicitly true.
+            - A capable payload retains legacy content/content_hash and adds concept_hash plus an okf envelope with version=1, format=okf-markdown, revision, semantic_hash, canonical document text, and extension fields.
+            - New clients accept legacy records with no OKF envelope; legacy conflict and tombstone planning continues to use content_hash during transition.
+            - Unknown OKF envelope fields survive pull, semantic no-op, and later push.
+            - Secret markers in the canonical OKF document block concept-aware gateway transmission.
           guidance:
             - tags are content/domain labels only; do not add hostnames, OS names, source machines, or client-origin labels to tags.
             - origin metadata belongs in provenance.
@@ -447,7 +553,19 @@ content:
     - Do not use __global__ for WorkingContext; cross-project handoff state is intentionally unsupported.
     - Do not put host, OS, machine, agent, or client-origin metadata in normal memory tags; use GatewayMemory.provenance fields.
     - Do not rely on memory for git history, releases, tags, CI state, or version facts.
+    - SQLite is canonical for durable OKF concepts; do not treat exported Markdown as a live second source of truth.
+    - OKF parsing never authorizes execution or external fetches.
   examples:
+    - name: Render canonical OKF memory
+      command: memory okf get <uuid>
+    - name: CAS-protected OKF update
+      command: memory okf put <uuid> --file memory.md --expect-revision 3
+    - name: Read virtual project index
+      command: memory okf read okf+memory://project/agent-memory /index.md
+    - name: Traverse memory graph
+      command: memory okf graph <uuid> --direction both --depth 2
+    - name: Dry-run physical interchange
+      command: memory okf export okf+memory://project/agent-memory ./export --dry-run
     - name: Read task context
       command: memory context "continue WorkingContext implementation" -k 8
     - name: Set multiline handoff

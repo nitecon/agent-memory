@@ -1,7 +1,9 @@
 use chrono::{TimeZone, Utc};
+use rusqlite::Connection;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::config::GatewayConfig;
@@ -58,6 +60,7 @@ pub struct MemoryGatewayClient {
     base_url: String,
     api_key: String,
     http: reqwest::blocking::Client,
+    okf_enabled: bool,
 }
 
 impl MemoryGatewayClient {
@@ -72,7 +75,9 @@ impl MemoryGatewayClient {
                 "run `memory setup gateway` (or `agent-tools setup gateway`) or set AGENT_MEMORY_GATEWAY_API_KEY, AGENT_GATEWAY_API_KEY, or GATEWAY_API_KEY".to_string(),
             )
         })?;
-        Self::from_parts(base_url, api_key)
+        let mut client = Self::from_parts(base_url, api_key)?;
+        client.okf_enabled = config.okf_sync_enabled();
+        Ok(client)
     }
 
     pub fn from_parts(base_url: &str, api_key: &str) -> Result<Self, GatewaySyncClientError> {
@@ -87,6 +92,7 @@ impl MemoryGatewayClient {
             base_url,
             api_key: api_key.to_string(),
             http: reqwest::blocking::Client::new(),
+            okf_enabled: false,
         })
     }
 
@@ -154,6 +160,10 @@ impl MemoryGatewayClient {
 
     pub fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url, normalize_path(path))
+    }
+
+    pub fn okf_enabled(&self) -> bool {
+        self.okf_enabled
     }
 }
 
@@ -400,6 +410,22 @@ pub struct KnownGatewayMemory {
     pub gateway_memory_id: String,
     pub server_revision: i64,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayOkfEnvelope {
+    pub version: u32,
+    pub format: String,
+    pub revision: i64,
+    pub semantic_hash: String,
+    /// Canonical normalized OKF Markdown. Text is the interchange contract;
+    /// SQLite remains authoritative on every client.
+    pub document: String,
+    /// Preserve gateway-defined optional envelope data across transitions.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +437,10 @@ pub struct GatewayMemory {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okf: Option<GatewayOkfEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_memory_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -491,6 +521,8 @@ impl GatewayMemoryTombstoneRecord {
             memory_type: "project".to_string(),
             tags: Vec::new(),
             content_hash: self.content_hash,
+            concept_hash: None,
+            okf: None,
             local_memory_id: None,
             client_id: None,
             gateway_memory_id: Some(self.gateway_memory_id),
@@ -547,6 +579,10 @@ pub struct MemoryConflict {
     pub local_content_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_concept_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_concept_hash: Option<String>,
     pub reason: String,
 }
 
@@ -647,6 +683,44 @@ pub fn memory_content_hash(content: &str, memory_type: &str, tags: &[String]) ->
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     hex_lower(&hasher.finalize())
+}
+
+pub fn gateway_okf_envelope(
+    conn: &Connection,
+    memory: &crate::db::models::Memory,
+) -> Result<GatewayOkfEnvelope, crate::error::MemoryError> {
+    let scope = match memory.project.as_deref() {
+        Some(crate::db::queries::GLOBAL_PROJECT_IDENT) => agent_memory::okf::BundleScope::Global,
+        Some(project) => agent_memory::okf::BundleScope::Project(project.to_string()),
+        None => agent_memory::okf::BundleScope::Unscoped,
+    };
+    let rendered = agent_memory::okf::OkfDocumentHandler::new(conn, scope)
+        .render(&memory.id)
+        .map_err(|error| crate::error::MemoryError::Config(error.to_string()))?;
+    agent_memory::okf::reject_secret_markers(&rendered.text, "gateway OKF sync")
+        .map_err(|error| crate::error::MemoryError::Config(error.to_string()))?;
+    let (revision, semantic_hash): (i64, String) = conn.query_row(
+        "SELECT c.current_revision, r.content_hash
+         FROM memory_concepts c JOIN memory_revisions r
+           ON r.memory_id = c.memory_id AND r.revision = c.current_revision
+         WHERE c.memory_id = ?1",
+        rusqlite::params![memory.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let extensions = agent_memory::okf::parse_document(&rendered.text)
+        .ok()
+        .and_then(|parsed| parsed.concept.extensions.get("x-gateway-envelope").cloned())
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    Ok(GatewayOkfEnvelope {
+        version: 1,
+        format: "okf-markdown".to_string(),
+        revision,
+        semantic_hash,
+        document: rendered.text,
+        extensions,
+    })
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -757,6 +831,8 @@ mod tests {
             memory_type: "project".to_string(),
             tags: Vec::new(),
             content_hash: "hash".to_string(),
+            concept_hash: None,
+            okf: None,
             local_memory_id: Some("local-1".to_string()),
             client_id: None,
             gateway_memory_id: Some("gw-1".to_string()),
@@ -934,6 +1010,7 @@ mod tests {
             base_url: Some("https://gateway.example".to_string()),
             api_key: None,
             auto_sync: None,
+            okf_sync: None,
         };
         let err = MemoryGatewayClient::from_config(&missing_key).unwrap_err();
         assert!(err.to_string().contains("AGENT_MEMORY_GATEWAY_API_KEY"));
@@ -976,5 +1053,59 @@ mod tests {
             a,
             "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5"
         );
+    }
+
+    #[test]
+    fn okf_envelope_renders_canonical_text_semantic_hash_and_unknown_extensions() {
+        let conn = crate::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let memory = crate::db::models::Memory::new(
+            "gateway body".to_string(),
+            Some(vec!["sync".to_string()]),
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        crate::db::queries::insert_memory(&conn, &memory).unwrap();
+        crate::concepts::mutate(
+            &conn,
+            &memory.id,
+            "gateway-extension",
+            Some("test"),
+            None,
+            false,
+            |_| {
+                conn.execute(
+                    "UPDATE memory_concepts SET extensions_json =
+                     '{\"extensions\":{\"x-producer\":{\"opaque\":true},\"x-gateway-envelope\":{\"x-future\":{\"n\":1}}}}'
+                     WHERE memory_id = ?1",
+                    rusqlite::params![memory.id],
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let envelope = gateway_okf_envelope(&conn, &memory).unwrap();
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.format, "okf-markdown");
+        assert_eq!(envelope.revision, 2);
+        assert_eq!(envelope.semantic_hash.len(), 64);
+        assert!(envelope.document.contains("x-producer"));
+        assert_eq!(envelope.extensions["x-future"]["n"], 1);
+    }
+
+    #[test]
+    fn okf_gateway_envelope_blocks_secret_markers_before_network_use() {
+        let conn = crate::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let memory = crate::db::models::Memory::new(
+            "API_KEY=do-not-send".to_string(),
+            None,
+            Some("agent-memory".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        crate::db::queries::insert_memory(&conn, &memory).unwrap();
+        assert!(gateway_okf_envelope(&conn, &memory).is_err());
     }
 }

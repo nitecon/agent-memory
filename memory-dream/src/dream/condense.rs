@@ -208,6 +208,14 @@ pub fn run_per_memory(
     inference: &dyn Inference,
     source: &Memory,
 ) -> Result<Decision, CondenseError> {
+    run_per_memory_with_context(inference, source, None)
+}
+
+pub fn run_per_memory_with_context(
+    inference: &dyn Inference,
+    source: &Memory,
+    okf_context: Option<&str>,
+) -> Result<Decision, CondenseError> {
     // `project` already stores the literal `__global__` sentinel for
     // global-scope memories, so no translation is needed before passing
     // it through as the prompt's scope field. We reference the constant
@@ -219,6 +227,7 @@ pub fn run_per_memory(
         project_or_global: source.project.as_deref(),
         tags: tags_joined.as_deref(),
         content: &source.content,
+        okf_context,
     };
     let prompt = build_condense_prompt(&inputs);
     let response = inference.generate(&prompt, MAX_OUTPUT_TOKENS)?;

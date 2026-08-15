@@ -21,6 +21,9 @@ pub struct GatewayConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub auto_sync: Option<bool>,
+    /// Explicit opt-in for the versioned OKF gateway contract. Defaults off
+    /// until the configured endpoint advertises/supports that contract.
+    pub okf_sync: Option<bool>,
 }
 
 impl GatewayConfig {
@@ -58,6 +61,7 @@ impl GatewayConfig {
             base_url: first_nonempty([memory_url, agent_url, gateway_url]),
             api_key: first_nonempty([memory_api_key, agent_api_key, gateway_api_key]),
             auto_sync: None,
+            okf_sync: None,
         }
     }
 
@@ -82,6 +86,12 @@ impl GatewayConfig {
         ]) {
             self.auto_sync = Some(auto_sync);
         }
+        if let Some(okf_sync) = first_bool([
+            pairs.get("AGENT_MEMORY_GATEWAY_OKF").cloned(),
+            pairs.get("MEMORY_GATEWAY_OKF").cloned(),
+        ]) {
+            self.okf_sync = Some(okf_sync);
+        }
     }
 
     fn apply_env_overrides(&mut self) {
@@ -105,6 +115,12 @@ impl GatewayConfig {
         ]) {
             self.auto_sync = Some(auto_sync);
         }
+        if let Some(okf_sync) = first_bool([
+            std::env::var("AGENT_MEMORY_GATEWAY_OKF").ok(),
+            std::env::var("MEMORY_GATEWAY_OKF").ok(),
+        ]) {
+            self.okf_sync = Some(okf_sync);
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -113,6 +129,10 @@ impl GatewayConfig {
 
     pub fn auto_sync_enabled(&self) -> bool {
         self.is_configured() && self.auto_sync.unwrap_or(true)
+    }
+
+    pub fn okf_sync_enabled(&self) -> bool {
+        self.is_configured() && self.okf_sync.unwrap_or(false)
     }
 }
 
@@ -438,10 +458,30 @@ mod tests {
             base_url: Some("https://gateway.example".to_string()),
             api_key: Some("key".to_string()),
             auto_sync: None,
+            okf_sync: None,
         };
 
         assert!(cfg.is_configured());
         assert!(cfg.auto_sync_enabled());
+        assert!(!cfg.okf_sync_enabled(), "OKF gateway contract must opt in");
+    }
+
+    #[test]
+    fn gateway_okf_contract_requires_explicit_capability_flag() {
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "AGENT_MEMORY_GATEWAY_URL".to_string(),
+            "https://gateway.example".to_string(),
+        );
+        pairs.insert(
+            "AGENT_MEMORY_GATEWAY_API_KEY".to_string(),
+            "key".to_string(),
+        );
+        pairs.insert("AGENT_MEMORY_GATEWAY_OKF".to_string(), "true".to_string());
+        let mut cfg = GatewayConfig::default();
+        cfg.apply_key_value_pairs(&pairs);
+        assert_eq!(cfg.okf_sync, Some(true));
+        assert!(cfg.okf_sync_enabled());
     }
 
     #[test]

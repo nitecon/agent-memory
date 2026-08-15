@@ -1,4 +1,5 @@
 mod cli;
+mod concepts;
 mod config;
 mod db;
 mod embedding;

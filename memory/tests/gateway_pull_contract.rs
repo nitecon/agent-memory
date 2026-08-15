@@ -11,6 +11,8 @@ fn remote_memory() -> GatewayMemory {
         memory_type: "project".to_string(),
         tags: vec!["sre".to_string(), "gateway-sync".to_string()],
         content_hash: "remote".to_string(),
+        concept_hash: None,
+        okf: None,
         local_memory_id: None,
         client_id: None,
         gateway_memory_id: Some("gw-1".to_string()),
@@ -40,6 +42,7 @@ fn pull_request_is_project_plus_cursor_state() {
             gateway_memory_id: "gw-1".to_string(),
             server_revision: 41,
             content_hash: "old".to_string(),
+            concept_hash: None,
         }],
         limit: Some(100),
     };
@@ -86,6 +89,35 @@ fn pull_response_returns_memory_array_and_cursor() {
     assert_eq!(
         value["memories"][0]["provenance"]["source_agent_id"],
         "sre-agent"
+    );
+}
+
+#[test]
+fn new_client_accepts_legacy_memory_without_okf_envelope() {
+    let value = serde_json::to_value(remote_memory()).unwrap();
+    let parsed: GatewayMemory = serde_json::from_value(value).unwrap();
+    assert!(parsed.okf.is_none());
+    assert!(parsed.concept_hash.is_none());
+}
+
+#[test]
+fn concept_aware_pull_preserves_unknown_okf_envelope_fields() {
+    let mut value = serde_json::to_value(remote_memory()).unwrap();
+    value["concept_hash"] = json!("semantic-remote");
+    value["okf"] = json!({
+        "version": 1,
+        "format": "okf-markdown",
+        "revision": 7,
+        "semantic_hash": "semantic-remote",
+        "document": "---\ntype: Agent Memory/project\nx-producer: {opaque: true}\n---\nRemote project memory\n",
+        "x-future-gateway": {"preserve": [1, 2, 3]}
+    });
+    let parsed: GatewayMemory = serde_json::from_value(value).unwrap();
+    let envelope = parsed.okf.unwrap();
+    assert_eq!(envelope.revision, 7);
+    assert_eq!(
+        envelope.extensions["x-future-gateway"]["preserve"],
+        json!([1, 2, 3])
     );
 }
 

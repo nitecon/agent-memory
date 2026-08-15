@@ -42,6 +42,7 @@ use agent_memory::embedding::embed_text;
 use agent_memory::error::MemoryError;
 use agent_memory::render;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::inference::Inference;
@@ -144,6 +145,7 @@ pub struct DreamSummary {
     pub review_merged: usize,
     pub review_superseded: usize,
     pub review_extracted: usize,
+    pub review_contradictions: usize,
 }
 
 /// Run a full dream pass.
@@ -199,7 +201,7 @@ pub fn run(
         // consolidation path. Survivors (including newly-materialized
         // supersede/extract memories) flow into Stage A + B for the
         // existing cosine + per-memory polish work.
-        let stage0_survivors = run_stage_0_project_review(
+        let stage0 = run_stage_0_project_review(
             conn,
             inference,
             cfg,
@@ -211,7 +213,13 @@ pub fn run(
 
         // Stage A — cosine dedup over the Stage 0 survivors for this project.
         // Survivors move to Stage B.
-        let survivors = run_stage_a_dedup(conn, cfg, &stage0_survivors, &mut project_stats);
+        let survivors = run_stage_a_dedup(
+            conn,
+            cfg,
+            &stage0.survivors,
+            &stage0.contradiction_ids,
+            &mut project_stats,
+        );
 
         // Stage B — per-memory condense via the three-way contract.
         for mem in &survivors {
@@ -245,6 +253,10 @@ pub fn run(
                         "review_extracted",
                         project_stats.review_extracted.to_string()
                     ),
+                    (
+                        "review_contradictions",
+                        project_stats.review_contradictions.to_string()
+                    ),
                     ("failed", project_stats.failed.to_string()),
                 ]
             )
@@ -276,6 +288,10 @@ pub fn run(
                 ("review_merged", summary.review_merged.to_string()),
                 ("review_superseded", summary.review_superseded.to_string()),
                 ("review_extracted", summary.review_extracted.to_string()),
+                (
+                    "review_contradictions",
+                    summary.review_contradictions.to_string()
+                ),
                 ("failed", summary.failed.to_string()),
             ]
         )
@@ -304,6 +320,12 @@ struct ProjectStats {
     review_merged: usize,
     review_superseded: usize,
     review_extracted: usize,
+    review_contradictions: usize,
+}
+
+struct Stage0Outcome {
+    survivors: Vec<Memory>,
+    contradiction_ids: HashSet<String>,
 }
 
 /// Decide which `last_dream_at` cutoff applies for `project`.
@@ -347,7 +369,7 @@ fn run_stage_0_project_review(
     candidates: Vec<Memory>,
     project_stats: &mut ProjectStats,
     summary: &mut DreamSummary,
-) -> Vec<Memory> {
+) -> Stage0Outcome {
     let apply = cfg.mode == DreamMode::Apply;
     let project_label = project.unwrap_or("(null)");
 
@@ -367,6 +389,7 @@ fn run_stage_0_project_review(
             project_stats.review_merged += outcome.stats.merged;
             project_stats.review_superseded += outcome.stats.superseded;
             project_stats.review_extracted += outcome.stats.extracted;
+            project_stats.review_contradictions += outcome.stats.contradictions;
             project_stats.failed += outcome.stats.failed;
 
             summary.review_kept += outcome.stats.kept;
@@ -374,6 +397,7 @@ fn run_stage_0_project_review(
             summary.review_merged += outcome.stats.merged;
             summary.review_superseded += outcome.stats.superseded;
             summary.review_extracted += outcome.stats.extracted;
+            summary.review_contradictions += outcome.stats.contradictions;
 
             println!(
                 "{}",
@@ -386,11 +410,15 @@ fn run_stage_0_project_review(
                         ("merged", outcome.stats.merged.to_string()),
                         ("superseded", outcome.stats.superseded.to_string()),
                         ("extracted", outcome.stats.extracted.to_string()),
+                        ("contradictions", outcome.stats.contradictions.to_string()),
                         ("failed", outcome.stats.failed.to_string()),
                     ]
                 )
             );
-            outcome.survivors
+            Stage0Outcome {
+                survivors: outcome.survivors,
+                contradiction_ids: outcome.contradiction_ids,
+            }
         }
         Err(e) => {
             // A Stage 0 failure is a single "batch didn't parse" event,
@@ -409,7 +437,10 @@ fn run_stage_0_project_review(
                     ]
                 )
             );
-            candidates
+            Stage0Outcome {
+                survivors: candidates,
+                contradiction_ids: HashSet::new(),
+            }
         }
     }
 }
@@ -425,10 +456,15 @@ fn run_stage_a_dedup(
     conn: &Connection,
     cfg: &DreamConfig<'_>,
     candidates: &[Memory],
+    contradiction_ids: &HashSet<String>,
     stats: &mut ProjectStats,
 ) -> Vec<Memory> {
     let mut survivors: Vec<Memory> = Vec::with_capacity(candidates.len());
     for mem in candidates {
+        if contradiction_ids.contains(&mem.id) {
+            survivors.push(mem.clone());
+            continue;
+        }
         let peers = match q::list_dedup_candidates(
             conn,
             &mem.id,
@@ -562,7 +598,8 @@ fn run_stage_b_condense(
     }
 
     // Inference — slow, lock-free.
-    let outcome = condense::run_per_memory(inference, source);
+    let okf_context = project_review::okf_review_context(conn, std::slice::from_ref(source)).ok();
+    let outcome = condense::run_per_memory_with_context(inference, source, okf_context.as_deref());
 
     match outcome {
         Ok(condense::Decision::Skip) => {
@@ -600,7 +637,12 @@ fn run_stage_b_condense(
                         return;
                     }
                 }
-                match agent_memory::db::queries::delete_memory(conn, &source.id) {
+                match agent_memory::db::queries::delete_memory_with_actor(
+                    conn,
+                    &source.id,
+                    Some("memory-dream"),
+                    Some("condense forget"),
+                ) {
                     Ok(_) => {
                         stats.forgot += 1;
                         println!(
@@ -815,23 +857,7 @@ mod tests {
     #[test]
     fn incremental_filter_skips_processed_projects() {
         let mut conn = open_mem_db();
-        let stamp = prompt::condenser_version_stamp("sonnet");
-        conn.execute(
-            "INSERT INTO memories (id, content, project, memory_type,
-                                   created_at, updated_at, condenser_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "aaaaaaaa-0000-1111-2222-000000000001",
-                "first",
-                "p1",
-                "user",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-                stamp,
-            ],
-        )
-        .unwrap();
-        q::set_last_dream_at(&conn, Some("p1"), "2099-01-01T00:00:00Z").unwrap();
+        insert_already_processed(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", "p1");
 
         let inf = FixedInference::new("skip");
         let tmp = std::env::temp_dir();
@@ -870,23 +896,20 @@ mod tests {
     /// --refresh override (which folds into `cfg.full` in `main.rs`).
     fn insert_already_processed(conn: &Connection, id: &str, content: &str, project: &str) {
         let stamp = prompt::condenser_version_stamp("sonnet");
-        conn.execute(
-            "INSERT INTO memories (id, content, project, memory_type,
-                                   created_at, updated_at, condenser_version,
-                                   embedding_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                id,
-                content,
-                project,
-                "user",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-                stamp,
-                EMBEDDING_MODEL_NAME,
-            ],
-        )
-        .unwrap();
+        let mut memory = Memory::new(
+            content.to_string(),
+            None,
+            Some(project.to_string()),
+            None,
+            None,
+            Some("user".to_string()),
+        );
+        memory.id = id.to_string();
+        memory.created_at = "2026-01-01T00:00:00Z".to_string();
+        memory.updated_at = memory.created_at.clone();
+        memory.condenser_version = Some(stamp);
+        memory.embedding_model = Some(EMBEDDING_MODEL_NAME.to_string());
+        q::insert_memory(conn, &memory).unwrap();
         q::set_last_dream_at(conn, Some(project), "2099-01-01T00:00:00Z").unwrap();
     }
 
@@ -945,41 +968,13 @@ mod tests {
         let older = "aaaaaaaa-0000-1111-2222-000000000020";
         let newer = "aaaaaaaa-0000-1111-2222-000000000021";
 
-        let stamp = prompt::condenser_version_stamp("sonnet");
         // Two byte-identical rows in the same project / memory_type /
         // embedding_model so Stage A's exact-match short-circuit fires.
+        insert_already_processed(&conn, older, "identical content", "p2");
+        insert_already_processed(&conn, newer, "identical content", "p2");
         conn.execute(
-            "INSERT INTO memories (id, content, project, memory_type,
-                                   created_at, updated_at, condenser_version,
-                                   embedding_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                older,
-                "identical content",
-                "p2",
-                "user",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-                stamp,
-                EMBEDDING_MODEL_NAME,
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO memories (id, content, project, memory_type,
-                                   created_at, updated_at, condenser_version,
-                                   embedding_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                newer,
-                "identical content",
-                "p2",
-                "user",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T00:00:00Z",
-                stamp,
-                EMBEDDING_MODEL_NAME,
-            ],
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params!["2026-01-02T00:00:00Z", newer],
         )
         .unwrap();
         q::set_last_dream_at(&conn, Some("p2"), "2099-01-01T00:00:00Z").unwrap();
@@ -1112,6 +1107,14 @@ mod tests {
         // Memory is gone.
         let err = q::get_memory_by_id(&conn, id).unwrap_err();
         assert!(matches!(err, MemoryError::NotFound(_)));
+        let actor: String = conn
+            .query_row(
+                "SELECT actor FROM memory_concept_tombstones WHERE memory_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(actor, "memory-dream");
     }
 
     /// `forget` dry-run surfaces intent without deleting.
@@ -1120,6 +1123,17 @@ mod tests {
         let mut conn = open_mem_db();
         let id = "aaaaaaaa-0000-1111-2222-000000000001";
         insert(&conn, id, "CI notification noise", Some("p1"));
+        let before: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM memory_revisions),
+                    (SELECT COUNT(*) FROM memory_relationships),
+                    (SELECT COUNT(*) FROM memory_concept_tombstones),
+                    (SELECT updated_at FROM memories WHERE id = ?1)",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
 
         let inf = FixedInference::new("forget");
         let tmp = std::env::temp_dir();
@@ -1129,6 +1143,108 @@ mod tests {
 
         // Row must still exist — dry run doesn't delete.
         assert!(q::get_memory_by_id(&conn, id).is_ok());
+        let after: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM memory_revisions),
+                    (SELECT COUNT(*) FROM memory_relationships),
+                    (SELECT COUNT(*) FROM memory_concept_tombstones),
+                    (SELECT updated_at FROM memories WHERE id = ?1)",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn condensation_revision_preserves_okf_provenance_and_clears_verification() {
+        let conn = open_mem_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000041";
+        let peer = "aaaaaaaa-0000-1111-2222-000000000042";
+        insert(&conn, id, "verbose original body", Some("p1"));
+        insert(&conn, peer, "related", Some("p1"));
+        agent_memory::concepts::mutate(
+            &conn,
+            id,
+            "enrich",
+            Some("test"),
+            None,
+            false,
+            |revision| {
+                conn.execute(
+                    "UPDATE memory_concepts SET extensions_json = '{\"x-producer\":{\"keep\":true}}'
+                     WHERE memory_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                conn.execute(
+                    "INSERT INTO memory_sources (
+                         memory_id, source_key, ordinal, resource, metadata_json
+                     ) VALUES (?1, 'source-1', 0, 'https://example.invalid/source', '{}')",
+                    rusqlite::params![id],
+                )?;
+                conn.execute(
+                    "INSERT INTO memory_verifications (
+                         id, memory_id, actor, verified_at, metadata_json
+                     ) VALUES ('verification-1', ?1, 'reviewer', '2026-08-15T00:00:00Z', '{}')",
+                    rusqlite::params![id],
+                )?;
+                agent_memory::concepts::insert_relationship(
+                    &conn,
+                    id,
+                    Some(peer),
+                    peer,
+                    "supports",
+                    revision,
+                    None,
+                )
+            },
+        )
+        .unwrap();
+
+        q::update_condensation(
+            &conn,
+            id,
+            "concise body",
+            "verbose original body",
+            "test:stamp",
+            &[1.0, 0.0],
+            EMBEDDING_MODEL_NAME,
+        )
+        .unwrap();
+
+        let state: (String, i64, i64, i64, i64, String, String) = conn
+            .query_row(
+                "SELECT c.extensions_json, c.current_revision,
+                        (SELECT COUNT(*) FROM memory_sources WHERE memory_id = ?1),
+                        (SELECT COUNT(*) FROM memory_relationships WHERE src_memory_id = ?1),
+                        (SELECT COUNT(*) FROM memory_verifications WHERE memory_id = ?1),
+                        r.operation, r.actor
+                 FROM memory_concepts c
+                 JOIN memory_revisions r ON r.memory_id = c.memory_id
+                      AND r.revision = c.current_revision
+                 WHERE c.memory_id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(state.0.contains("x-producer"));
+        assert_eq!(state.1, 3);
+        assert_eq!(state.2, 1);
+        assert_eq!(state.3, 1);
+        assert_eq!(state.4, 0);
+        assert_eq!(state.5, "condense");
+        assert_eq!(state.6, "memory-dream");
     }
 
     /// Apply-mode pass stamps `project_state.last_dream_at`.

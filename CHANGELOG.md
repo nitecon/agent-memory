@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.12.0 - 2026-08-15
+
+- Made every durable SQLite memory a canonical OKF concept with lossless virtual
+  Markdown documents/bundles, generated indexes/logs, immutable semantic
+  revisions, compare-and-swap updates, provenance, verification, lifecycle
+  state, arbitrary extensions, and bounded typed graph traversal.
+- Added `memory okf` validate/get/put/read/list/index/log/history/diff/graph,
+  explicit safe import/export, corresponding MCP tools, and
+  `okf+memory://...` Markdown resources. WorkingContext remains completely
+  outside the OKF surface.
+- Extended retrieval and Dream curation with OKF metadata, freshness/trust,
+  graph context, provenance-aware revisions, verification invalidation, and
+  contradiction preservation.
+- Added an explicitly capability-gated gateway `okf-markdown` envelope and
+  semantic hash while retaining legacy fields, hashes, conflict behavior, and
+  tombstones. Unknown extension fields round-trip across mixed-version sync.
+- Made the complete schema upgrade chain atomic and added migration retry,
+  WAL concurrency, hostile-input, graph-budget, and release injection-probe
+  conformance coverage.
+
 ## v1.11.1 - 2026-06-18
 
 - Gateway-aware rules block now decides **programmatically at runtime** from gateway-configured state: when a gateway is configured the injected block omits the post-action save directive (Rule B + quality gate, because the gateway's `tasks done` reminder owns the save nudge), otherwise it keeps Rule B as the fallback. Removed the `AGENT_MEMORY_GATEWAY_SAVE_REMINDER` env var / config flag introduced in v1.11.0 — derivable state should not require a manually-set environment variable.

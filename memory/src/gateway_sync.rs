@@ -7,9 +7,9 @@ use crate::db::models::{Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert};
 use crate::db::queries;
 use crate::error::MemoryError;
 use crate::sync::{
-    memory_content_hash, GatewayMemory, GatewayMemoryProvenance, GatewayMemoryTombstone,
-    GatewaySyncClientError, MemoryGatewayClient, PushMemoriesRequest, PushMemoryAction,
-    PushMemoryResult,
+    gateway_okf_envelope, memory_content_hash, GatewayMemory, GatewayMemoryProvenance,
+    GatewayMemoryTombstone, GatewaySyncClientError, MemoryGatewayClient, PushMemoriesRequest,
+    PushMemoryAction, PushMemoryResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,13 @@ pub fn push_memory_update_if_configured(
     };
 
     let sync = queries::get_memory_gateway_sync(conn, &memory.id)?;
-    let gateway_memory = gateway_memory_from_local(memory, project, sync.as_ref())?;
+    let gateway_memory = gateway_memory_from_local(
+        conn,
+        memory,
+        project,
+        sync.as_ref(),
+        gateway_config.okf_sync_enabled(),
+    )?;
     let content_hash = gateway_memory.content_hash.clone();
     let result = push_single(gateway_config, gateway_memory)?;
 
@@ -96,7 +102,14 @@ pub fn tombstone_memory_before_local_removal(
         });
     }
 
-    let gateway_memory = gateway_tombstone_from_local(memory, project, &sync, reason)?;
+    let gateway_memory = gateway_tombstone_from_local(
+        conn,
+        memory,
+        project,
+        &sync,
+        reason,
+        gateway_config.okf_sync_enabled(),
+    )?;
     let content_hash = gateway_memory.content_hash.clone();
     let result = push_single(gateway_config, gateway_memory)?;
 
@@ -130,9 +143,11 @@ fn gateway_project_for_memory<'a>(
 }
 
 fn gateway_memory_from_local(
+    conn: &Connection,
     memory: &Memory,
     project: &str,
     sync: Option<&MemoryGatewaySync>,
+    okf_enabled: bool,
 ) -> Result<GatewayMemory, MemoryError> {
     if memory.project.as_deref() != Some(project) {
         return Err(MemoryError::Config(format!(
@@ -146,12 +161,18 @@ fn gateway_memory_from_local(
         .unwrap_or_else(|| "user".to_string());
     let tags = memory.tags.clone().unwrap_or_default();
     let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
+    let okf = okf_enabled
+        .then(|| gateway_okf_envelope(conn, memory))
+        .transpose()?;
+    let concept_hash = okf.as_ref().map(|envelope| envelope.semantic_hash.clone());
     Ok(GatewayMemory {
         project: project.to_string(),
         content: memory.content.clone(),
         memory_type,
         tags,
         content_hash,
+        concept_hash,
+        okf,
         local_memory_id: Some(memory.id.clone()),
         client_id: Some(memory.id.clone()),
         gateway_memory_id: sync.map(|record| record.gateway_memory_id.clone()),
@@ -165,12 +186,15 @@ fn gateway_memory_from_local(
 }
 
 fn gateway_tombstone_from_local(
+    conn: &Connection,
     memory: &Memory,
     project: &str,
     sync: &MemoryGatewaySync,
     reason: &str,
+    okf_enabled: bool,
 ) -> Result<GatewayMemory, MemoryError> {
-    let mut gateway_memory = gateway_memory_from_local(memory, project, Some(sync))?;
+    let mut gateway_memory =
+        gateway_memory_from_local(conn, memory, project, Some(sync), okf_enabled)?;
     gateway_memory.tombstone = Some(GatewayMemoryTombstone {
         deleted: true,
         deleted_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -194,6 +218,8 @@ pub fn gateway_tombstone_from_sync(record: &MemoryGatewaySync, reason: &str) -> 
         memory_type: "project".to_string(),
         tags: Vec::new(),
         content_hash,
+        concept_hash: None,
+        okf: None,
         local_memory_id: Some(record.local_memory_id.clone()),
         client_id: Some(record.local_memory_id.clone()),
         gateway_memory_id: Some(record.gateway_memory_id.clone()),
@@ -394,6 +420,7 @@ mod tests {
             base_url: Some(base_url),
             api_key: Some("test-key".to_string()),
             auto_sync: Some(true),
+            okf_sync: None,
         }
     }
 
@@ -521,6 +548,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:1".to_string()),
             api_key: Some("test-key".to_string()),
             auto_sync: Some(true),
+            okf_sync: None,
         };
 
         let outcome =
@@ -532,6 +560,25 @@ mod tests {
                 reason: "memory is not linked to gateway"
             }
         );
+    }
+
+    #[test]
+    fn local_gateway_projection_is_capability_gated() {
+        let conn = open_mem_db();
+        let memory = insert_memory(&conn, "agent-memory", "body");
+        let legacy =
+            gateway_memory_from_local(&conn, &memory, "agent-memory", None, false).unwrap();
+        assert!(legacy.okf.is_none());
+        assert!(legacy.concept_hash.is_none());
+
+        let capable =
+            gateway_memory_from_local(&conn, &memory, "agent-memory", None, true).unwrap();
+        assert!(capable.okf.is_some());
+        assert_eq!(
+            capable.concept_hash.as_deref(),
+            capable.okf.as_ref().map(|okf| okf.semantic_hash.as_str())
+        );
+        assert_eq!(legacy.content_hash, capable.content_hash);
     }
 
     fn spawn_gateway<F>(handler: F) -> (String, std::thread::JoinHandle<Value>)

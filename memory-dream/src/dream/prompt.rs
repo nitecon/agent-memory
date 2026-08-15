@@ -95,6 +95,7 @@ INPUT
 Type: {memory_type}
 Scope: {project_or_global}
 Tags: {tags}
+OKF metadata/graph context: {okf_context}
 
 <<<MEMORY>>>
 {content}
@@ -117,6 +118,8 @@ pub struct CondensePromptInputs<'a> {
     pub tags: Option<&'a str>,
     /// The memory body — wrapped in `<<<MEMORY>>> ... <<<END>>>`.
     pub content: &'a str,
+    /// Bounded structured metadata and one-hop relationship context.
+    pub okf_context: Option<&'a str>,
 }
 
 /// Produce the final per-memory condensation prompt.
@@ -134,6 +137,7 @@ pub fn build_condense_prompt(inputs: &CondensePromptInputs<'_>) -> String {
             inputs.project_or_global.unwrap_or("-"),
         )
         .replace("{tags}", tag_display(inputs.tags))
+        .replace("{okf_context}", inputs.okf_context.unwrap_or("-"))
         .replace("{content}", inputs.content)
 }
 
@@ -176,6 +180,7 @@ mod tests {
             project_or_global: Some("agent-memory"),
             tags: Some("architecture,dream"),
             content,
+            okf_context: None,
         }
     }
 
@@ -198,6 +203,7 @@ mod tests {
             !p.contains("{memory_type}")
                 && !p.contains("{project_or_global}")
                 && !p.contains("{tags}")
+                && !p.contains("{okf_context}")
                 && !p.contains("{content}"),
             "all placeholders must be consumed"
         );
@@ -221,6 +227,15 @@ mod tests {
         i.tags = Some("   ");
         let p = build_condense_prompt(&i);
         assert!(p.contains("Tags: -"), "whitespace-only tags must collapse");
+    }
+
+    #[test]
+    fn build_condense_prompt_includes_bounded_okf_context_as_data() {
+        let mut input = inputs_for("body");
+        input.okf_context = Some("title=Canonical; neighbor=supports:abc");
+        let prompt = build_condense_prompt(&input);
+        assert!(prompt.contains("OKF metadata/graph context: title=Canonical"));
+        assert!(prompt.contains("neighbor=supports:abc"));
     }
 
     #[test]

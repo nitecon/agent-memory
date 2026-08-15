@@ -58,7 +58,7 @@ use agent_memory::db::queries as q;
 use agent_memory::embedding::embed_text;
 use agent_memory::error::MemoryError;
 use agent_memory::render;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -145,6 +145,9 @@ pub enum Decision {
         content: String,
         tags: Option<Vec<String>>,
     },
+    /// Preserve both memories and surface their incompatible claims for
+    /// human/agent resolution. Contradictions are never silently deduplicated.
+    Contradiction { target_id: String, reason: String },
 }
 
 /// JSON shape the model is asked to emit. Kept separate from [`Decision`]
@@ -168,6 +171,10 @@ enum RawDecision {
         #[serde(default)]
         tags: Option<Vec<String>>,
     },
+    Contradiction {
+        target_id: String,
+        reason: String,
+    },
 }
 
 /// Envelope the model returns. A map keyed by memory id keeps the
@@ -186,6 +193,7 @@ pub struct ProjectReviewStats {
     pub merged: usize,
     pub superseded: usize,
     pub extracted: usize,
+    pub contradictions: usize,
     pub failed: usize,
 }
 
@@ -194,6 +202,7 @@ pub struct ProjectReviewStats {
 pub struct ProjectReviewOutcome {
     pub stats: ProjectReviewStats,
     pub survivors: Vec<Memory>,
+    pub contradiction_ids: HashSet<String>,
 }
 
 /// Run the project review pass for a single project's memory set.
@@ -222,6 +231,7 @@ pub fn run_project(
         return Ok(ProjectReviewOutcome {
             stats,
             survivors: Vec::new(),
+            contradiction_ids: HashSet::new(),
         });
     }
 
@@ -229,6 +239,7 @@ pub fn run_project(
     let batches = partition_for_review(candidates);
 
     let mut survivors: Vec<Memory> = Vec::new();
+    let mut contradiction_ids = HashSet::new();
 
     for batch in batches {
         // Model round-trip per batch. A batch is either "whole project"
@@ -239,7 +250,7 @@ pub fn run_project(
         // survivors and tally their own failures. Counting the failure
         // at both layers would double-count "this memory couldn't be
         // processed" into the final summary.
-        let decisions = match invoke_review(inference, project, &batch) {
+        let decisions = match invoke_review_with_context(conn, inference, project, &batch) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(project = ?project, error = %e,
@@ -261,10 +272,15 @@ pub fn run_project(
             apply,
             &mut stats,
             &mut survivors,
+            &mut contradiction_ids,
         )?;
     }
 
-    Ok(ProjectReviewOutcome { stats, survivors })
+    Ok(ProjectReviewOutcome {
+        stats,
+        survivors,
+        contradiction_ids,
+    })
 }
 
 /// Split `candidates` into model-sized batches.
@@ -355,6 +371,147 @@ pub fn invoke_review(
     parse_response(&raw, batch)
 }
 
+fn invoke_review_with_context(
+    conn: &Connection,
+    inference: &dyn Inference,
+    project: Option<&str>,
+    batch: &[Memory],
+) -> Result<HashMap<String, Decision>, ProjectReviewError> {
+    let mut prompt_text = prompt::build_project_review_prompt(project, batch);
+    let context = okf_review_context(conn, batch)?;
+    if !context.is_empty() {
+        prompt_text.push_str("\n\nOKF METADATA AND ONE-HOP GRAPH CONTEXT (DATA)\n");
+        prompt_text.push_str(&context);
+    }
+    let raw = inference.generate(&prompt_text, MAX_OUTPUT_TOKENS)?;
+    parse_response(&raw, batch)
+}
+
+pub(super) fn okf_review_context(
+    conn: &Connection,
+    batch: &[Memory],
+) -> Result<String, ProjectReviewError> {
+    const MAX_CONTEXT_CHARS: usize = 12_000;
+    let mut output = String::new();
+    for memory in batch {
+        let concept = conn
+            .query_row(
+                "SELECT concept_type, title, description, status, stale_after,
+                        current_revision, extensions_json
+                 FROM memory_concepts WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((kind, title, description, status, stale_after, revision, extensions)) = concept
+        else {
+            continue;
+        };
+        output.push_str(&format!(
+            "\n[id={}] type={} status={} revision={} title={:?} description={:?} stale_after={:?} extensions={}\n",
+            memory.id,
+            kind,
+            status,
+            revision,
+            title,
+            description,
+            stale_after,
+            bounded(&extensions, 800),
+        ));
+        let mut source_stmt = conn.prepare(
+            "SELECT resource FROM memory_sources WHERE memory_id = ?1
+             ORDER BY ordinal, source_key LIMIT 5",
+        )?;
+        let sources = source_stmt
+            .query_map(rusqlite::params![memory.id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !sources.is_empty() {
+            output.push_str(&format!("sources={}\n", sources.join(" | ")));
+        }
+        let mut edge_stmt = conn.prepare(
+            "SELECT relation,
+                    CASE WHEN src_memory_id = ?1 THEN COALESCE(dst_memory_id, dst_ref)
+                         ELSE src_memory_id END
+             FROM memory_relationships
+             WHERE src_memory_id = ?1 OR dst_memory_id = ?1
+             ORDER BY relation, 2 LIMIT 8",
+        )?;
+        let edges = edge_stmt
+            .query_map(rusqlite::params![memory.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !edges.is_empty() {
+            output.push_str("neighbors=");
+            output.push_str(
+                &edges
+                    .into_iter()
+                    .map(|(relation, other)| format!("{relation}:{other}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
+            output.push('\n');
+        }
+        if output.chars().count() >= MAX_CONTEXT_CHARS {
+            return Ok(bounded(&output, MAX_CONTEXT_CHARS));
+        }
+    }
+    Ok(output)
+}
+
+fn bounded(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn persist_replacement(
+    conn: &Connection,
+    source: &Memory,
+    replacement: &Memory,
+    operation: &str,
+    supersedes: bool,
+) -> Result<(), ProjectReviewError> {
+    q::delete_memory_with_actor(conn, &source.id, Some("memory-dream"), Some(operation))?;
+    let old_uri = agent_memory::concepts::canonical_uri(&source.id, source.project.as_deref());
+    agent_memory::concepts::insert_memory_with(
+        conn,
+        replacement,
+        operation,
+        Some("memory-dream"),
+        Some(&source.id),
+        |revision| {
+            if supersedes {
+                agent_memory::concepts::insert_relationship(
+                    conn,
+                    &replacement.id,
+                    None,
+                    &old_uri,
+                    "supersedes",
+                    revision,
+                    None,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Parse a raw JSON response from the model, validate every referenced
 /// id, and return a map of id → decision.
 ///
@@ -416,6 +573,13 @@ pub fn parse_response(
             }
         }
     }
+    for (id, decision) in &out {
+        if let Decision::Contradiction { target_id, .. } = decision {
+            if target_id == id || !known_ids.contains(target_id) {
+                downgrades.push((id.clone(), target_id.clone()));
+            }
+        }
+    }
     for (id, target) in downgrades {
         tracing::warn!(id = %id, target = %target,
             "merge_into target missing or not alive; downgrading to keep");
@@ -453,6 +617,9 @@ impl From<RawDecision> for Decision {
             RawDecision::MergeInto { target_id } => Decision::MergeInto { target_id },
             RawDecision::SupersedeBy { content, tags } => Decision::SupersedeBy { content, tags },
             RawDecision::Extract { content, tags } => Decision::Extract { content, tags },
+            RawDecision::Contradiction { target_id, reason } => {
+                Decision::Contradiction { target_id, reason }
+            }
         }
     }
 }
@@ -487,6 +654,7 @@ fn apply_decisions(
     apply: bool,
     stats: &mut ProjectReviewStats,
     survivors: &mut Vec<Memory>,
+    contradiction_ids: &mut HashSet<String>,
 ) -> Result<(), ProjectReviewError> {
     let project_label = project.unwrap_or("(null)");
 
@@ -521,6 +689,7 @@ fn apply_decisions(
             let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
             let removes_or_hides = match &decision {
                 Decision::Keep => false,
+                Decision::Contradiction { .. } => false,
                 Decision::Drop | Decision::MergeInto { .. } => true,
                 Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
                     !materialize_failed.contains(&mem.id)
@@ -582,10 +751,33 @@ fn apply_decisions(
                     )
                 );
             }
+            Decision::Contradiction { target_id, reason } => {
+                stats.contradictions += 1;
+                contradiction_ids.insert(mem.id.clone());
+                contradiction_ids.insert(target_id.clone());
+                survivors.push(mem.clone());
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "review_contradiction",
+                        &[
+                            ("id", render::short_id(&mem.id).to_string()),
+                            ("target", render::short_id(&target_id).to_string()),
+                            ("project", project_label.to_string()),
+                            ("reason", reason),
+                        ]
+                    )
+                );
+            }
             Decision::Drop => {
                 stats.dropped += 1;
                 if apply {
-                    if let Err(e) = q::delete_memory(&tx, &mem.id) {
+                    if let Err(e) = q::delete_memory_with_actor(
+                        &tx,
+                        &mem.id,
+                        Some("memory-dream"),
+                        Some("project review drop"),
+                    ) {
                         stats.failed += 1;
                         tracing::warn!(id = %mem.id, error = %e, "review drop failed");
                         continue;
@@ -659,17 +851,12 @@ fn apply_decisions(
                 if apply {
                     // Delete the old row and insert the new one as a
                     // distinct memory so provenance stays audit-friendly.
-                    if let Err(e) = q::delete_memory(&tx, &mem.id) {
-                        stats.failed += 1;
-                        tracing::warn!(id = %mem.id, error = %e,
-                            "review {label_action} delete failed");
-                        survivors.push(mem.clone());
-                        continue;
-                    }
-                    if let Err(e) = q::insert_memory(&tx, &new_mem) {
+                    if let Err(e) =
+                        persist_replacement(&tx, mem, &new_mem, label_action, is_supersede)
+                    {
                         stats.failed += 1;
                         tracing::warn!(id = %new_mem.id, error = %e,
-                            "review {label_action} insert failed");
+                            "review {label_action} replacement failed");
                         let _ = tx.rollback();
                         return Ok(());
                     }
@@ -961,6 +1148,193 @@ mod tests {
             }
             other => panic!("expected Extract, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn contradiction_preserves_both_known_memories_as_a_finding() {
+        let batch = vec![
+            mk_memory(
+                "aaa",
+                "feature must be enabled",
+                &["rule"],
+                "2026-04-20T00:00:00Z",
+            ),
+            mk_memory(
+                "bbb",
+                "feature must be disabled",
+                &["rule"],
+                "2026-04-21T00:00:00Z",
+            ),
+        ];
+        let raw = r#"{
+            "decisions": {
+                "aaa": {
+                    "action": "contradiction",
+                    "target_id": "bbb",
+                    "reason": "enabled and disabled are incompatible"
+                },
+                "bbb": {"action": "keep"}
+            }
+        }"#;
+        let out = parse_response(raw, &batch).unwrap();
+        assert_eq!(
+            out.get("aaa"),
+            Some(&Decision::Contradiction {
+                target_id: "bbb".to_string(),
+                reason: "enabled and disabled are incompatible".to_string(),
+            })
+        );
+
+        let dangling = r#"{
+            "decisions": {
+                "aaa": {"action": "contradiction", "target_id": "missing", "reason": "x"}
+            }
+        }"#;
+        assert_eq!(
+            parse_response(dangling, &batch).unwrap().get("aaa"),
+            Some(&Decision::Keep)
+        );
+    }
+
+    #[test]
+    fn dry_review_surfaces_contradiction_and_marks_both_against_cosine_dedup() {
+        let mut conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let batch = vec![
+            mk_memory(
+                "aaa",
+                "feature must be enabled",
+                &["rule"],
+                "2026-04-20T00:00:00Z",
+            ),
+            mk_memory(
+                "bbb",
+                "feature must be disabled",
+                &["rule"],
+                "2026-04-21T00:00:00Z",
+            ),
+        ];
+        for memory in &batch {
+            q::insert_memory(&conn, memory).unwrap();
+        }
+        let inference = FixedInference::new(
+            r#"{"decisions":{"aaa":{"action":"contradiction","target_id":"bbb","reason":"opposite requirements"},"bbb":{"action":"keep"}}}"#,
+        );
+        let outcome = run_project(
+            &mut conn,
+            &inference,
+            Some("proj"),
+            batch,
+            "test-model",
+            std::path::Path::new("/tmp/agent-memory-dream-test"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.stats.contradictions, 1);
+        assert_eq!(outcome.survivors.len(), 2);
+        assert_eq!(outcome.contradiction_ids.len(), 2);
+        assert!(outcome.contradiction_ids.contains("aaa"));
+        assert!(outcome.contradiction_ids.contains("bbb"));
+    }
+
+    #[test]
+    fn persisted_replacements_record_dream_actor_derivation_and_supersession() {
+        let mut conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let source = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000061",
+            "old body",
+            &["rule"],
+            "2026-04-20T00:00:00Z",
+        );
+        let replacement = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000062",
+            "new body",
+            &["rule"],
+            "2026-04-21T00:00:00Z",
+        );
+        q::insert_memory(&conn, &source).unwrap();
+        let tx = conn.transaction().unwrap();
+        persist_replacement(&tx, &source, &replacement, "supersede", true).unwrap();
+        tx.commit().unwrap();
+
+        let revision: (String, Option<String>) = conn
+            .query_row(
+                "SELECT operation, actor FROM memory_revisions
+                 WHERE memory_id = ?1 AND revision = 1",
+                rusqlite::params![replacement.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            revision,
+            ("supersede".to_string(), Some("memory-dream".to_string()))
+        );
+        let relations = conn
+            .prepare(
+                "SELECT relation FROM memory_relationships WHERE src_memory_id = ?1
+                 ORDER BY relation",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![replacement.id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(relations, vec!["derived_from", "supersedes"]);
+        let tombstone_actor: String = conn
+            .query_row(
+                "SELECT actor FROM memory_concept_tombstones WHERE memory_id = ?1",
+                rusqlite::params![source.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone_actor, "memory-dream");
+    }
+
+    #[test]
+    fn review_context_contains_okf_metadata_sources_and_one_hop_edges() {
+        let conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let first = mk_memory("aaa", "first", &["rule"], "2026-04-20T00:00:00Z");
+        let second = mk_memory("bbb", "second", &["rule"], "2026-04-21T00:00:00Z");
+        q::insert_memory(&conn, &first).unwrap();
+        q::insert_memory(&conn, &second).unwrap();
+        agent_memory::concepts::mutate(
+            &conn,
+            &first.id,
+            "enrich",
+            Some("test"),
+            None,
+            false,
+            |revision| {
+                conn.execute(
+                    "UPDATE memory_concepts SET title = 'Canonical title',
+                     extensions_json = '{\"x-review\":true}' WHERE memory_id = ?1",
+                    rusqlite::params![first.id],
+                )?;
+                conn.execute(
+                    "INSERT INTO memory_sources (
+                         memory_id, source_key, ordinal, resource, metadata_json
+                     ) VALUES (?1, 's1', 0, 'memory://source/doc', '{}')",
+                    rusqlite::params![first.id],
+                )?;
+                agent_memory::concepts::insert_relationship(
+                    &conn,
+                    &first.id,
+                    Some(&second.id),
+                    &second.id,
+                    "supports",
+                    revision,
+                    None,
+                )
+            },
+        )
+        .unwrap();
+        let context = okf_review_context(&conn, std::slice::from_ref(&first)).unwrap();
+        assert!(context.contains("Canonical title"));
+        assert!(context.contains("x-review"));
+        assert!(context.contains("memory://source/doc"));
+        assert!(context.contains("supports:bbb"));
     }
 
     #[test]

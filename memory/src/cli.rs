@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, io::Read, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    env,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
@@ -16,9 +21,9 @@ use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
 use crate::setup::{gateway, hooks, menu, rules, skill};
 use crate::sync::{
-    memory_content_hash, GatewayMemory, GatewayMemoryProvenance, GatewayMemoryTombstone,
-    GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse,
-    PushMemoriesRequest, PushMemoriesResponse, PushMemoryAction,
+    gateway_okf_envelope, memory_content_hash, GatewayMemory, GatewayMemoryProvenance,
+    GatewayMemoryTombstone, GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest,
+    PullMemoriesResponse, PushMemoriesRequest, PushMemoriesResponse, PushMemoryAction,
 };
 
 /// Score multiplier applied to memories tagged with the current project.
@@ -64,6 +69,11 @@ pub enum MemoryScope {
 #[derive(Parser)]
 #[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents", version = env!("AGENT_MEMORY_VERSION"))]
 pub enum Cli {
+    /// Read, validate, write, traverse, import, and export OKF-native memories.
+    Okf {
+        #[command(subcommand)]
+        command: OkfCommands,
+    },
     /// Save a memory with auto-embedding and BM25 indexing.
     ///
     /// If --project is omitted, the current project is auto-detected from the
@@ -72,6 +82,10 @@ pub enum Cli {
     Store {
         /// Memory content text.
         content: String,
+        /// Optional OKF Markdown document; its body and metadata replace the
+        /// plain positional content while preserving the legacy invocation.
+        #[arg(long)]
+        okf_file: Option<PathBuf>,
         /// Comma-separated tags.
         #[arg(short, long)]
         tags: Option<String>,
@@ -118,6 +132,15 @@ pub enum Cli {
         /// Disable the current-project boost entirely.
         #[arg(long)]
         no_project_boost: bool,
+        /// Exact OKF concept type filter (for example `Agent Memory/project`).
+        #[arg(long)]
+        concept_type: Option<String>,
+        /// Exact tag filter.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Text-seeded graph expansion depth (0 disables; capped at 2 for retrieval).
+        #[arg(long, default_value_t = 1)]
+        graph_depth: usize,
         /// Output format (default: brief).
         #[arg(long, value_enum, default_value_t = OutputFormat::Brief)]
         format: OutputFormat,
@@ -355,6 +378,9 @@ pub enum Cli {
         /// self-updater path.
         #[arg(long)]
         content: Option<String>,
+        /// Re-author from a complete OKF Markdown document.
+        #[arg(long, conflicts_with = "content")]
+        okf_file: Option<PathBuf>,
         /// Optional comma-separated tag replacement. Omit to preserve
         /// existing tags. Ignored by the self-updater path.
         #[arg(long)]
@@ -369,6 +395,94 @@ pub enum Cli {
     Setup {
         #[command(subcommand)]
         command: Option<SetupCommands>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum GraphDirection {
+    In,
+    Out,
+    Both,
+}
+
+#[derive(Subcommand)]
+pub enum OkfCommands {
+    /// Validate an OKF Markdown document.
+    Validate { file: PathBuf },
+    /// Render one canonical memory as OKF Markdown.
+    Get { target: String },
+    /// Create or update a canonical OKF memory.
+    Put {
+        target: String,
+        #[arg(long, default_value = "-")]
+        file: PathBuf,
+        #[arg(long)]
+        expect_revision: Option<i64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read a virtual bundle document.
+    Read { bundle: String, path: String },
+    /// List a virtual bundle directory.
+    List {
+        bundle: String,
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Render a root, type, or tag index.
+    Index {
+        bundle: String,
+        #[arg(long = "type", conflicts_with = "tag")]
+        concept_type: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Render paginated immutable history for a bundle.
+    Log {
+        bundle: String,
+        #[arg(long)]
+        cursor: Option<usize>,
+        #[arg(short = 'k', long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// List immutable revisions for one memory.
+    History {
+        id: String,
+        #[arg(short = 'k', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Compare two immutable revisions.
+    Diff { id: String, rev_a: i64, rev_b: i64 },
+    /// Traverse typed memory relationships.
+    Graph {
+        target: String,
+        #[arg(long)]
+        relation: Option<String>,
+        #[arg(long, value_enum, default_value_t = GraphDirection::Out)]
+        direction: GraphDirection,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(short = 'k', long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Export an explicit physical projection of a virtual bundle.
+    Export {
+        bundle: String,
+        target: PathBuf,
+        #[arg(long = "id")]
+        ids: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Import a physical OKF bundle through the canonical handlers.
+    Import {
+        source: PathBuf,
+        #[arg(long, conflicts_with = "scope")]
+        project: Option<String>,
+        #[arg(long, value_enum)]
+        scope: Option<MemoryScope>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -521,8 +635,12 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
     let cwd_project = project::project_ident_from_cwd().ok();
 
     match cmd {
+        Cli::Okf { command } => {
+            execute_okf(command, conn, cwd_project.as_deref())?;
+        }
         Cli::Store {
             content,
+            okf_file,
             tags,
             project,
             agent,
@@ -574,19 +692,41 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 }
             };
 
-            let mut memory = Memory::new(
-                content.clone(),
-                tag_list,
-                resolved_project,
-                agent,
-                source_file,
-                Some(memory_type.clone()),
-            );
-
-            let emb = embedding::embed_text(&content, &config.model_cache_dir)?;
-            memory.embedding = Some(emb);
-
-            queries::insert_memory(conn, &memory)?;
+            let memory = if let Some(okf_file) = okf_file {
+                let text = read_text_path(&okf_file)?;
+                let parsed = agent_memory::okf::parse_document(&text)
+                    .map_err(|error| MemoryError::Config(error.to_string()))?;
+                let emb = embedding::embed_text(&parsed.concept.body, &config.model_cache_dir)?;
+                let scope = match resolved_scope {
+                    MemoryScope::Global => agent_memory::okf::BundleScope::Global,
+                    MemoryScope::Project => resolved_project
+                        .as_ref()
+                        .map(|project| agent_memory::okf::BundleScope::Project(project.clone()))
+                        .unwrap_or(agent_memory::okf::BundleScope::Unscoped),
+                };
+                let put = agent_memory::okf::OkfDocumentHandler::new(conn, scope)
+                    .put(None, &parsed, None, false)
+                    .map_err(okf_cli_error)?;
+                let blob = embedding_to_blob(&emb);
+                conn.execute(
+                    "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
+                    rusqlite::params![blob, EMBEDDING_MODEL_NAME_DEFAULT, put.id],
+                )?;
+                queries::get_memory_by_id(conn, &put.id)?
+            } else {
+                let mut memory = Memory::new(
+                    content.clone(),
+                    tag_list,
+                    resolved_project,
+                    agent,
+                    source_file,
+                    Some(memory_type.clone()),
+                );
+                let emb = embedding::embed_text(&content, &config.model_cache_dir)?;
+                memory.embedding = Some(emb);
+                queries::insert_memory(conn, &memory)?;
+                memory
+            };
 
             let mut attrs: Vec<(&str, String)> = vec![
                 ("id", render::short_id(&memory.id).to_string()),
@@ -619,6 +759,9 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             project,
             only,
             no_project_boost,
+            concept_type,
+            tag,
+            graph_depth,
             format: _,
             preview_chars: _,
         } => {
@@ -631,6 +774,9 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 only_project: only.as_deref(),
                 global_project: boosts.global_project,
                 global_boost_factor: boosts.global_boost,
+                concept_type: concept_type.as_deref(),
+                tag: tag.as_deref(),
+                graph_depth,
             };
             let results = search::hybrid_search(conn, &query, opts, &config.model_cache_dir)?;
             print_ranked(&results, &boosts, &query, None, false);
@@ -937,11 +1083,16 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         Cli::Update {
             id,
             content,
+            okf_file,
             tags,
             memory_type,
         } => match id {
             None => {
-                if content.is_some() || tags.is_some() || memory_type.is_some() {
+                if content.is_some()
+                    || okf_file.is_some()
+                    || tags.is_some()
+                    || memory_type.is_some()
+                {
                     return Err(MemoryError::Config(
                         "`memory update --content ...` requires a positional <id>. \
                              Run `memory update <id> --content \"...\"` to re-author, or \
@@ -952,19 +1103,24 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 crate::updater::manual_update()?;
             }
             Some(raw_id) => {
-                let new_content = content.ok_or_else(|| {
-                    MemoryError::Config(
-                        "`memory update <id>` requires --content \"...\"".to_string(),
-                    )
-                })?;
-                run_update_content(
-                    conn,
-                    &config,
-                    &raw_id,
-                    &new_content,
-                    tags.as_deref(),
-                    memory_type.as_deref(),
-                )?;
+                if let Some(okf_file) = okf_file {
+                    run_update_okf(conn, &config, &raw_id, &okf_file)?;
+                } else {
+                    let new_content = content.ok_or_else(|| {
+                        MemoryError::Config(
+                            "`memory update <id>` requires --content \"...\" or --okf-file FILE"
+                                .to_string(),
+                        )
+                    })?;
+                    run_update_content(
+                        conn,
+                        &config,
+                        &raw_id,
+                        &new_content,
+                        tags.as_deref(),
+                        memory_type.as_deref(),
+                    )?;
+                }
             }
         },
         Cli::Setup { command } => {
@@ -972,6 +1128,430 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         }
     }
     Ok(())
+}
+
+fn execute_okf(
+    command: OkfCommands,
+    conn: &Connection,
+    cwd_project: Option<&str>,
+) -> Result<(), MemoryError> {
+    use crate::concepts::graph::{self, Direction, TraversalOptions};
+    use agent_memory::okf::{BundleScope, OkfBundleHandler, OkfDocumentHandler};
+
+    match command {
+        OkfCommands::Validate { file } => {
+            let text = read_text_path(&file)?;
+            let handler = OkfDocumentHandler::new(conn, BundleScope::Unscoped);
+            let parsed = handler.validate(&text).map_err(okf_cli_error)?;
+            println!(
+                "{}",
+                render::render_action_result(
+                    "okf_valid",
+                    &[("diagnostics", parsed.diagnostics.len().to_string())],
+                )
+            );
+        }
+        OkfCommands::Get { target } => {
+            let id = resolve_okf_target(conn, &target)?;
+            let scope = okf_scope_for_id(conn, &id)?;
+            let rendered = OkfDocumentHandler::new(conn, scope)
+                .render(&id)
+                .map_err(okf_cli_error)?;
+            print!("{}", rendered.text);
+        }
+        OkfCommands::Put {
+            target,
+            file,
+            expect_revision,
+            dry_run,
+        } => {
+            let text = read_text_path(&file)?;
+            let parsed = agent_memory::okf::parse_document(&text)
+                .map_err(|error| MemoryError::Config(error.to_string()))?;
+            let target_arg = (target != "new").then_some(target.as_str());
+            let existing_id = if let Some(value) = target_arg {
+                match resolve_okf_target(conn, value) {
+                    Ok(id) => Some(id),
+                    Err(MemoryError::NotFound(_)) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let scope = if let Some(id) = existing_id.as_deref() {
+                okf_scope_for_id(conn, id)?
+            } else {
+                scope_from_concept(&parsed.concept, cwd_project)?
+            };
+            let handler = OkfDocumentHandler::new(conn, scope);
+            let effective_target = existing_id.as_deref().or(target_arg);
+            let result = handler
+                .put(effective_target, &parsed, expect_revision, dry_run)
+                .map_err(okf_cli_error)?;
+            println!(
+                "{}",
+                render::render_action_result(
+                    if dry_run {
+                        "okf_put_dry_run"
+                    } else {
+                        "okf_put"
+                    },
+                    &[
+                        ("id", result.id),
+                        ("revision", result.revision.to_string()),
+                        ("created", result.created.to_string()),
+                        ("changed", result.changed.to_string()),
+                        ("fields", result.diff.fields.len().to_string()),
+                    ],
+                )
+            );
+        }
+        OkfCommands::Read { bundle, path } => {
+            let scope = BundleScope::parse_uri(&bundle).map_err(okf_cli_error)?;
+            let entry = OkfBundleHandler::new(conn, scope)
+                .read(&path)
+                .map_err(okf_cli_error)?;
+            print!("{}", entry.content);
+        }
+        OkfCommands::List { bundle, path } => {
+            let scope = BundleScope::parse_uri(&bundle).map_err(okf_cli_error)?;
+            for entry in OkfBundleHandler::new(conn, scope)
+                .list(&path)
+                .map_err(okf_cli_error)?
+            {
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "okf_entry",
+                        &[
+                            ("path", entry.path),
+                            ("kind", format!("{:?}", entry.kind).to_ascii_lowercase()),
+                            ("read_only", entry.read_only.to_string()),
+                        ],
+                    )
+                );
+            }
+        }
+        OkfCommands::Index {
+            bundle,
+            concept_type,
+            tag,
+        } => {
+            let scope = BundleScope::parse_uri(&bundle).map_err(okf_cli_error)?;
+            let entry = OkfBundleHandler::new(conn, scope)
+                .index(concept_type.as_deref(), tag.as_deref())
+                .map_err(okf_cli_error)?;
+            print!("{}", entry.content);
+        }
+        OkfCommands::Log {
+            bundle,
+            cursor,
+            limit,
+        } => {
+            let scope = BundleScope::parse_uri(&bundle).map_err(okf_cli_error)?;
+            let page = OkfBundleHandler::new(conn, scope)
+                .log(cursor, Some(limit))
+                .map_err(okf_cli_error)?;
+            print!("{}", page.document.content);
+            if let Some(next) = page.next_cursor {
+                println!("\n<!-- next-cursor: {next} -->");
+            }
+        }
+        OkfCommands::History { id, limit } => {
+            let id = resolve_okf_target(conn, &id)?;
+            let mut stmt = conn.prepare(
+                "SELECT revision, operation, actor, content_hash, created_at
+                 FROM memory_revisions WHERE memory_id = ?1
+                 ORDER BY revision DESC LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![id, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (revision, operation, actor, hash, at) in rows {
+                let mut attrs = vec![
+                    ("id", id.clone()),
+                    ("revision", revision.to_string()),
+                    ("operation", operation),
+                    ("hash", hash),
+                    ("at", at),
+                ];
+                if let Some(actor) = actor {
+                    attrs.push(("actor", actor));
+                }
+                println!("{}", render::render_action_result("okf_revision", &attrs));
+            }
+        }
+        OkfCommands::Diff { id, rev_a, rev_b } => {
+            let id = resolve_okf_target(conn, &id)?;
+            let left = revision_snapshot(conn, &id, rev_a)?;
+            let right = revision_snapshot(conn, &id, rev_b)?;
+            let left = left.as_object().ok_or_else(|| {
+                MemoryError::Config("revision snapshot is not an object".to_string())
+            })?;
+            let right = right.as_object().ok_or_else(|| {
+                MemoryError::Config("revision snapshot is not an object".to_string())
+            })?;
+            let keys = left
+                .keys()
+                .chain(right.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for field in keys {
+                if left.get(&field) != right.get(&field) {
+                    let before = bounded_value(left.get(&field).map(ToString::to_string));
+                    let after = bounded_value(right.get(&field).map(ToString::to_string));
+                    println!(
+                        "{}",
+                        render::render_action_result(
+                            "okf_diff",
+                            &[
+                                ("id", id.clone()),
+                                ("field", field),
+                                ("before", before),
+                                ("after", after),
+                            ],
+                        )
+                    );
+                }
+            }
+        }
+        OkfCommands::Graph {
+            target,
+            relation,
+            direction,
+            depth,
+            limit,
+        } => {
+            let id = resolve_okf_target(conn, &target)?;
+            let direction = match direction {
+                GraphDirection::In => Direction::Incoming,
+                GraphDirection::Out => Direction::Outgoing,
+                GraphDirection::Both => Direction::Both,
+            };
+            let relations = relation.into_iter().collect();
+            let result = graph::traverse(
+                conn,
+                std::slice::from_ref(&id),
+                &TraversalOptions {
+                    direction,
+                    relations,
+                    max_depth: depth,
+                    max_results: limit,
+                    ..TraversalOptions::default()
+                },
+            )?;
+            for path in result.paths {
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "okf_graph_path",
+                        &[
+                            ("root", id.clone()),
+                            ("path", path.nodes.join(" -> ")),
+                            ("depth", path.steps.len().to_string()),
+                            ("cycle", path.cycle.to_string()),
+                        ],
+                    )
+                );
+            }
+            for diagnostic in result.diagnostics {
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "okf_graph_unresolved",
+                        &[
+                            ("source", diagnostic.source),
+                            ("reference", diagnostic.reference),
+                            ("relation", diagnostic.relation),
+                        ],
+                    )
+                );
+            }
+        }
+        OkfCommands::Export {
+            bundle,
+            target,
+            ids,
+            dry_run,
+        } => {
+            let scope = BundleScope::parse_uri(&bundle).map_err(okf_cli_error)?;
+            let result = agent_memory::okf::export_bundle(conn, scope, &target, &ids, dry_run)
+                .map_err(okf_cli_error)?;
+            println!(
+                "{}",
+                render::render_action_result(
+                    if dry_run {
+                        "okf_export_dry_run"
+                    } else {
+                        "okf_exported"
+                    },
+                    &[
+                        ("target", target.display().to_string()),
+                        ("files", result.files.len().to_string()),
+                    ],
+                )
+            );
+        }
+        OkfCommands::Import {
+            source,
+            project,
+            scope,
+            dry_run,
+        } => {
+            let bundle_scope = match scope {
+                Some(MemoryScope::Global) => BundleScope::Global,
+                Some(MemoryScope::Project) | None => {
+                    let project = project
+                        .or_else(|| cwd_project.map(str::to_string))
+                        .ok_or_else(|| {
+                            MemoryError::Config(
+                                "OKF import requires --project outside a project directory"
+                                    .to_string(),
+                            )
+                        })?;
+                    BundleScope::Project(project)
+                }
+            };
+            let result = agent_memory::okf::import_bundle(conn, bundle_scope, &source, dry_run)
+                .map_err(okf_cli_error)?;
+            println!(
+                "{}",
+                render::render_action_result(
+                    if dry_run {
+                        "okf_import_dry_run"
+                    } else {
+                        "okf_imported"
+                    },
+                    &[
+                        ("created", result.created.to_string()),
+                        ("updated", result.updated.to_string()),
+                        ("unchanged", result.unchanged.to_string()),
+                    ],
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+fn okf_cli_error(error: agent_memory::okf::HandlerError) -> MemoryError {
+    MemoryError::Config(error.to_string())
+}
+
+fn read_text_path(path: &Path) -> Result<String, MemoryError> {
+    if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        Ok(text)
+    } else {
+        std::fs::read_to_string(path).map_err(MemoryError::from)
+    }
+}
+
+fn resolve_okf_target(conn: &Connection, target: &str) -> Result<String, MemoryError> {
+    let raw = if let Some(path) = target.strip_prefix("/memories/") {
+        path.strip_suffix(".md").unwrap_or(path)
+    } else if target.starts_with("memory://") {
+        target
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(target)
+    } else {
+        target
+    };
+    match queries::resolve_id_prefix(conn, raw)? {
+        ResolvedId::Exact(id) => Ok(id),
+        ResolvedId::Ambiguous(_) => {
+            Err(MemoryError::Config(format!("ambiguous memory ID `{raw}`")))
+        }
+        ResolvedId::NotFound => Err(MemoryError::NotFound(raw.to_string())),
+    }
+}
+
+fn okf_scope_for_id(
+    conn: &Connection,
+    id: &str,
+) -> Result<agent_memory::okf::BundleScope, MemoryError> {
+    let project = conn.query_row(
+        "SELECT project FROM memories WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    Ok(match project.as_deref() {
+        Some(GLOBAL_PROJECT_IDENT) => agent_memory::okf::BundleScope::Global,
+        Some(project) => agent_memory::okf::BundleScope::Project(project.to_string()),
+        None => agent_memory::okf::BundleScope::Unscoped,
+    })
+}
+
+fn scope_from_concept(
+    concept: &agent_memory::okf::OkfConcept,
+    cwd_project: Option<&str>,
+) -> Result<agent_memory::okf::BundleScope, MemoryError> {
+    let metadata = concept.agent_memory.as_ref();
+    match metadata.and_then(|value| value.scope.as_deref()) {
+        Some("global") => Ok(agent_memory::okf::BundleScope::Global),
+        Some("unscoped") => Ok(agent_memory::okf::BundleScope::Unscoped),
+        Some("project") | None => {
+            if metadata.and_then(|value| value.project.as_deref()) == Some(GLOBAL_PROJECT_IDENT) {
+                return Ok(agent_memory::okf::BundleScope::Global);
+            }
+            metadata
+                .and_then(|value| value.project.clone())
+                .or_else(|| cwd_project.map(str::to_string))
+                .map(agent_memory::okf::BundleScope::Project)
+                .ok_or_else(|| {
+                    MemoryError::Config(
+                        "new OKF concept requires project/scope metadata outside a project"
+                            .to_string(),
+                    )
+                })
+        }
+        Some(scope) => Err(MemoryError::Config(format!(
+            "unknown x-agent-memory scope `{scope}`"
+        ))),
+    }
+}
+
+fn revision_snapshot(
+    conn: &Connection,
+    id: &str,
+    revision: i64,
+) -> Result<serde_json::Value, MemoryError> {
+    let json: String = conn
+        .query_row(
+            "SELECT snapshot_json FROM memory_revisions
+             WHERE memory_id = ?1 AND revision = ?2",
+            rusqlite::params![id, revision],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                MemoryError::NotFound(format!("{id}@{revision}"))
+            }
+            other => MemoryError::Database(other),
+        })?;
+    serde_json::from_str(&json).map_err(MemoryError::from)
+}
+
+fn bounded_value(value: Option<String>) -> String {
+    let value = value.unwrap_or_else(|| "null".to_string());
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 /// Print a ranked result set (`search`/`context`) as grouped light-XML.
@@ -1078,6 +1658,9 @@ pub fn retrieve_context_block(
         only_project: only,
         global_project: boosts.global_project,
         global_boost_factor: boosts.global_boost,
+        concept_type: None,
+        tag: None,
+        graph_depth: 1,
     };
     let results = search::hybrid_search(conn, description, opts, &config.model_cache_dir)?;
     let working_context = if no_working_context {
@@ -1234,6 +1817,47 @@ fn run_update_content(
     Ok(())
 }
 
+fn run_update_okf(
+    conn: &Connection,
+    config: &Config,
+    raw_id: &str,
+    file: &Path,
+) -> Result<(), MemoryError> {
+    let id = resolve_okf_target(conn, raw_id)?;
+    let text = read_text_path(file)?;
+    let parsed = agent_memory::okf::parse_document(&text)
+        .map_err(|error| MemoryError::Config(error.to_string()))?;
+    let embedding = embedding::embed_text(&parsed.concept.body, &config.model_cache_dir)?;
+    let expected = parsed
+        .concept
+        .agent_memory
+        .as_ref()
+        .and_then(|metadata| metadata.revision)
+        .and_then(|revision| i64::try_from(revision).ok());
+    let scope = okf_scope_for_id(conn, &id)?;
+    let result = agent_memory::okf::OkfDocumentHandler::new(conn, scope)
+        .put(Some(&id), &parsed, expected, false)
+        .map_err(okf_cli_error)?;
+    let blob = embedding_to_blob(&embedding);
+    conn.execute(
+        "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
+        rusqlite::params![blob, EMBEDDING_MODEL_NAME_DEFAULT, id],
+    )?;
+    maybe_auto_push_after_memory_update(conn, config, &id);
+    println!(
+        "{}",
+        render::render_action_result(
+            "okf_updated",
+            &[
+                ("id", id),
+                ("revision", result.revision.to_string()),
+                ("changed", result.changed.to_string()),
+            ],
+        )
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PushCandidate {
     local_memory_id: String,
@@ -1358,7 +1982,8 @@ fn run_auto_push(
     project: &str,
     batch_size: usize,
 ) -> Result<AutoPushSummary, MemoryError> {
-    let candidates = build_push_candidates(conn, project)?;
+    let candidates =
+        build_push_candidates_with_okf(conn, project, config.gateway.okf_sync_enabled())?;
     let pending: Vec<&PushCandidate> = candidates
         .iter()
         .filter(|candidate| candidate.action != "skipped")
@@ -1525,7 +2150,11 @@ fn run_push_project(
     status_only: bool,
     batch_size: usize,
 ) -> Result<PushProjectSummary, MemoryError> {
-    let candidates = build_push_candidates(conn, project)?;
+    let candidates = build_push_candidates_with_okf(
+        conn,
+        project,
+        gateway.is_some_and(MemoryGatewayClient::okf_enabled),
+    )?;
     let pending: Vec<&PushCandidate> = candidates
         .iter()
         .filter(|candidate| candidate.action != "skipped")
@@ -1639,9 +2268,18 @@ fn build_push_request(
     (request, hashes)
 }
 
+#[cfg(test)]
 fn build_push_candidates(
     conn: &Connection,
     project: &str,
+) -> Result<Vec<PushCandidate>, MemoryError> {
+    build_push_candidates_with_okf(conn, project, false)
+}
+
+fn build_push_candidates_with_okf(
+    conn: &Connection,
+    project: &str,
+    okf_enabled: bool,
 ) -> Result<Vec<PushCandidate>, MemoryError> {
     let memories = queries::list_memories_by_project(conn, Some(project))?;
     let mut memory_syncs = Vec::new();
@@ -1662,7 +2300,8 @@ fn build_push_candidates(
 
     let mut candidates = Vec::new();
     for (memory, sync) in memory_syncs {
-        let gateway_memory = gateway_memory_from_local(&memory, project, sync.as_ref())?;
+        let gateway_memory =
+            gateway_memory_from_local(conn, &memory, project, sync.as_ref(), okf_enabled)?;
         let duplicate_sync = if sync.is_none() {
             synced_by_hash.get(&gateway_memory.content_hash)
         } else {
@@ -1674,7 +2313,8 @@ fn build_push_candidates(
             }
             (Some(_), _) => "update",
             (None, Some(record)) => {
-                let gateway_memory = gateway_memory_from_local(&memory, project, Some(record))?;
+                let gateway_memory =
+                    gateway_memory_from_local(conn, &memory, project, Some(record), okf_enabled)?;
                 candidates.push(PushCandidate {
                     local_memory_id: memory.id,
                     gateway_memory,
@@ -1716,9 +2356,11 @@ fn sync_record_matches_hash(record: &MemoryGatewaySync, content_hash: &str) -> b
 }
 
 fn gateway_memory_from_local(
+    conn: &Connection,
     memory: &Memory,
     project: &str,
     sync: Option<&MemoryGatewaySync>,
+    okf_enabled: bool,
 ) -> Result<GatewayMemory, MemoryError> {
     if memory.project.as_deref() != Some(project) {
         return Err(MemoryError::Config(format!(
@@ -1732,12 +2374,18 @@ fn gateway_memory_from_local(
         .unwrap_or_else(|| "user".to_string());
     let tags = memory.tags.clone().unwrap_or_default();
     let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
+    let okf = okf_enabled
+        .then(|| gateway_okf_envelope(conn, memory))
+        .transpose()?;
+    let concept_hash = okf.as_ref().map(|envelope| envelope.semantic_hash.clone());
     Ok(GatewayMemory {
         project: project.to_string(),
         content: memory.content.clone(),
         memory_type,
         tags,
         content_hash,
+        concept_hash,
+        okf,
         local_memory_id: Some(memory.id.clone()),
         client_id: Some(memory.id.clone()),
         gateway_memory_id: sync.map(|record| record.gateway_memory_id.clone()),
@@ -2264,15 +2912,19 @@ fn apply_pull_plans(
             }
             "update" => {
                 if let Some(local_id) = plan.local_memory_id.as_deref() {
-                    let tags = plan.remote.tags.clone();
-                    queries::update_content(
-                        conn,
-                        local_id,
-                        &plan.remote.content,
-                        Some(&tags),
-                        Some(&plan.remote.memory_type),
-                    )?;
-                    reembed_memory(conn, config, local_id, &plan.remote.content)?;
+                    if plan.remote.okf.is_some() {
+                        apply_remote_okf(conn, config, project, &plan.remote, Some(local_id))?;
+                    } else {
+                        let tags = plan.remote.tags.clone();
+                        queries::update_content(
+                            conn,
+                            local_id,
+                            &plan.remote.content,
+                            Some(&tags),
+                            Some(&plan.remote.memory_type),
+                        )?;
+                        reembed_memory(conn, config, local_id, &plan.remote.content)?;
+                    }
                     upsert_pull_sync(conn, project, local_id, &plan.remote, false, None)?;
                 }
             }
@@ -2301,6 +2953,9 @@ fn insert_remote_memory(
     project: &str,
     remote: &GatewayMemory,
 ) -> Result<String, MemoryError> {
+    if remote.okf.is_some() {
+        return apply_remote_okf(conn, config, project, remote, None);
+    }
     let mut memory = Memory::new(
         remote.content.clone(),
         Some(remote.tags.clone()),
@@ -2325,8 +2980,89 @@ fn insert_remote_memory(
         &remote.content,
         &config.model_cache_dir,
     )?);
-    queries::insert_memory(conn, &memory)?;
+    crate::concepts::insert_memory(conn, &memory, "gateway_pull", memory.agent.as_deref(), None)?;
     Ok(memory.id)
+}
+
+fn apply_remote_okf(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    remote: &GatewayMemory,
+    target: Option<&str>,
+) -> Result<String, MemoryError> {
+    let (parsed, scope) = normalize_remote_okf(project, remote, target)?;
+
+    // Complete model work before the short handler transaction.
+    let embedding = embedding::embed_text(&parsed.concept.body, &config.model_cache_dir)?;
+    let result = agent_memory::okf::OkfDocumentHandler::new(conn, scope)
+        .put_with_operation(target, &parsed, None, false, "gateway_pull")
+        .map_err(okf_cli_error)?;
+    let blob = embedding_to_blob(&embedding);
+    conn.execute(
+        "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
+        rusqlite::params![blob, EMBEDDING_MODEL_NAME_DEFAULT, result.id],
+    )?;
+    Ok(result.id)
+}
+
+fn normalize_remote_okf(
+    project: &str,
+    remote: &GatewayMemory,
+    target: Option<&str>,
+) -> Result<
+    (
+        agent_memory::okf::ParsedDocument,
+        agent_memory::okf::BundleScope,
+    ),
+    MemoryError,
+> {
+    let envelope = remote
+        .okf
+        .as_ref()
+        .ok_or_else(|| MemoryError::Config("gateway OKF envelope missing".to_string()))?;
+    if envelope.version != 1 || envelope.format != "okf-markdown" {
+        return Err(MemoryError::Config(format!(
+            "unsupported gateway OKF envelope version/format: {}/{}",
+            envelope.version, envelope.format
+        )));
+    }
+    let mut parsed = agent_memory::okf::parse_document(&envelope.document)
+        .map_err(|error| MemoryError::Config(format!("gateway OKF document: {error}")))?;
+    if parsed.concept.body != remote.content {
+        return Err(MemoryError::Config(
+            "gateway legacy content and OKF body disagree".to_string(),
+        ));
+    }
+    let scope = if project == GLOBAL_PROJECT_IDENT {
+        agent_memory::okf::BundleScope::Global
+    } else {
+        agent_memory::okf::BundleScope::Project(project.to_string())
+    };
+    let metadata = parsed
+        .concept
+        .agent_memory
+        .get_or_insert_with(Default::default);
+    metadata.project = Some(project.to_string());
+    metadata.scope = Some(if project == GLOBAL_PROJECT_IDENT {
+        "global".to_string()
+    } else {
+        "project".to_string()
+    });
+    metadata.memory_type = Some(remote.memory_type.clone());
+    metadata.revision = None;
+    if let Some(target) = target {
+        metadata.id = Some(target.to_string());
+    }
+    if !envelope.extensions.is_empty() {
+        let yaml = serde_yaml_ng::to_value(&envelope.extensions)
+            .map_err(|error| MemoryError::Config(error.to_string()))?;
+        parsed
+            .concept
+            .extensions
+            .insert("x-gateway-envelope".to_string(), yaml);
+    }
+    Ok((parsed, scope))
 }
 
 fn upsert_pull_sync(
@@ -3009,6 +3745,7 @@ mod tests {
                 content,
                 tags,
                 memory_type,
+                ..
             } => {
                 assert!(id.is_none());
                 assert!(content.is_none());
@@ -3040,6 +3777,7 @@ mod tests {
                 content,
                 tags,
                 memory_type,
+                ..
             } => {
                 assert_eq!(id.as_deref(), Some("aabbccdd"));
                 assert_eq!(content.as_deref(), Some("new body\n- fact"));
@@ -4019,6 +4757,8 @@ mod tests {
                 memory_type: "project".to_string(),
                 tags: vec!["gateway".to_string()],
                 content_hash: format!("hash-{index}"),
+                concept_hash: None,
+                okf: None,
                 local_memory_id: Some(local_memory_id),
                 client_id: None,
                 gateway_memory_id: None,
@@ -4045,6 +4785,8 @@ mod tests {
             content: content.to_string(),
             memory_type: "project".to_string(),
             content_hash: memory_content_hash(content, "project", &tags),
+            concept_hash: None,
+            okf: None,
             tags,
             local_memory_id: None,
             client_id: None,
@@ -4056,6 +4798,54 @@ mod tests {
             provenance: None,
             tombstone: None,
         }
+    }
+
+    #[test]
+    fn gateway_okf_unknown_envelope_fields_survive_pull_noop_and_push() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        crate::db::run_migrations(&conn).expect("migrate");
+
+        let document = agent_memory::okf::render_document(
+            &agent_memory::okf::OkfConcept::minimal("knowledge", "portable body"),
+            agent_memory::okf::RenderMode::Normalized,
+        )
+        .unwrap();
+        let mut remote = cli_remote_memory("gw-okf", "portable body", vec!["sync"], 7);
+        remote.concept_hash = Some("remote-semantic-hash".to_string());
+        remote.okf = Some(crate::sync::GatewayOkfEnvelope {
+            version: 1,
+            format: "okf-markdown".to_string(),
+            revision: 4,
+            semantic_hash: "remote-semantic-hash".to_string(),
+            document,
+            extensions: std::collections::BTreeMap::from([(
+                "x-future-proof".to_string(),
+                serde_json::json!({"nested": [1, 2, 3]}),
+            )]),
+        });
+
+        let (parsed, scope) = normalize_remote_okf("agent-memory", &remote, None).unwrap();
+        let handler = agent_memory::okf::OkfDocumentHandler::new(&conn, scope);
+        let first = handler
+            .put_with_operation(None, &parsed, None, false, "gateway_pull")
+            .unwrap();
+        let stored = queries::get_memory_by_id(&conn, &first.id).unwrap();
+        let outbound = gateway_okf_envelope(&conn, &stored).unwrap();
+        assert_eq!(
+            outbound.extensions.get("x-future-proof"),
+            Some(&serde_json::json!({"nested": [1, 2, 3]}))
+        );
+
+        let (parsed_again, scope) =
+            normalize_remote_okf("agent-memory", &remote, Some(&first.id)).unwrap();
+        let noop = agent_memory::okf::OkfDocumentHandler::new(&conn, scope)
+            .put_with_operation(Some(&first.id), &parsed_again, None, false, "gateway_pull")
+            .unwrap();
+        assert!(
+            !noop.changed,
+            "an identical pull must not create a revision"
+        );
+        assert_eq!(noop.revision, first.revision);
     }
 
     #[test]
@@ -4112,10 +4902,13 @@ mod tests {
         )
         .unwrap();
 
+        let mut fast_remote =
+            cli_remote_memory("gw-fast-forward", "remote update", vec!["fast"], 4);
+        fast_remote.concept_hash = Some("different-additive-semantic-hash".to_string());
         let response = PullMemoriesResponse {
             project: "agent-memory".to_string(),
             memories: vec![
-                cli_remote_memory("gw-fast-forward", "remote update", vec!["fast"], 4),
+                fast_remote,
                 cli_remote_memory("gw-conflict", "remote update", vec!["conflict"], 4),
             ],
             tombstones: vec![],
@@ -4127,6 +4920,11 @@ mod tests {
         let plans = plan_pull_actions(&conn, "agent-memory", &response).unwrap();
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].action, "update");
+        assert_eq!(
+            plans[0].remote.concept_hash.as_deref(),
+            Some("different-additive-semantic-hash"),
+            "semantic hashes coexist while transition conflict planning remains legacy-compatible"
+        );
         assert_eq!(
             plans[0].local_memory_id.as_deref(),
             Some(fast_forward.id.as_str())
@@ -4562,6 +5360,49 @@ mod tests {
         for s in checks {
             assert!(!s.contains('{'), "unexpected '{{' in output: {s}");
             assert!(!s.contains('}'), "unexpected '}}' in output: {s}");
+        }
+    }
+
+    #[test]
+    fn okf_command_family_parses_complete_contract() {
+        let commands = [
+            vec!["memory", "okf", "validate", "-"],
+            vec!["memory", "okf", "get", "abcd"],
+            vec!["memory", "okf", "put", "new", "--dry-run"],
+            vec!["memory", "okf", "read", "okf+memory://global/", "/index.md"],
+            vec!["memory", "okf", "list", "okf+memory://global/"],
+            vec![
+                "memory",
+                "okf",
+                "index",
+                "okf+memory://global/",
+                "--tag",
+                "x",
+            ],
+            vec!["memory", "okf", "log", "okf+memory://global/", "-k", "5"],
+            vec!["memory", "okf", "history", "abcd", "-k", "5"],
+            vec!["memory", "okf", "diff", "abcd", "1", "2"],
+            vec!["memory", "okf", "graph", "abcd", "--direction", "both"],
+            vec![
+                "memory",
+                "okf",
+                "export",
+                "okf+memory://global/",
+                "target",
+                "--dry-run",
+            ],
+            vec![
+                "memory",
+                "okf",
+                "import",
+                "source",
+                "--scope",
+                "global",
+                "--dry-run",
+            ],
+        ];
+        for args in commands {
+            assert!(Cli::try_parse_from(args).is_ok());
         }
     }
 }

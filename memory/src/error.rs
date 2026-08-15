@@ -25,4 +25,13 @@ pub enum MemoryError {
 
     #[error("Update error: {0}")]
     Update(String),
+
+    #[error(
+        "Revision conflict for memory {id}: expected {expected}, current revision is {actual}"
+    )]
+    RevisionConflict {
+        id: String,
+        expected: i64,
+        actual: i64,
+    },
 }

@@ -1,9 +1,11 @@
 pub mod bm25;
 pub mod fusion;
+pub mod index;
 pub mod rerank;
 pub mod vector;
 
 use rusqlite::Connection;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::db::models::Memory;
@@ -30,6 +32,16 @@ pub struct SearchResult {
     /// boost than current-project memories so universal preferences surface
     /// across every repo without out-ranking strong local context.
     pub is_global: bool,
+    pub concept_type: String,
+    pub concept_title: Option<String>,
+    pub concept_description: Option<String>,
+    pub concept_status: String,
+    pub is_stale: bool,
+    pub is_verified: bool,
+    pub revision: i64,
+    pub canonical_uri: String,
+    pub graph_relation: Option<String>,
+    pub graph_distance: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +93,12 @@ pub struct SearchOptions<'a> {
     /// smaller than `boost_factor` so local context still wins ties, but
     /// larger than 1.0 so universal preferences out-rank cross-project noise.
     pub global_boost_factor: f32,
+    /// Exact OKF concept type filter.
+    pub concept_type: Option<&'a str>,
+    /// Exact tag filter.
+    pub tag: Option<&'a str>,
+    /// Text-seeded relationship expansion. Zero disables graph expansion.
+    pub graph_depth: usize,
 }
 
 impl<'a> SearchOptions<'a> {
@@ -92,8 +110,107 @@ impl<'a> SearchOptions<'a> {
             only_project: None,
             global_project: None,
             global_boost_factor: 1.0,
+            concept_type: None,
+            tag: None,
+            graph_depth: 0,
         }
     }
+}
+
+struct ConceptSignals {
+    concept_type: String,
+    title: Option<String>,
+    description: Option<String>,
+    status: String,
+    stale: bool,
+    verified: bool,
+    revision: i64,
+}
+
+fn concept_signals(conn: &Connection, id: &str) -> Result<ConceptSignals, MemoryError> {
+    let (concept_type, title, description, status, stale_after, revision, verified) = conn.query_row(
+        "SELECT c.concept_type, c.title, c.description, c.status, c.stale_after, c.current_revision,
+                EXISTS(SELECT 1 FROM memory_verifications v WHERE v.memory_id = c.memory_id)
+         FROM memory_concepts c WHERE c.memory_id = ?1",
+        rusqlite::params![id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        },
+    )?;
+    let stale = stale_after
+        .as_deref()
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .is_some_and(|at| at <= chrono::Utc::now());
+    Ok(ConceptSignals {
+        concept_type,
+        title,
+        description,
+        status,
+        stale,
+        verified,
+        revision,
+    })
+}
+
+fn make_result(
+    conn: &Connection,
+    memory: Memory,
+    ranked: RankedResult,
+    opts: &SearchOptions<'_>,
+    graph_relation: Option<String>,
+    graph_distance: Option<usize>,
+) -> Result<Option<SearchResult>, MemoryError> {
+    let signals = concept_signals(conn, &memory.id)?;
+    if signals.status == "deprecated"
+        || opts
+            .concept_type
+            .is_some_and(|expected| signals.concept_type != expected)
+        || opts.tag.is_some_and(|expected| {
+            !memory
+                .tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|tag| tag == expected)
+        })
+        || opts
+            .only_project
+            .is_some_and(|project| memory.project.as_deref() != Some(project))
+    {
+        return Ok(None);
+    }
+    let is_current_project = opts
+        .current_project
+        .is_some_and(|project| memory.project.as_deref() == Some(project));
+    let is_global = opts
+        .global_project
+        .is_some_and(|project| memory.project.as_deref() == Some(project));
+    let canonical_uri = crate::concepts::canonical_uri(&memory.id, memory.project.as_deref());
+    Ok(Some(SearchResult {
+        memory,
+        match_quality: classify_quality(ranked.bm25_rank, ranked.vector_rank),
+        rank_info: ranked,
+        is_current_project,
+        is_global,
+        concept_type: signals.concept_type,
+        concept_title: signals.title,
+        concept_description: signals.description,
+        concept_status: signals.status,
+        is_stale: signals.stale,
+        is_verified: signals.verified,
+        revision: signals.revision,
+        canonical_uri,
+        graph_relation,
+        graph_distance,
+    }))
 }
 
 pub fn hybrid_search(
@@ -115,29 +232,13 @@ pub fn hybrid_search(
     let fused = reciprocal_rank_fusion(&bm25_results, &vector_results, candidate_limit);
 
     let mut results = Vec::new();
-    let mut accessed_ids = Vec::new();
 
     for ranked in fused {
         match queries::get_memory_by_id(conn, &ranked.id) {
             Ok(memory) => {
-                let quality = classify_quality(ranked.bm25_rank, ranked.vector_rank);
-                let is_current = match opts.current_project {
-                    Some(cp) => memory.project.as_deref() == Some(cp),
-                    None => false,
-                };
-                // A memory's project ident is a single string, so a memory
-                // can be current-project or global-scope but never both.
-                let is_global = match opts.global_project {
-                    Some(gp) => memory.project.as_deref() == Some(gp),
-                    None => false,
-                };
-                results.push(SearchResult {
-                    memory,
-                    rank_info: ranked,
-                    match_quality: quality,
-                    is_current_project: is_current,
-                    is_global,
-                });
+                if let Some(result) = make_result(conn, memory, ranked, &opts, None, None)? {
+                    results.push(result);
+                }
             }
             Err(MemoryError::NotFound(_)) => continue,
             Err(e) => return Err(e),
@@ -154,6 +255,14 @@ pub fn hybrid_search(
     // returns — the error is never propagated out of `hybrid_search`.
     maybe_rerank(query, &mut results, model_cache_dir);
 
+    if opts.graph_depth > 0 && !results.is_empty() {
+        // Graph projection is advisory. Corrupt/missing derived graph state
+        // must fall back to the already-ranked flat textual results.
+        let _ = expand_graph_neighbors(conn, &mut results, &opts);
+    }
+
+    apply_trust_modifiers(&mut results);
+
     apply_scope_boosts(
         &mut results,
         opts.current_project.is_some().then_some(opts.boost_factor),
@@ -162,18 +271,127 @@ pub fn hybrid_search(
             .then_some(opts.global_boost_factor),
     );
 
-    if let Some(op) = opts.only_project {
-        results.retain(|r| r.memory.project.as_deref() == Some(op));
-    }
-
     results.truncate(opts.limit);
 
-    for r in &results {
-        accessed_ids.push(r.memory.id.clone());
-    }
-    queries::increment_access(conn, &accessed_ids)?;
+    increment_surfaced_access(conn, &results)?;
 
     Ok(results)
+}
+
+fn increment_surfaced_access(
+    conn: &Connection,
+    results: &[SearchResult],
+) -> Result<(), MemoryError> {
+    let mut accessed_ids = results
+        .iter()
+        .map(|result| result.memory.id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    accessed_ids.sort();
+    queries::increment_access(conn, &accessed_ids)
+}
+
+fn apply_trust_modifiers(results: &mut [SearchResult]) {
+    for result in results {
+        if result.is_stale {
+            result.rank_info.score *= 0.9;
+        }
+    }
+}
+
+fn relation_factor(relation: &str) -> f32 {
+    match relation {
+        "supports" => 0.80,
+        "supersedes" => 0.78,
+        "derived_from" => 0.70,
+        "links_to" => 0.65,
+        "cites" => 0.62,
+        _ => 0.60,
+    }
+}
+
+fn expand_graph_neighbors(
+    conn: &Connection,
+    results: &mut Vec<SearchResult>,
+    opts: &SearchOptions<'_>,
+) -> Result<(), MemoryError> {
+    use crate::concepts::graph::{self, Direction, TraversalOptions};
+
+    let seed_limit = results.len().min(opts.limit.max(1));
+    let seeds = results
+        .iter()
+        .take(seed_limit)
+        .map(|result| (result.memory.id.clone(), result.rank_info.score))
+        .collect::<Vec<_>>();
+    let seed_scores = seeds
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let roots = seeds.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+    let traversal = graph::traverse(
+        conn,
+        &roots,
+        &TraversalOptions {
+            direction: Direction::Both,
+            relations: BTreeSet::new(),
+            max_depth: opts.graph_depth.min(2),
+            fan_out: 12,
+            max_results: opts.limit.saturating_mul(3).clamp(1, 300),
+        },
+    )?;
+    let mut known = results
+        .iter()
+        .map(|result| result.memory.id.clone())
+        .collect::<HashSet<_>>();
+    let neighbor_budget = opts.limit.div_ceil(3).max(1);
+    let mut added = 0;
+    for path in traversal.paths {
+        if added >= neighbor_budget {
+            break;
+        }
+        let Some(step) = path.steps.last() else {
+            continue;
+        };
+        let Some(seed) = path.nodes.first() else {
+            continue;
+        };
+        let Some(neighbor) = path.nodes.last() else {
+            continue;
+        };
+        if known.contains(neighbor) || path.cycle {
+            continue;
+        }
+        let distance = path.steps.len();
+        let decay = 0.75_f32.powi(distance.saturating_sub(1) as i32);
+        let score = seed_scores.get(seed).copied().unwrap_or_default()
+            * relation_factor(&step.relation)
+            * decay;
+        let memory = match queries::get_memory_by_id(conn, neighbor) {
+            Ok(memory) => memory,
+            Err(MemoryError::NotFound(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        let ranked = RankedResult {
+            id: neighbor.clone(),
+            score,
+            bm25_rank: None,
+            vector_rank: None,
+        };
+        if let Some(result) = make_result(
+            conn,
+            memory,
+            ranked,
+            opts,
+            Some(step.relation.clone()),
+            Some(distance),
+        )? {
+            known.insert(neighbor.clone());
+            results.push(result);
+            added += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Reranking is on by default. The `MEMORY_RERANK` env var is an escape hatch:
@@ -202,7 +420,21 @@ fn maybe_rerank(query: &str, results: &mut [SearchResult], model_cache_dir: &Pat
         return;
     }
 
-    let docs: Vec<&str> = results.iter().map(|r| r.memory.content.as_str()).collect();
+    let documents = results
+        .iter()
+        .map(|result| {
+            let tags = result.memory.tags.as_deref().unwrap_or_default().join(" ");
+            format!(
+                "{}\n{}\n{}\n{}\n{}",
+                result.concept_title.as_deref().unwrap_or_default(),
+                result.concept_description.as_deref().unwrap_or_default(),
+                result.concept_type,
+                tags,
+                result.memory.content
+            )
+        })
+        .collect::<Vec<_>>();
+    let docs = documents.iter().map(String::as_str).collect::<Vec<_>>();
     match rerank::rerank_scores(query, &docs, model_cache_dir) {
         Ok(scores) if scores.len() == results.len() => {
             for (r, score) in results.iter_mut().zip(scores) {
@@ -264,6 +496,7 @@ mod tests {
     use super::*;
     use crate::db::models::Memory;
     use crate::search::fusion::RankedResult;
+    use crate::{concepts, db, db::queries};
 
     /// Build a test-only `SearchResult` with a fixed RRF score and scope
     /// flags. Avoids constructing full embeddings — the boost logic only
@@ -296,6 +529,16 @@ mod tests {
             match_quality: MatchQuality::High,
             is_current_project: is_current,
             is_global,
+            concept_type: "Agent Memory/project".to_string(),
+            concept_title: None,
+            concept_description: None,
+            concept_status: "stable".to_string(),
+            is_stale: false,
+            is_verified: false,
+            revision: 1,
+            canonical_uri: format!("memory://unscoped/{id}"),
+            graph_relation: None,
+            graph_distance: None,
         }
     }
 
@@ -447,5 +690,153 @@ mod tests {
         ];
         apply_scope_boosts(&mut results, None, Some(1.25));
         assert_eq!(results[0].memory.project.as_deref(), Some("__global__"));
+    }
+
+    #[test]
+    fn okf_segment_index_searches_metadata_dedupes_resources_and_excludes_deprecated() {
+        let conn = db::open_database(Path::new(":memory:")).unwrap();
+        let memory = Memory::new(
+            format!(
+                "# Alpha\n{}\n## Beta\n{}",
+                "repeated ".repeat(300),
+                "needle ".repeat(300)
+            ),
+            Some(vec!["unique-tag".into()]),
+            Some("project".into()),
+            None,
+            None,
+            Some("reference".into()),
+        );
+        let id = memory.id.clone();
+        queries::insert_memory(&conn, &memory).unwrap();
+        concepts::mutate(&conn, &id, "metadata", None, None, true, |_| {
+            conn.execute(
+                "UPDATE memory_concepts SET title = 'Unique Lantern',
+                 description = 'Special description' WHERE memory_id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        for query in [
+            "lantern",
+            "description",
+            "unique-tag",
+            "reference",
+            "needle",
+        ] {
+            let hits = search_bm25(&conn, query, 10).unwrap();
+            assert_eq!(
+                hits.iter().filter(|(hit, _)| hit == &id).count(),
+                1,
+                "{query}"
+            );
+        }
+
+        concepts::mutate(&conn, &id, "deprecate", None, None, true, |_| {
+            conn.execute(
+                "UPDATE memory_concepts SET status = 'deprecated' WHERE memory_id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(search_bm25(&conn, "lantern", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn graph_expansion_is_text_seeded_bounded_filtered_and_stale_is_downranked() {
+        let conn = db::open_database(Path::new(":memory:")).unwrap();
+        let seed = Memory::new(
+            "seed".into(),
+            Some(vec!["keep".into()]),
+            Some("p".into()),
+            None,
+            None,
+            None,
+        );
+        let neighbor = Memory::new(
+            "neighbor".into(),
+            Some(vec!["keep".into()]),
+            Some("p".into()),
+            None,
+            None,
+            None,
+        );
+        let excluded = Memory::new(
+            "excluded".into(),
+            Some(vec!["other".into()]),
+            Some("p".into()),
+            None,
+            None,
+            None,
+        );
+        for memory in [&seed, &neighbor, &excluded] {
+            queries::insert_memory(&conn, memory).unwrap();
+        }
+        concepts::insert_relationship(
+            &conn,
+            &seed.id,
+            Some(&neighbor.id),
+            &neighbor.id,
+            "supports",
+            1,
+            None,
+        )
+        .unwrap();
+        concepts::insert_relationship(
+            &conn,
+            &seed.id,
+            Some(&excluded.id),
+            &excluded.id,
+            "supports",
+            1,
+            None,
+        )
+        .unwrap();
+        let opts = SearchOptions {
+            limit: 3,
+            tag: Some("keep"),
+            graph_depth: 1,
+            ..SearchOptions::new(3)
+        };
+        let ranked = RankedResult {
+            id: seed.id.clone(),
+            score: 1.0,
+            bm25_rank: Some(0),
+            vector_rank: Some(0),
+        };
+        let mut results = vec![make_result(&conn, seed.clone(), ranked, &opts, None, None)
+            .unwrap()
+            .unwrap()];
+        expand_graph_neighbors(&conn, &mut results, &opts).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].memory.id, neighbor.id);
+        assert_eq!(results[1].graph_relation.as_deref(), Some("supports"));
+        assert_eq!(results[1].graph_distance, Some(1));
+
+        results[0].is_stale = true;
+        let score = results[0].rank_info.score;
+        apply_trust_modifiers(&mut results);
+        assert!((results[0].rank_info.score - score * 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn surfaced_resource_access_is_incremented_once_even_if_internal_results_repeat() {
+        let conn = db::open_database(Path::new(":memory:")).unwrap();
+        let memory = Memory::new("body".into(), None, None, None, None, None);
+        let id = memory.id.clone();
+        queries::insert_memory(&conn, &memory).unwrap();
+        let first = mk_result("one", None, 1.0, "p", "__global__");
+        let mut second = mk_result("two", None, 0.5, "p", "__global__");
+        let mut first = first;
+        first.memory.id = id.clone();
+        second.memory.id = id.clone();
+        increment_surfaced_access(&conn, &[first, second]).unwrap();
+        assert_eq!(
+            queries::get_memory_by_id(&conn, &id).unwrap().access_count,
+            1
+        );
     }
 }

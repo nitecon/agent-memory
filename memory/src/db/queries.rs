@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::models::{
     blob_to_embedding, embedding_to_blob, Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert,
@@ -238,38 +238,7 @@ pub fn resolve_id_prefix(conn: &Connection, prefix: &str) -> Result<ResolvedId, 
 }
 
 pub fn insert_memory(conn: &Connection, memory: &Memory) -> Result<(), MemoryError> {
-    let tags_json = memory
-        .tags
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-
-    let embedding_blob = memory.embedding.as_ref().map(|e| embedding_to_blob(e));
-
-    conn.execute(
-        "INSERT INTO memories (id, content, tags, project, agent, source_file,
-         created_at, updated_at, access_count, embedding, memory_type,
-         content_raw, superseded_by, condenser_version, embedding_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![
-            memory.id,
-            memory.content,
-            tags_json,
-            memory.project,
-            memory.agent,
-            memory.source_file,
-            memory.created_at,
-            memory.updated_at,
-            memory.access_count,
-            embedding_blob,
-            memory.memory_type,
-            memory.content_raw,
-            memory.superseded_by,
-            memory.condenser_version,
-            memory.embedding_model,
-        ],
-    )?;
-    Ok(())
+    crate::concepts::insert_memory(conn, memory, "store", memory.agent.as_deref(), None)
 }
 
 pub fn get_working_context(
@@ -756,9 +725,18 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>, 
 }
 
 pub fn delete_memory(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
-    prepare_memory_gateway_sync_for_delete(conn, id)?;
-    let changed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
-    Ok(changed > 0)
+    delete_memory_with_actor(conn, id, None, None)
+}
+
+pub fn delete_memory_with_actor(
+    conn: &Connection,
+    id: &str,
+    actor: Option<&str>,
+    reason: Option<&str>,
+) -> Result<bool, MemoryError> {
+    crate::concepts::forget(conn, id, actor, reason, || {
+        prepare_memory_gateway_sync_for_delete(conn, id)
+    })
 }
 
 /// Bump the `access_count` counter for every id in `ids`.
@@ -785,12 +763,31 @@ pub fn move_memory_by_id(
     id: &str,
     new_project: Option<&str>,
 ) -> Result<bool, MemoryError> {
+    let old_project: Option<Option<String>> = conn
+        .query_row(
+            "SELECT project FROM memories WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(old_project) = old_project else {
+        return Ok(false);
+    };
     let now = chrono::Utc::now().to_rfc3339();
-    let changed = conn.execute(
-        "UPDATE memories SET project = ?1, updated_at = ?2 WHERE id = ?3",
-        params![new_project, now, id],
-    )?;
-    Ok(changed > 0)
+    let old_uri = crate::concepts::canonical_uri(id, old_project.as_deref());
+    let outcome = crate::concepts::mutate(conn, id, "move", None, None, true, |revision| {
+        conn.execute(
+            "UPDATE memories SET project = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_project, now, id],
+        )?;
+        if old_project.as_deref() != new_project {
+            crate::concepts::insert_relationship(
+                conn, id, None, &old_uri, "aliases", revision, None,
+            )?;
+        }
+        Ok(())
+    })?;
+    Ok(outcome.changed)
 }
 
 /// Reassign the `project` column for every memory currently tagged with `from`.
@@ -801,18 +798,27 @@ pub fn move_memories_by_project(
     from: Option<&str>,
     new_project: Option<&str>,
 ) -> Result<usize, MemoryError> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let changed = match from {
-        Some(f) => conn.execute(
-            "UPDATE memories SET project = ?1, updated_at = ?2 WHERE project = ?3",
-            params![new_project, now, f],
-        )?,
-        None => conn.execute(
-            "UPDATE memories SET project = ?1, updated_at = ?2 WHERE project IS NULL",
-            params![new_project, now],
-        )?,
-    };
-    Ok(changed)
+    crate::concepts::atomic(conn, || {
+        let mut stmt = match from {
+            Some(_) => conn.prepare("SELECT id FROM memories WHERE project = ?1 ORDER BY id")?,
+            None => conn.prepare("SELECT id FROM memories WHERE project IS NULL ORDER BY id")?,
+        };
+        let ids = if let Some(project) = from {
+            stmt.query_map(params![project], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        drop(stmt);
+        let mut changed = 0;
+        for id in ids {
+            if move_memory_by_id(conn, &id, new_project)? {
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    })
 }
 
 /// Preview rows that `move_memories_by_project` would update.
@@ -870,7 +876,7 @@ pub fn copy_memory_by_id(
     copy.content_raw = src.content_raw;
     copy.condenser_version = src.condenser_version;
     copy.embedding_model = src.embedding_model;
-    insert_memory(conn, &copy)?;
+    crate::concepts::insert_memory(conn, &copy, "copy", copy.agent.as_deref(), Some(&src.id))?;
     Ok(copy.id)
 }
 
@@ -882,24 +888,32 @@ pub fn copy_memories_by_project(
     new_project: Option<&str>,
 ) -> Result<Vec<String>, MemoryError> {
     let sources = list_memories_by_project(conn, from)?;
-    let mut new_ids = Vec::with_capacity(sources.len());
-    for src in sources {
-        let mut copy = Memory::new(
-            src.content,
-            src.tags,
-            new_project.map(|s| s.to_string()),
-            src.agent,
-            src.source_file,
-            src.memory_type,
-        );
-        copy.embedding = src.embedding;
-        copy.content_raw = src.content_raw;
-        copy.condenser_version = src.condenser_version;
-        copy.embedding_model = src.embedding_model;
-        insert_memory(conn, &copy)?;
-        new_ids.push(copy.id);
-    }
-    Ok(new_ids)
+    crate::concepts::atomic(conn, || {
+        let mut new_ids = Vec::with_capacity(sources.len());
+        for src in sources {
+            let mut copy = Memory::new(
+                src.content,
+                src.tags,
+                new_project.map(|s| s.to_string()),
+                src.agent,
+                src.source_file,
+                src.memory_type,
+            );
+            copy.embedding = src.embedding;
+            copy.content_raw = src.content_raw;
+            copy.condenser_version = src.condenser_version;
+            copy.embedding_model = src.embedding_model;
+            crate::concepts::insert_memory(
+                conn,
+                &copy,
+                "copy",
+                copy.agent.as_deref(),
+                Some(&src.id),
+            )?;
+            new_ids.push(copy.id);
+        }
+        Ok(new_ids)
+    })
 }
 
 /// List distinct project idents with the number of memories tagged under each.
@@ -1075,24 +1089,35 @@ pub fn update_condensation(
 ) -> Result<(), MemoryError> {
     let now = chrono::Utc::now().to_rfc3339();
     let blob = embedding_to_blob(embedding);
-    conn.execute(
-        "UPDATE memories SET
-             content = ?1,
-             content_raw = ?2,
-             condenser_version = ?3,
-             embedding = ?4,
-             embedding_model = ?5,
-             updated_at = ?6
-         WHERE id = ?7",
-        params![
-            new_content,
-            new_content_raw,
-            condenser_version,
-            blob,
-            embedding_model,
-            now,
-            id
-        ],
+    crate::concepts::mutate(
+        conn,
+        id,
+        "condense",
+        Some("memory-dream"),
+        None,
+        true,
+        |_| {
+            conn.execute(
+                "UPDATE memories SET
+                 content = ?1,
+                 content_raw = ?2,
+                 condenser_version = ?3,
+                 embedding = ?4,
+                 embedding_model = ?5,
+                 updated_at = ?6
+             WHERE id = ?7",
+                params![
+                    new_content,
+                    new_content_raw,
+                    condenser_version,
+                    blob,
+                    embedding_model,
+                    now,
+                    id
+                ],
+            )?;
+            Ok(())
+        },
     )?;
     Ok(())
 }
@@ -1106,10 +1131,53 @@ pub fn mark_superseded(
     older_id: &str,
     newer_id: &str,
 ) -> Result<(), MemoryError> {
-    conn.execute(
-        "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
-        params![newer_id, older_id],
-    )?;
+    let existing: Option<Option<String>> = conn
+        .query_row(
+            "SELECT superseded_by FROM memories WHERE id = ?1",
+            params![older_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.as_ref().and_then(|value| value.as_deref()) == Some(newer_id) {
+        return Ok(());
+    }
+    crate::concepts::atomic(conn, || {
+        crate::concepts::mutate(
+            conn,
+            older_id,
+            "dream_merge",
+            Some("memory-dream"),
+            None,
+            true,
+            |_| {
+                conn.execute(
+                    "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                    params![newer_id, older_id],
+                )?;
+                Ok(())
+            },
+        )?;
+        crate::concepts::mutate(
+            conn,
+            newer_id,
+            "dream_merge",
+            Some("memory-dream"),
+            None,
+            true,
+            |revision| {
+                crate::concepts::insert_relationship(
+                    conn,
+                    newer_id,
+                    Some(older_id),
+                    older_id,
+                    "supersedes",
+                    revision,
+                    None,
+                )
+            },
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1135,6 +1203,14 @@ pub fn update_content(
     new_tags: Option<&[String]>,
     new_memory_type: Option<&str>,
 ) -> Result<bool, MemoryError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let tags_json = new_tags.map(serde_json::to_string).transpose()?;
 
@@ -1146,7 +1222,10 @@ pub fn update_content(
     // lose original) style drift.
     let mut sql = String::from(
         "UPDATE memories SET
-             content_raw = COALESCE(content_raw, content),
+             content_raw = CASE
+                 WHEN content <> ?1 THEN COALESCE(content_raw, content)
+                 ELSE content_raw
+             END,
              content = ?1,
              updated_at = ?2,
              superseded_by = NULL",
@@ -1167,8 +1246,23 @@ pub fn update_content(
     bind.push(Box::new(id.to_string()));
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
-    let changed = conn.execute(&sql, param_refs.as_slice())?;
-    Ok(changed > 0)
+    let outcome = crate::concepts::mutate(conn, id, "update", None, None, true, |_| {
+        conn.execute(&sql, param_refs.as_slice())?;
+        if let Some(memory_type) = new_memory_type {
+            let normalized = memory_type.trim();
+            let normalized = if normalized.is_empty() {
+                "user"
+            } else {
+                normalized
+            };
+            conn.execute(
+                "UPDATE memory_concepts SET concept_type = ?1 WHERE memory_id = ?2",
+                params![format!("Agent Memory/{normalized}"), id],
+            )?;
+        }
+        Ok(())
+    })?;
+    Ok(outcome.changed)
 }
 
 // -- project_state helpers (Release 2.3) -------------------------------------

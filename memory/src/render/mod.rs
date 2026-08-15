@@ -168,7 +168,7 @@ fn append_section(
     }
     out.push_str(&format!("<{section_name}>\n"));
     for (i, r) in bucket.iter().enumerate() {
-        out.push_str(&format_result_line(i + 1, &r.memory, show_project));
+        out.push_str(&format_result_line(i + 1, r, show_project));
         out.push('\n');
     }
     out.push_str(&format!("</{section_name}>\n"));
@@ -195,8 +195,10 @@ fn append_section(
 /// with a colon — used for the `<other_projects>` section. Tags are
 /// surfaced via the per-section alphabetical `<tags>` cloud rather than
 /// repeated on every line.
-fn format_result_line(idx: usize, m: &Memory, show_project: bool) -> String {
-    let preview = one_line_preview(&m.content, 160);
+fn format_result_line(idx: usize, result: &SearchResult, show_project: bool) -> String {
+    let m = &result.memory;
+    let preview_source = result.concept_description.as_deref().unwrap_or(&m.content);
+    let preview = one_line_preview(preview_source, 160);
     let id_short = short_id(&m.id);
 
     let project_prefix = if show_project {
@@ -208,7 +210,35 @@ fn format_result_line(idx: usize, m: &Memory, show_project: bool) -> String {
         String::new()
     };
 
-    format!("{idx}. {project_prefix}{preview} (ID:{id_short})")
+    let mut signals = vec![
+        format!("type={}", result.concept_type),
+        format!("rev={}", result.revision),
+    ];
+    if result.concept_status != "stable" {
+        signals.push(format!("status={}", result.concept_status));
+    }
+    if result.is_stale {
+        signals.push("stale".to_string());
+    }
+    if !result.is_verified {
+        signals.push("unverified".to_string());
+    }
+    if let Some(relation) = result.graph_relation.as_deref() {
+        signals.push(format!(
+            "neighbor={relation}@{}",
+            result.graph_distance.unwrap_or(1)
+        ));
+    }
+    signals.push(format!("uri={}", result.canonical_uri));
+    let title = result
+        .concept_title
+        .as_deref()
+        .map(|title| format!("{title}: "))
+        .unwrap_or_default();
+    format!(
+        "{idx}. {project_prefix}{title}{preview} (ID:{id_short}) [OKF {}]",
+        signals.join("; ")
+    )
 }
 
 /// Collapse multi-line content to a single line with an ellipsis cut-off so a
@@ -549,6 +579,7 @@ mod tests {
     }
 
     fn mk_result(memory: Memory, is_current: bool, is_global: bool) -> SearchResult {
+        let uri = crate::concepts::canonical_uri(&memory.id, memory.project.as_deref());
         SearchResult {
             memory,
             rank_info: RankedResult {
@@ -560,6 +591,16 @@ mod tests {
             match_quality: MatchQuality::Medium,
             is_current_project: is_current,
             is_global,
+            concept_type: "Agent Memory/user".to_string(),
+            concept_title: None,
+            concept_description: None,
+            concept_status: "stable".to_string(),
+            is_stale: false,
+            is_verified: false,
+            revision: 1,
+            canonical_uri: uri,
+            graph_relation: None,
+            graph_distance: None,
         }
     }
 

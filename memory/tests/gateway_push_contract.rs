@@ -1,5 +1,5 @@
 use agent_memory::sync::{
-    GatewayMemory, MemoryConflict, MemoryValidationError, PushMemoriesRequest,
+    GatewayMemory, GatewayOkfEnvelope, MemoryConflict, MemoryValidationError, PushMemoriesRequest,
     PushMemoriesResponse, PushMemoryAction, PushMemoryResult,
 };
 use serde_json::json;
@@ -11,6 +11,8 @@ fn project_memory() -> GatewayMemory {
         memory_type: "project".to_string(),
         tags: vec!["gateway-sync".to_string(), "project-ident".to_string()],
         content_hash: "abc123".to_string(),
+        concept_hash: None,
+        okf: None,
         local_memory_id: Some("local-1".to_string()),
         client_id: Some("client-1".to_string()),
         gateway_memory_id: None,
@@ -51,6 +53,34 @@ fn push_request_is_project_plus_memory_array() {
             ]
         })
     );
+}
+
+#[test]
+fn old_gateway_payload_omits_optional_okf_contract() {
+    let value = serde_json::to_value(project_memory()).unwrap();
+    assert!(value.get("okf").is_none());
+    assert!(value.get("concept_hash").is_none());
+}
+
+#[test]
+fn capable_gateway_payload_carries_versioned_text_envelope_and_both_hashes() {
+    let mut memory = project_memory();
+    memory.concept_hash = Some("semantic-123".to_string());
+    memory.okf = Some(GatewayOkfEnvelope {
+        version: 1,
+        format: "okf-markdown".to_string(),
+        revision: 4,
+        semantic_hash: "semantic-123".to_string(),
+        document: "---\ntype: Agent Memory/project\n---\nbody\n".to_string(),
+        extensions: [("x-gateway".to_string(), json!({"keep": true}))]
+            .into_iter()
+            .collect(),
+    });
+    let value = serde_json::to_value(memory).unwrap();
+    assert_eq!(value["content_hash"], "abc123");
+    assert_eq!(value["concept_hash"], "semantic-123");
+    assert_eq!(value["okf"]["version"], 1);
+    assert_eq!(value["okf"]["x-gateway"]["keep"], true);
 }
 
 #[test]
@@ -121,6 +151,8 @@ fn push_response_covers_created_linked_conflict_and_rejected() {
                     remote_server_revision: Some(7),
                     local_content_hash: Some("local".to_string()),
                     remote_content_hash: Some("remote".to_string()),
+                    local_concept_hash: None,
+                    remote_concept_hash: None,
                     reason: "remote revision moved".to_string(),
                 }),
                 error: None,
