@@ -255,6 +255,30 @@ pub fn resolve_id_prefix(conn: &Connection, prefix: &str) -> Result<ResolvedId, 
     }
 }
 
+/// IDs eligible for a structural enrichment sweep, oldest first.
+///
+/// Superseded rows are excluded: they are audit history, and enriching them
+/// would mint revisions on concepts nothing will surface.
+pub fn list_enrichable_ids(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Vec<String>, MemoryError> {
+    let mut sql = format!("SELECT id FROM memories WHERE {DEFAULT_VISIBILITY_FILTER}");
+    if project.is_some() {
+        sql.push_str(" AND project = ?1");
+    }
+    sql.push_str(" ORDER BY created_at");
+    let mut stmt = conn.prepare(&sql)?;
+    let read = |row: &rusqlite::Row<'_>| row.get::<_, String>(0);
+    let ids = match project {
+        Some(project) => stmt
+            .query_map(params![project], read)?
+            .collect::<Result<Vec<_>, _>>()?,
+        None => stmt.query_map([], read)?.collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(ids)
+}
+
 pub fn insert_memory(conn: &Connection, memory: &Memory) -> Result<(), MemoryError> {
     crate::concepts::insert_memory(conn, memory, "store", memory.agent.as_deref(), None)
 }

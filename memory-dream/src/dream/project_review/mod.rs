@@ -513,6 +513,14 @@ fn persist_replacement(
             if let Some(carried) = carried.as_ref() {
                 agent_memory::concepts::apply_carried_concept(conn, &replacement.id, carried)?;
             }
+            // Carried metadata wins; anything still absent is derived from the
+            // rewritten body so the replacement is never less described than
+            // a freshly stored memory.
+            agent_memory::concepts::enrich::derive_into(
+                conn,
+                &replacement.id,
+                &replacement.content,
+            )?;
             agent_memory::concepts::insert_relationship_with_producer(
                 conn,
                 &replacement.id,

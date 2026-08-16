@@ -181,6 +181,20 @@ pub enum Cli {
         #[arg(short, long)]
         query: Option<String>,
     },
+    /// Backfill structurally derived OKF metadata (title, description, sources).
+    ///
+    /// Recall and `get` already enrich the memories they touch, so this only
+    /// exists to sweep a store in one pass rather than waiting for each row to
+    /// be used. Derivation is structural — no model is loaded and no network
+    /// call is made — and it never replaces an authored value.
+    Enrich {
+        /// Limit to one project ident (defaults to every project).
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Report what would be filled without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Decay stale/low-access memories.
     Prune {
         /// Maximum age in days before pruning.
@@ -888,6 +902,37 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 eprintln!("Either --id or --query must be provided");
             }
         }
+        Cli::Enrich { project, dry_run } => {
+            let ids = queries::list_enrichable_ids(conn, project.as_deref())?;
+            let mut filled_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut touched = 0usize;
+            for id in &ids {
+                let filled = if dry_run {
+                    // Derive without writing, then report only what would
+                    // actually land — absent fields, not every derivable one.
+                    crate::concepts::enrich::preview(conn, id)?
+                } else {
+                    crate::concepts::enrich::enrich(conn, id)?
+                };
+                if filled.is_empty() {
+                    continue;
+                }
+                touched += 1;
+                for field in filled {
+                    *filled_counts.entry(field).or_default() += 1;
+                }
+            }
+            let status = if dry_run { "dry_run" } else { "enriched" };
+            let mut fields = vec![
+                ("scanned", ids.len().to_string()),
+                ("memories", touched.to_string()),
+            ];
+            for (field, count) in &filled_counts {
+                fields.push((field.as_str(), count.to_string()));
+            }
+            println!("{}", render::render_action_result(status, &fields));
+        }
         Cli::Prune {
             max_age_days,
             min_access_count,
@@ -916,6 +961,10 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 match queries::resolve_id_prefix(conn, id)? {
                     ResolvedId::Exact(full_id) => match queries::get_memory_by_id(conn, &full_id) {
                         Ok(m) => {
+                            // Same enrich-on-use contract as recall: fetching a
+                            // memory is a use, and derived descriptors cost no
+                            // inference.
+                            crate::concepts::enrich::enrich_quietly(conn, &full_id);
                             out_lines.push(render::render_memory(&m));
                             fetched.push(m);
                         }

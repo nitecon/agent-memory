@@ -168,6 +168,12 @@ fn make_result(
     graph_relation: Option<String>,
     graph_distance: Option<usize>,
 ) -> Result<Option<SearchResult>, MemoryError> {
+    // Enrich on use. A memory that is being surfaced is a memory worth
+    // describing, and structural descriptors are cheap enough to derive
+    // inline — so recall stops waiting on a scheduled Dream pass to gain
+    // titles. Idempotent and best-effort: a locked or read-only store
+    // degrades to the un-enriched projection read below.
+    crate::concepts::enrich::enrich_quietly(conn, &memory.id);
     let signals = concept_signals(conn, &memory.id)?;
     // Single lifecycle predicate for every retrieval surface. `deprecated`
     // status and supersession both mean "this concept is no longer the live

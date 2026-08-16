@@ -5,6 +5,8 @@
 //! embedding, inference, filesystem, or network work.
 
 #[allow(dead_code)]
+pub mod enrich;
+#[allow(dead_code)]
 pub mod graph;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -435,7 +437,15 @@ pub fn apply_carried_concept(
     Ok(())
 }
 
-/// Insert a durable memory and its canonical concept/revision atomically.
+/// Insert a durable memory and its canonical concept/revision atomically,
+/// deriving structural descriptors into revision 1.
+///
+/// Enrichment is attached here rather than inside [`insert_memory_with`] so it
+/// stays opt-in per write path. A memory stored through this crate's own API
+/// has no authored metadata to preserve, so deriving a title costs nothing. A
+/// concept written from an OKF document is the opposite case: the document is
+/// authoritative, an omitted `title` means the concept has none, and inventing
+/// one would make an identical re-import read as a change.
 pub fn insert_memory(
     conn: &Connection,
     memory: &Memory,
@@ -443,7 +453,9 @@ pub fn insert_memory(
     actor: Option<&str>,
     derived_from: Option<&str>,
 ) -> Result<(), MemoryError> {
-    insert_memory_with(conn, memory, operation, actor, derived_from, |_| Ok(()))
+    insert_memory_with(conn, memory, operation, actor, derived_from, |_| {
+        enrich::derive_into(conn, &memory.id, &memory.content)
+    })
 }
 
 /// Insert a memory while atomically configuring its complete OKF projection.
