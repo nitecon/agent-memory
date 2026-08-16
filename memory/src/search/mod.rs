@@ -169,7 +169,19 @@ fn make_result(
     graph_distance: Option<usize>,
 ) -> Result<Option<SearchResult>, MemoryError> {
     let signals = concept_signals(conn, &memory.id)?;
+    // Single lifecycle predicate for every retrieval surface. `deprecated`
+    // status and supersession both mean "this concept is no longer the live
+    // answer", so neither may reach a ranked result — regardless of whether
+    // the row arrived from the text rankers or from graph expansion.
+    //
+    // The graph path is the one that actually needed this: traversal is
+    // `Direction::Both`, so a live memory's `supersedes` edge walks *backwards*
+    // to the predecessor Dream already merged away. Without the filter that
+    // predecessor is re-injected alongside the memory that replaced it — two
+    // copies of the same knowledge, one of them stale — and `memory get` then
+    // refuses the ID because prefix resolution hides superseded rows.
     if signals.status == "deprecated"
+        || memory.superseded_by.is_some()
         || opts
             .concept_type
             .is_some_and(|expected| signals.concept_type != expected)
@@ -820,6 +832,67 @@ mod tests {
         let score = results[0].rank_info.score;
         apply_trust_modifiers(&mut results);
         assert!((results[0].rank_info.score - score * 0.9).abs() < f32::EPSILON);
+    }
+
+    /// Regression: a live memory's `supersedes` edge points backwards at the
+    /// predecessor Dream merged away. `Direction::Both` traversal reaches it,
+    /// so without the lifecycle predicate recall injects the survivor and the
+    /// row it replaced side by side.
+    #[test]
+    fn graph_expansion_never_resurfaces_the_superseded_predecessor() {
+        let conn = db::open_database(Path::new(":memory:")).unwrap();
+        let survivor = Memory::new(
+            "survivor".into(),
+            Some(vec!["keep".into()]),
+            Some("p".into()),
+            None,
+            None,
+            None,
+        );
+        let predecessor = Memory::new(
+            "predecessor".into(),
+            Some(vec!["keep".into()]),
+            Some("p".into()),
+            None,
+            None,
+            None,
+        );
+        for memory in [&survivor, &predecessor] {
+            queries::insert_memory(&conn, memory).unwrap();
+        }
+        queries::mark_superseded(&conn, &predecessor.id, &survivor.id).unwrap();
+
+        let opts = SearchOptions {
+            limit: 5,
+            graph_depth: 1,
+            ..SearchOptions::new(5)
+        };
+        let ranked = RankedResult {
+            id: survivor.id.clone(),
+            score: 1.0,
+            bm25_rank: Some(0),
+            vector_rank: Some(0),
+        };
+        let mut results = vec![
+            make_result(&conn, survivor.clone(), ranked, &opts, None, None)
+                .unwrap()
+                .unwrap(),
+        ];
+        expand_graph_neighbors(&conn, &mut results, &opts).unwrap();
+        assert_eq!(results.len(), 1, "superseded predecessor must not be added");
+
+        // The predecessor is also rejected when it arrives from the text
+        // rankers rather than from graph expansion.
+        let direct = RankedResult {
+            id: predecessor.id.clone(),
+            score: 1.0,
+            bm25_rank: Some(0),
+            vector_rank: Some(0),
+        };
+        let refreshed = queries::get_memory_by_id(&conn, &predecessor.id).unwrap();
+        assert!(make_result(&conn, refreshed, direct, &opts, None, None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

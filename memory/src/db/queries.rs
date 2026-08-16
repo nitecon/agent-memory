@@ -230,6 +230,24 @@ pub fn resolve_id_prefix(conn: &Connection, prefix: &str) -> Result<ResolvedId, 
         candidates.push(row?);
     }
 
+    // Fallback: no live row matched, so retry without the visibility filter.
+    // A prefix the caller is holding often came from an earlier recall or an
+    // audit trail, and by the time they use it Dream may have merged that row
+    // away. Resolving it to the audit row (rather than `not_found`) is what
+    // the doc contract above promises and matches the full-UUID fast path.
+    // Live rows still win outright, so this never shadows an active memory.
+    if candidates.is_empty() {
+        let fallback_sql = format!("SELECT {MEMORY_COLS} FROM memories WHERE id LIKE ?1 LIMIT ?2");
+        let mut fallback_stmt = conn.prepare(&fallback_sql)?;
+        let fallback_rows = fallback_stmt.query_map(
+            params![like_pattern, (MAX_PREFIX_CANDIDATES + 1) as i64],
+            map_memory_row,
+        )?;
+        for row in fallback_rows {
+            candidates.push(row?);
+        }
+    }
+
     match candidates.len() {
         0 => Ok(ResolvedId::NotFound),
         1 => Ok(ResolvedId::Exact(candidates.remove(0).id)),
@@ -1548,6 +1566,27 @@ mod resolve_id_tests {
         insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
         let r = resolve_id_prefix(&conn, "deadbeef").unwrap();
         assert!(matches!(r, ResolvedId::NotFound));
+    }
+
+    /// Regression: recall hands agents 8-char prefixes, and by the time one is
+    /// used Dream may have merged that row away. `memory get <prefix>` must
+    /// still resolve it instead of reporting `not_found` for a row that exists.
+    #[test]
+    fn superseded_row_still_resolvable_by_prefix_when_no_live_row_matches() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
+        insert(&conn, "bbbbbbbb-0000-1111-2222-333333333333");
+        mark_superseded(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-333333333333",
+            "bbbbbbbb-0000-1111-2222-333333333333",
+        )
+        .unwrap();
+        let r = resolve_id_prefix(&conn, "aaaaaaaa").unwrap();
+        match r {
+            ResolvedId::Exact(id) => assert_eq!(id, "aaaaaaaa-0000-1111-2222-333333333333"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
     }
 
     #[test]
