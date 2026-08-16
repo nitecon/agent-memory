@@ -43,6 +43,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
+fs2 = { workspace = true }
 
 # Settings file (dream.toml) — TOML parse/serialize for the persistent
 # backend/model config layer. Intentionally separate from the SQLite store

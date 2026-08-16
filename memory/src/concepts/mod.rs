@@ -569,17 +569,41 @@ pub fn insert_relationship(
     source_revision: i64,
     ordinal: Option<i64>,
 ) -> Result<(), MemoryError> {
+    insert_relationship_with_producer(
+        conn,
+        src_memory_id,
+        dst_memory_id,
+        dst_ref,
+        relation,
+        "agent-memory",
+        source_revision,
+        ordinal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_relationship_with_producer(
+    conn: &Connection,
+    src_memory_id: &str,
+    dst_memory_id: Option<&str>,
+    dst_ref: &str,
+    relation: &str,
+    producer: &str,
+    source_revision: i64,
+    ordinal: Option<i64>,
+) -> Result<(), MemoryError> {
     conn.execute(
         "INSERT OR IGNORE INTO memory_relationships (
              id, src_memory_id, dst_memory_id, dst_ref, relation, confidence,
              producer, source_revision, ordinal, metadata_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'asserted', 'agent-memory', ?6, ?7, '{}', ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'asserted', ?6, ?7, ?8, '{}', ?9)",
         params![
             uuid::Uuid::new_v4().to_string(),
             src_memory_id,
             dst_memory_id,
             dst_ref,
             relation,
+            producer,
             source_revision,
             ordinal,
             chrono::Utc::now().to_rfc3339(),

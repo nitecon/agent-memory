@@ -47,6 +47,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_MODEL_NAME)]
     pub model: String,
 
+    /// Override the headless backend's model identity for one invocation.
+    /// This also supplies the `{model}` marker in headless.command.
+    #[arg(long, global = true)]
+    pub headless_model: Option<String>,
+
     /// Download (or update) the configured model from HuggingFace into
     /// the local cache directory. Implies a non-run invocation — exits
     /// after the download completes.
@@ -327,6 +332,19 @@ mod tests {
     fn command_override_parses() {
         let cli = Cli::parse_from(["memory-dream", "--command-override", "echo {prompt}"]);
         assert_eq!(cli.command_override.as_deref(), Some("echo {prompt}"));
+    }
+
+    #[test]
+    fn headless_model_override_parses() {
+        let cli = Cli::parse_from([
+            "memory-dream",
+            "--headless-model",
+            "claude-haiku-4-5-20251001",
+        ]);
+        assert_eq!(
+            cli.headless_model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
     }
 
     #[test]

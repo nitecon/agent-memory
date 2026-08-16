@@ -350,7 +350,44 @@ fn run_migrations_inner(conn: &Connection) -> Result<(), MemoryError> {
     if version < 10 {
         migrate_v10_okf_search_segments(conn)?;
     }
+    if version < 11 {
+        migrate_v11_dream_relationship_provenance(conn)?;
+    }
 
+    Ok(())
+}
+
+fn migrate_v11_dream_relationship_provenance(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch(
+        "DELETE FROM memory_relationships
+         WHERE id IN (
+             SELECT incorrect.id
+             FROM memory_relationships AS incorrect
+             JOIN memory_revisions AS revision
+               ON revision.memory_id = incorrect.src_memory_id
+              AND revision.revision = incorrect.source_revision
+              AND revision.actor = 'memory-dream'
+             JOIN memory_relationships AS correct
+               ON correct.src_memory_id = incorrect.src_memory_id
+              AND correct.producer = 'memory-dream'
+              AND correct.source_revision = incorrect.source_revision
+              AND correct.relation = incorrect.relation
+              AND correct.dst_ref = incorrect.dst_ref
+              AND COALESCE(correct.ordinal, -1) = COALESCE(incorrect.ordinal, -1)
+             WHERE incorrect.producer = 'agent-memory'
+         );
+         UPDATE memory_relationships AS relationship
+         SET producer = 'memory-dream'
+         WHERE producer = 'agent-memory'
+           AND EXISTS (
+               SELECT 1
+               FROM memory_revisions AS revision
+               WHERE revision.memory_id = relationship.src_memory_id
+                 AND revision.revision = relationship.source_revision
+                 AND revision.actor = 'memory-dream'
+           );
+         INSERT OR IGNORE INTO schema_version (version) VALUES (11);",
+    )?;
     Ok(())
 }
 
@@ -723,7 +760,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -766,7 +803,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
     }
 
     #[test]
@@ -831,7 +868,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -910,7 +947,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
 
         let existing: String = conn
             .query_row(
@@ -973,7 +1010,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
 
         let sync_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
@@ -1075,7 +1112,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 10);
+        assert_eq!(max_v, 11);
 
         conn.execute(
             "INSERT INTO memory_gateway_sync (
@@ -1153,7 +1190,7 @@ mod migration_tests {
              DROP TABLE memory_revisions;
              DROP TABLE memory_concepts;
              DROP TABLE memory_concept_tombstones;
-             DELETE FROM schema_version WHERE version IN (9, 10);
+             DELETE FROM schema_version WHERE version IN (9, 10, 11);
              INSERT INTO memories (
                  id, content, tags, project, agent, source_file,
                  created_at, updated_at, access_count, embedding, memory_type,
@@ -1313,7 +1350,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version = 10;",
+             DELETE FROM schema_version WHERE version IN (10, 11);",
         )
         .expect("restore v9 state");
 
@@ -1345,7 +1382,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version = 10;
+             DELETE FROM schema_version WHERE version IN (10, 11);
              CREATE TABLE memory_segments_fts (wrong_column TEXT);",
         )
         .expect("construct incompatible v9 fixture");
@@ -1375,7 +1412,52 @@ mod migration_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
+    }
+
+    #[test]
+    fn v11_repairs_relationships_owned_by_dream_revisions() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let memory = crate::db::models::Memory::new(
+            "replacement".to_string(),
+            None,
+            Some("project".to_string()),
+            None,
+            None,
+            Some("project".to_string()),
+        );
+        let id = memory.id.clone();
+        crate::db::queries::insert_memory(&conn, &memory).unwrap();
+        conn.execute(
+            "UPDATE memory_revisions SET actor = 'memory-dream'
+             WHERE memory_id = ?1 AND revision = 1",
+            params![id],
+        )
+        .unwrap();
+        crate::concepts::insert_relationship(
+            &conn,
+            &id,
+            None,
+            "memory://project/project/original",
+            "supersedes",
+            1,
+            None,
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_version WHERE version = 11", [])
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let producer: String = conn
+            .query_row(
+                "SELECT producer FROM memory_relationships WHERE src_memory_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(producer, "memory-dream");
     }
 
     #[test]

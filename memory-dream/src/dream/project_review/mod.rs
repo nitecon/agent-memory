@@ -496,12 +496,13 @@ fn persist_replacement(
         Some(&source.id),
         |revision| {
             if supersedes {
-                agent_memory::concepts::insert_relationship(
+                agent_memory::concepts::insert_relationship_with_producer(
                     conn,
                     &replacement.id,
                     None,
                     &old_uri,
                     "supersedes",
+                    "memory-dream",
                     revision,
                     None,
                 )?;

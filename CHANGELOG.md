@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.12.1 - 2026-08-15
+
+- Made Dream's condenser audit stamp use the actual backend-qualified
+  inference identity. Headless configuration now has an explicit model field
+  and `{model}` command placeholder; legacy pinned commands migrate without
+  overwriting custom templates.
+- Isolated headless Dream subprocesses from automatic memory/agent-tools hook
+  injection, corrected Dream-created relationship producer provenance, and
+  repair deterministically attributable legacy relationship rows on migration.
+- Added a cross-platform single-pass lock, made `--limit` a true global cap,
+  included inference identity and elapsed time in terminal summaries, and made
+  the binary exit non-zero when any Dream operations fail.
+- Kept scheduled Dream passes unlimited by default so every eligible memory is
+  considered; pass limits remain an explicit operator opt-in.
+
 ## v1.12.0 - 2026-08-15
 
 - Made every durable SQLite memory a canonical OKF concept with lossless virtual

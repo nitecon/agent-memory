@@ -78,7 +78,7 @@ pub struct DreamConfig<'a> {
     pub mode: DreamMode,
     /// Cap on the number of memories to process. `0` = no limit.
     pub limit: usize,
-    /// Short model name to stamp into `condenser_version`.
+    /// Backend-qualified inference identity to stamp into `condenser_version`.
     pub model_name: &'a str,
     /// Cache directory for fastembed's MiniLM model files.
     pub embedding_cache_dir: &'a Path,
@@ -154,13 +154,18 @@ pub fn run(
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
 ) -> Result<DreamSummary, DreamError> {
+    let started_at = std::time::Instant::now();
     let mut summary = DreamSummary::default();
+    let mut remaining = cfg.limit;
 
     // Enumerate projects. An empty DB yields zero projects and the pass
     // exits cleanly with zero work.
     let projects = q::list_distinct_projects_for_dream(conn)?;
 
     for project in &projects {
+        if cfg.limit > 0 && remaining == 0 {
+            break;
+        }
         let project_label = project.as_deref().unwrap_or("(null)");
         let cutoff = resolve_incremental_cutoff(conn, project.as_deref(), cfg)?;
         let current_stamp = prompt::condenser_version_stamp(cfg.model_name);
@@ -174,11 +179,14 @@ pub fn run(
             } else {
                 Some(current_stamp.as_str())
             },
-            cfg.limit,
+            if cfg.limit > 0 { remaining } else { 0 },
         )?;
 
         let walked = candidates.len();
         summary.total_walked += walked;
+        if cfg.limit > 0 {
+            remaining = remaining.saturating_sub(walked);
+        }
 
         println!(
             "{}",
@@ -293,6 +301,8 @@ pub fn run(
                     summary.review_contradictions.to_string()
                 ),
                 ("failed", summary.failed.to_string()),
+                ("inference", cfg.model_name.to_string()),
+                ("elapsed_ms", started_at.elapsed().as_millis().to_string()),
             ]
         )
     );
@@ -884,6 +894,25 @@ mod tests {
         cfg.full = true;
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
         assert_eq!(summary.total_walked, 1, "--full must ignore cutoff");
+    }
+
+    #[test]
+    fn limit_is_global_across_projects() {
+        let mut conn = open_mem_db();
+        for (id, project) in [
+            ("aaaaaaaa-0000-1111-2222-000000000101", "p1"),
+            ("aaaaaaaa-0000-1111-2222-000000000102", "p1"),
+            ("aaaaaaaa-0000-1111-2222-000000000103", "p2"),
+            ("aaaaaaaa-0000-1111-2222-000000000104", "p2"),
+        ] {
+            insert(&conn, id, id, Some(project));
+        }
+        let inf = FixedInference::new("skip");
+        let tmp = std::env::temp_dir();
+        let mut cfg = DreamConfig::new(DreamMode::Apply, "test/model", &tmp);
+        cfg.limit = 3;
+        let summary = run(&mut conn, &inf, &cfg).unwrap();
+        assert_eq!(summary.total_walked, 3);
     }
 
     /// Helper for the --refresh stage tests: insert a memory that would

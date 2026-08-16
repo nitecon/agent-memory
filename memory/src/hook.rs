@@ -29,6 +29,17 @@ use crate::cli;
 use crate::config::Config;
 use crate::project;
 
+/// Set to a false-like value by non-interactive curation subprocesses that
+/// already carry complete context and must not recursively retrieve memory.
+pub const HOOK_ENABLE_ENV: &str = "AGENT_MEMORY_HOOK";
+
+fn hook_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
 /// Hook payload fields we probe, in precedence order. The first one whose value
 /// is a non-empty string wins. Mirrors the old bash script's jq extraction so
 /// behavior is unchanged across the scriptless migration.
@@ -91,6 +102,9 @@ fn build_envelope(event: &str, context: &str) -> String {
 /// [`build_envelope`] on stdout. Any empty/blank result short-circuits to "emit
 /// nothing".
 pub fn run(agent: &str, limit: usize, conn: &Connection, config: &Config) {
+    if !hook_enabled(std::env::var(HOOK_ENABLE_ENV).ok().as_deref()) {
+        return;
+    }
     let mut payload = String::new();
     if std::io::stdin().read_to_string(&mut payload).is_err() {
         return;
@@ -197,5 +211,16 @@ mod tests {
         assert_eq!(event_name("claude"), "UserPromptSubmit");
         assert_eq!(event_name("codex"), "UserPromptSubmit");
         assert_eq!(event_name("anything-else"), "UserPromptSubmit");
+    }
+
+    #[test]
+    fn hook_enable_env_accepts_false_like_opt_outs() {
+        for value in ["0", "false", "FALSE", "no", "off", " OFF "] {
+            assert!(!hook_enabled(Some(value)), "{value:?} should disable hook");
+        }
+        for value in ["1", "true", "yes", "on", ""] {
+            assert!(hook_enabled(Some(value)), "{value:?} should enable hook");
+        }
+        assert!(hook_enabled(None));
     }
 }

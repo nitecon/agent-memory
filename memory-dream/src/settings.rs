@@ -47,7 +47,8 @@ pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 600_000;
 /// scope). The model pin stays: `--model sonnet` tracks Anthropic's
 /// rolling Sonnet alias, which is the right price/competence point for
 /// condense + classify + forget work without the Opus tax.
-pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --model sonnet -p '{prompt}'";
+pub const DEFAULT_CLAUDE_MODEL: &str = "sonnet";
+pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --model {model} -p '{prompt}'";
 
 /// Canonical command template for Gemini on first-run auto-detect.
 ///
@@ -57,7 +58,8 @@ pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --model sonnet -p '{prompt}'";
 /// `--model` / `-p` per `gemini --help`; no `--yolo` because Gemini's
 /// headless path is the non-agentic fallback (it doesn't pass the
 /// tool-support probe) so no tool-approval bypass is needed.
-pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model gemini-2.5-flash -p '{prompt}'";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model {model} -p '{prompt}'";
 
 /// Headless command templates from earlier versions that are known to break
 /// the agentic probe or carry a stale model pin. When an existing
@@ -88,6 +90,9 @@ const KNOWN_STALE_CLAUDE_COMMANDS: &[&str] = &[
     // on some claude CLI versions.
     "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' --model sonnet \
      -p '{prompt}'",
+    // v1.5.0-v1.12.0 default — model duplicated in the command rather than
+    // sourced from headless.model.
+    "claude --model sonnet -p '{prompt}'",
 ];
 
 /// Gemini command templates from earlier versions that are auto-upgraded
@@ -97,6 +102,7 @@ const KNOWN_STALE_GEMINI_COMMANDS: &[&str] = &[
     // Pre-v1.4.1 default — no model pin, so fresh installs ran whichever
     // model Gemini's CLI picked up (historically Pro). v1.4.1 pins Flash.
     "gemini -p '{prompt}'",
+    "gemini --model gemini-2.5-flash -p '{prompt}'",
 ];
 
 /// Default local model short-name when falling back to the `local` backend.
@@ -211,6 +217,10 @@ fn default_device() -> String {
 /// `[headless]` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadlessConfig {
+    /// Model identifier used both in the command template's `{model}` marker
+    /// and in Dream's condenser-version audit stamp.
+    #[serde(default)]
+    pub model: String,
     /// Shell-style command template with a literal `{prompt}` placeholder.
     /// Tokenized via `shlex::split` at use time; never re-interpreted by a shell.
     pub command: String,
@@ -252,11 +262,39 @@ impl Settings {
             .command
             .clone()
             .unwrap_or_else(|| self.headless.command.clone());
+        let configured_headless_model = if let Some(model) = &overrides.headless_model {
+            model.clone()
+        } else if let Some(command_override) = &overrides.command {
+            model_from_command(command_override).unwrap_or_else(|| {
+                if command_override.contains("{model}") {
+                    self.headless.model.clone()
+                } else {
+                    String::new()
+                }
+            })
+        } else {
+            self.headless.model.clone()
+        };
+        // A custom command with a literal --model pin executes that literal,
+        // so it remains the audit source of truth. `{model}` templates use the
+        // explicit configuration value and cannot drift.
+        let headless_model = if command.contains("{model}") {
+            configured_headless_model
+        } else {
+            model_from_command(&command).unwrap_or(configured_headless_model)
+        };
+        let inference_identity = match mode {
+            BackendMode::Headless => headless_identity(&command, &headless_model),
+            BackendMode::Local => format!("local/{model}"),
+            BackendMode::Disabled => "disabled".to_string(),
+        };
         EffectiveConfig {
             mode,
             active_model: model,
+            headless_model,
             headless_command: command,
             headless_timeout_ms: self.headless.timeout_ms,
+            inference_identity,
             device: self.local.device.clone(),
         }
     }
@@ -324,10 +362,12 @@ impl Settings {
         let command_is_recognizable_default;
         if KNOWN_STALE_CLAUDE_COMMANDS.contains(&trimmed.as_str()) {
             self.headless.command = DEFAULT_CLAUDE_COMMAND.to_string();
+            self.headless.model = DEFAULT_CLAUDE_MODEL.to_string();
             changed = true;
             command_is_recognizable_default = true;
         } else if KNOWN_STALE_GEMINI_COMMANDS.contains(&trimmed.as_str()) {
             self.headless.command = DEFAULT_GEMINI_COMMAND.to_string();
+            self.headless.model = DEFAULT_GEMINI_MODEL.to_string();
             changed = true;
             command_is_recognizable_default = true;
         } else {
@@ -339,6 +379,16 @@ impl Settings {
             // picked a short timeout for their specific binary.
             command_is_recognizable_default =
                 trimmed == DEFAULT_CLAUDE_COMMAND || trimmed == DEFAULT_GEMINI_COMMAND;
+        }
+
+        // v1.12.0 and earlier had no explicit headless model. Preserve custom
+        // commands and recover their common `--model X` / `--model=X` form.
+        // If no model is discoverable, the effective identity falls back to a
+        // command hash rather than incorrectly claiming the local model.
+        if self.headless.model.trim().is_empty() {
+            self.headless.model = model_from_command(&self.headless.command)
+                .unwrap_or_else(|| command_model_id(&self.headless.command));
+            changed = true;
         }
 
         // Timeout upgrade — only when the user is on a default command
@@ -450,6 +500,11 @@ impl Settings {
                 device: default_device(),
             },
             headless: HeadlessConfig {
+                model: if command == DEFAULT_GEMINI_COMMAND {
+                    DEFAULT_GEMINI_MODEL.to_string()
+                } else {
+                    DEFAULT_CLAUDE_MODEL.to_string()
+                },
                 command: command.to_string(),
                 timeout_ms: DEFAULT_HEADLESS_TIMEOUT_MS,
             },
@@ -468,6 +523,7 @@ impl Settings {
                 device: default_device(),
             },
             headless: HeadlessConfig {
+                model: DEFAULT_CLAUDE_MODEL.to_string(),
                 command: DEFAULT_CLAUDE_COMMAND.to_string(),
                 timeout_ms: DEFAULT_HEADLESS_TIMEOUT_MS,
             },
@@ -527,6 +583,23 @@ impl Settings {
                     ));
                 }
                 self.headless.command = value.to_string();
+                if let Some(model) = model_from_command(value) {
+                    self.headless.model = model;
+                }
+            }
+            "headless.model" => {
+                if value.trim().is_empty() {
+                    return Err("headless.model must not be empty".to_string());
+                }
+                if let Some(pinned) = model_from_command(&self.headless.command) {
+                    if pinned != value {
+                        return Err(format!(
+                            "headless.command pins model {pinned:?}; replace its literal model with \
+                             {{model}} before changing headless.model"
+                        ));
+                    }
+                }
+                self.headless.model = value.to_string();
             }
             "headless.timeout_ms" => {
                 let parsed: u64 = value.parse().map_err(|e| {
@@ -537,7 +610,7 @@ impl Settings {
             other => {
                 return Err(format!(
                     "unknown setting '{other}'. Supported keys: backend.mode, \
-                     local.active_model, local.device, headless.command, \
+                     local.active_model, local.device, headless.model, headless.command, \
                      headless.timeout_ms"
                 ));
             }
@@ -554,6 +627,7 @@ impl Settings {
 pub struct CliOverrides {
     pub backend: Option<BackendMode>,
     pub model: Option<String>,
+    pub headless_model: Option<String>,
     pub command: Option<String>,
 }
 
@@ -564,13 +638,53 @@ pub struct CliOverrides {
 pub struct EffectiveConfig {
     pub mode: BackendMode,
     pub active_model: String,
+    pub headless_model: String,
     pub headless_command: String,
     pub headless_timeout_ms: u64,
+    /// Backend-qualified stable identity used in condenser-version stamps.
+    pub inference_identity: String,
     /// Raw device preference string (`auto|cpu|metal|cuda`). The candle
     /// backend parses this into a [`crate::inference::DevicePreference`] at
     /// load time. Kept as a string here so settings and CLI override flows
     /// share one storage shape.
     pub device: String,
+}
+
+fn model_from_command(command: &str) -> Option<String> {
+    let argv = shlex::split(command)?;
+    for (index, token) in argv.iter().enumerate() {
+        if token == "--model" {
+            return argv.get(index + 1).filter(|v| *v != "{model}").cloned();
+        }
+        if let Some(value) = token.strip_prefix("--model=") {
+            if !value.is_empty() && value != "{model}" {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn headless_identity(command: &str, configured_model: &str) -> String {
+    let provider = shlex::split(command)
+        .and_then(|argv| argv.into_iter().next())
+        .and_then(|program| {
+            std::path::Path::new(&program)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "custom".to_string());
+    let model = configured_model.trim();
+    if !model.is_empty() {
+        return format!("headless/{provider}/{model}");
+    }
+    format!("headless/{provider}/{}", command_model_id(command))
+}
+
+fn command_model_id(command: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(command.as_bytes());
+    format!("command-{}", &hex::encode(digest)[..8])
 }
 
 #[cfg(test)]
@@ -606,6 +720,7 @@ mod tests {
         let (settings, _warn) = Settings::auto_detect_with(|b| b == "claude");
         assert_eq!(settings.backend.mode, BackendMode::Headless);
         assert_eq!(settings.headless.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(settings.headless.model, DEFAULT_CLAUDE_MODEL);
         assert_eq!(settings.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
     }
 
@@ -614,6 +729,7 @@ mod tests {
         let (settings, _warn) = Settings::auto_detect_with(|b| b == "gemini");
         assert_eq!(settings.backend.mode, BackendMode::Headless);
         assert_eq!(settings.headless.command, DEFAULT_GEMINI_COMMAND);
+        assert_eq!(settings.headless.model, DEFAULT_GEMINI_MODEL);
     }
 
     #[test]
@@ -739,8 +855,8 @@ timeout_ms = 30000
         // On-disk file reflects the upgrade.
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
         assert!(
-            raw.contains("--model sonnet"),
-            "expected upgraded command on disk; got:\n{raw}"
+            raw.contains("model = \"sonnet\"") && raw.contains("--model {model}"),
+            "expected upgraded model source of truth on disk; got:\n{raw}"
         );
     }
 
@@ -775,8 +891,8 @@ timeout_ms = 600000
             "upgraded command must not mention allowedTools; got:\n{raw}"
         );
         assert!(
-            raw.contains("--model sonnet"),
-            "upgraded command must keep the Sonnet pin; got:\n{raw}"
+            raw.contains("model = \"sonnet\"") && raw.contains("--model {model}"),
+            "upgraded configuration must keep the Sonnet pin; got:\n{raw}"
         );
     }
 
@@ -829,7 +945,7 @@ timeout_ms = 30000
         assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
         assert!(
-            raw.contains("gemini-2.5-flash"),
+            raw.contains("model = \"gemini-2.5-flash\"") && raw.contains("--model {model}"),
             "expected Flash-pinned command on disk; got:\n{raw}"
         );
     }
@@ -861,6 +977,7 @@ timeout_ms = 30000
 
         let loaded = Settings::load(dir.path()).expect("load ok");
         assert_eq!(loaded.headless.command, custom);
+        assert_eq!(loaded.headless.model, "opus");
         assert_eq!(
             loaded.headless.timeout_ms, 30_000,
             "custom command must leave the user's timeout alone"
@@ -964,6 +1081,8 @@ timeout_ms = 45000
         s.apply_dotted_set("headless.command", "claude -p '{prompt}'")
             .unwrap();
         assert_eq!(s.headless.command, "claude -p '{prompt}'");
+        s.apply_dotted_set("headless.model", "haiku").unwrap();
+        assert_eq!(s.headless.model, "haiku");
         s.apply_dotted_set("headless.timeout_ms", "60000").unwrap();
         assert_eq!(s.headless.timeout_ms, 60_000);
     }
@@ -987,11 +1106,20 @@ timeout_ms = 45000
     }
 
     #[test]
+    fn apply_dotted_set_rejects_model_drift_from_literal_command() {
+        let mut s = Settings::default_headless(DEFAULT_CLAUDE_COMMAND);
+        s.headless.command = "claude --model sonnet -p '{prompt}'".to_string();
+        let err = s.apply_dotted_set("headless.model", "haiku").unwrap_err();
+        assert!(err.contains("pins model"));
+    }
+
+    #[test]
     fn effective_cli_overrides_win_over_file() {
         let s = Settings::default_headless(DEFAULT_CLAUDE_COMMAND);
         let overrides = CliOverrides {
             backend: Some(BackendMode::Local),
             model: Some("tinyllama".to_string()),
+            headless_model: None,
             command: None,
         };
         let eff = s.effective(&overrides);
@@ -999,6 +1127,7 @@ timeout_ms = 45000
         assert_eq!(eff.active_model, "tinyllama");
         // Command flows through from the file since no override was passed.
         assert_eq!(eff.headless_command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(eff.inference_identity, "local/tinyllama");
     }
 
     #[test]
@@ -1008,5 +1137,34 @@ timeout_ms = 45000
         assert_eq!(eff.mode, BackendMode::Headless);
         assert_eq!(eff.active_model, DEFAULT_LOCAL_MODEL);
         assert_eq!(eff.headless_command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(eff.inference_identity, "headless/claude/sonnet");
+    }
+
+    #[test]
+    fn custom_headless_command_migrates_model_without_rewriting_command() {
+        let dir = tmp();
+        let body = r#"
+[backend]
+mode = "headless"
+[local]
+active_model = "gemma3"
+downloaded_models = []
+[headless]
+command = "claude --model claude-haiku-4-5-20251001 -p '{prompt}'"
+timeout_ms = 600000
+"#;
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+        let loaded = Settings::load(dir.path()).unwrap();
+        assert_eq!(loaded.headless.model, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            loaded.headless.command,
+            "claude --model claude-haiku-4-5-20251001 -p '{prompt}'"
+        );
+        assert_eq!(
+            loaded
+                .effective(&CliOverrides::default())
+                .inference_identity,
+            "headless/claude/claude-haiku-4-5-20251001"
+        );
     }
 }

@@ -16,6 +16,7 @@ use agent_memory::db::open_database;
 use agent_memory::render;
 use anyhow::Context;
 use clap::Parser;
+use fs2::FileExt;
 use memory_dream::cli::{Cli, Commands, ConfigCmd, ConfigSetArgs, RmArgs, TestArgs, UseArgs};
 use memory_dream::dream::{DreamConfig, DreamMode};
 use memory_dream::inference::{
@@ -271,6 +272,20 @@ fn render_pull_error(model: &str, err: &model_manager::ModelManagerError) {
 /// (CLI flags over file settings), constructs the inference impl, and
 /// dispatches to `dream::run`.
 fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Result<()> {
+    let lock_path = config.data_dir.join("memory-dream.lock");
+    let _run_lock = match acquire_run_lock(&lock_path)? {
+        Some(lock) => lock,
+        None => {
+            println!(
+                "{}",
+                render::render_action_result(
+                    "dream_skipped",
+                    &[("reason", "already_running".to_string())]
+                )
+            );
+            return Ok(());
+        }
+    };
     let mut conn = open_database(&config.db_path).context("open memory database")?;
 
     let overrides = cli_overrides(cli);
@@ -283,7 +298,7 @@ fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Re
         DreamMode::Apply
     };
 
-    let mut cfg = DreamConfig::new(mode, &effective.active_model, &config.model_cache_dir);
+    let mut cfg = DreamConfig::new(mode, &effective.inference_identity, &config.model_cache_dir);
     cfg.limit = cli.limit;
     // `--refresh` is the user-facing alias for `--full`; either flag forces
     // the orchestrator to ignore `project_state.last_dream_at` AND the
@@ -307,7 +322,35 @@ fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Re
         "dream pass finished"
     );
 
-    Ok(())
+    validate_summary(&summary)
+}
+
+fn validate_summary(summary: &memory_dream::dream::DreamSummary) -> anyhow::Result<()> {
+    if summary.failed == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "dream pass completed with {} failed operation(s) out of {} walked",
+        summary.failed,
+        summary.total_walked
+    )
+}
+
+fn acquire_run_lock(path: &std::path::Path) -> anyhow::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open Dream run lock {}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("acquire Dream run lock {}", path.display()))
+        }
+    }
 }
 
 /// Assemble a `CliOverrides` from clap-parsed flags. Single-entry helper
@@ -330,6 +373,7 @@ fn cli_overrides(cli: &Cli) -> CliOverrides {
             Some(cli.model.clone())
         },
         command: cli.command_override.clone(),
+        headless_model: cli.headless_model.clone(),
     }
 }
 
@@ -342,8 +386,11 @@ fn build_inference(
 ) -> Box<dyn Inference> {
     match effective.mode {
         BackendMode::Headless => {
-            match HeadlessInference::new(&effective.headless_command, effective.headless_timeout_ms)
-            {
+            match HeadlessInference::new_with_model(
+                &effective.headless_command,
+                &effective.headless_model,
+                effective.headless_timeout_ms,
+            ) {
                 Ok(h) => Box::new(h),
                 Err(e) => {
                     eprintln!(
@@ -425,11 +472,13 @@ fn run_config(config: &Config, settings: &mut Settings, sub: &ConfigCmd) -> anyh
 /// The shape mirrors `dream.toml` 1:1 so humans reading either format see
 /// the same keys.
 fn render_settings(s: &Settings) -> String {
+    let identity = s.effective(&CliOverrides::default()).inference_identity;
     let mut out = String::new();
     out.push_str("<settings>\n");
     out.push_str(&format!(
-        "  <backend mode=\"{}\"/>\n",
-        s.backend.mode.as_str()
+        "  <backend mode=\"{}\" inference_identity=\"{}\"/>\n",
+        s.backend.mode.as_str(),
+        escape_attr(&identity)
     ));
     out.push_str(&format!(
         "  <local active_model=\"{}\" downloaded_models=\"{}\"/>\n",
@@ -437,7 +486,8 @@ fn render_settings(s: &Settings) -> String {
         escape_attr(&s.local.downloaded_models.join(","))
     ));
     out.push_str(&format!(
-        "  <headless command=\"{}\" timeout_ms=\"{}\"/>\n",
+        "  <headless model=\"{}\" command=\"{}\" timeout_ms=\"{}\"/>\n",
+        escape_attr(&s.headless.model),
         escape_attr(&s.headless.command),
         s.headless.timeout_ms
     ));
@@ -571,11 +621,15 @@ fn run_list(_config: &Config, settings: &Settings) -> anyhow::Result<()> {
     let claude_on_path = which::which("claude").is_ok();
     let gemini_on_path = which::which("gemini").is_ok();
 
+    let identity = settings
+        .effective(&CliOverrides::default())
+        .inference_identity;
     let mut out = String::new();
     out.push_str("<list>\n");
     out.push_str(&format!(
-        "  <backend mode=\"{}\"/>\n",
-        settings.backend.mode.as_str()
+        "  <backend mode=\"{}\" inference_identity=\"{}\"/>\n",
+        settings.backend.mode.as_str(),
+        escape_attr(&identity)
     ));
     out.push_str(&format!(
         "  <local active_model=\"{}\" downloaded_models=\"{}\"/>\n",
@@ -583,7 +637,8 @@ fn run_list(_config: &Config, settings: &Settings) -> anyhow::Result<()> {
         escape_attr(&settings.local.downloaded_models.join(","))
     ));
     out.push_str(&format!(
-        "  <headless command=\"{}\" timeout_ms=\"{}\"/>\n",
+        "  <headless model=\"{}\" command=\"{}\" timeout_ms=\"{}\"/>\n",
+        escape_attr(&settings.headless.model),
         escape_attr(&settings.headless.command),
         settings.headless.timeout_ms
     ));
@@ -643,23 +698,7 @@ fn run_test(
     // backends is structurally consistent.
     let original = memory.content.clone();
     let backend_name = effective.mode.as_str();
-    let model_label = match effective.mode {
-        BackendMode::Headless => {
-            // Best-effort: use argv[0] of the command template as the
-            // "model" label so the output still reads naturally
-            // (`model="claude"`). Falls back to the short-name.
-            shlex::split(&effective.headless_command)
-                .and_then(|v| v.into_iter().next())
-                .map(|bin| {
-                    std::path::Path::new(&bin)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or(bin)
-                })
-                .unwrap_or_else(|| effective.active_model.clone())
-        }
-        _ => effective.active_model.clone(),
-    };
+    let model_label = effective.inference_identity.clone();
     let id_short = agent_memory::render::short_id(&memory.id).to_string();
     match memory_dream::dream::condense::run_per_memory(inference.as_ref(), &memory) {
         Ok(memory_dream::dream::condense::Decision::Skip) => {
@@ -726,4 +765,30 @@ fn run_test(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_lock_rejects_a_second_owner_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dream.lock");
+        let first = acquire_run_lock(&path).unwrap().expect("first owner");
+        assert!(acquire_run_lock(&path).unwrap().is_none());
+        drop(first);
+        assert!(acquire_run_lock(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_summary_becomes_a_process_error() {
+        let mut summary = memory_dream::dream::DreamSummary::default();
+        assert!(validate_summary(&summary).is_ok());
+        summary.total_walked = 4;
+        summary.failed = 1;
+        let error = validate_summary(&summary).unwrap_err().to_string();
+        assert!(error.contains("1 failed operation"));
+        assert!(error.contains("4 walked"));
+    }
 }

@@ -698,7 +698,7 @@ You can also trigger an update manually at any time with `memory update`.
 2. **Stage A — cosine dedup** over the Stage 0 survivors. Near-identical memories are matched by cosine similarity on the embeddings; the older of a duplicate pair gets a `superseded_by` pointer to the newer one. Default reads filter superseded rows out, so they stay in the DB for audit but never surface in search / context / list. This is a cheap secondary signal that catches byte-identical inserts without a model round-trip.
 3. **Stage B — per-memory condense**. Surviving verbose memories are condensed into a shorter factual claim using an in-process gemma3 model (via `candle`). The original text is preserved in a new `content_raw` column so nothing is lost — condensed text replaces `content`, raw text lives alongside.
 
-It's never a daemon. Each invocation loads the model, processes the DB, and exits. Run it however you like: cron, `launchd`, Windows Task Scheduler, or just manually after a heavy session.
+It's never a daemon. Each invocation loads the model, processes the DB, and exits. A nonblocking lock beside the database guarantees that only one pass runs at a time; a concurrent invocation exits successfully with `<result status="dream_skipped" reason="already_running"/>`. Run it however you like: cron, `launchd`, Windows Task Scheduler, or just manually after a heavy session.
 
 ### First-time setup
 
@@ -745,7 +745,7 @@ memory-dream --dry-run
 # with any concurrent `memory store` writes.
 memory-dream
 
-# Cap the pass for incremental runs on large DBs.
+# Cap the entire pass (across all projects) for incremental runs on large DBs.
 memory-dream --limit 50
 
 # Re-evaluate every memory, ignoring the "recently dreamed" cutoff and the
@@ -759,7 +759,18 @@ memory-dream --refresh
 memory-dream --model myorg/my-fork
 ```
 
-The bare invocation (above) is equivalent to `memory-dream run`. The same global flags — `--model`, `--dry-run`, `--limit`, `--full` / `--refresh`, `--batch-size`, `--backend`, `--command-override` — apply to the bare pass and to the `test` subcommand; they override settings for a single invocation and never mutate `dream.toml`.
+For a headless backend, the model identity is explicit and is also substituted into the command template:
+
+```toml
+[headless]
+model = "claude-haiku-4-5-20251001"
+command = "claude --model {model} -p '{prompt}'"
+timeout_ms = 600000
+```
+
+This identity—not `local.active_model`—is recorded in `condenser_version` and terminal audit output. Existing commands with `--model VALUE` are migrated automatically; custom commands without a discoverable model use a stable command-derived identity. Dream marks headless children with `MEMORY_DREAM_HEADLESS=1` and disables automatic memory/agent-tools prompt hooks so the curation prompt remains self-contained.
+
+The bare invocation (above) is equivalent to `memory-dream run`. The same global flags — `--model`, `--headless-model`, `--dry-run`, `--limit`, `--full` / `--refresh`, `--batch-size`, `--backend`, `--command-override` — apply to the bare pass and to the `test` subcommand; they override settings for a single invocation and never mutate `dream.toml`.
 
 ### Subcommands
 
@@ -769,7 +780,7 @@ The bare invocation (above) is equivalent to `memory-dream run`. The same global
 |---------|----------|
 | `memory-dream run` | Explicit alias for the bare invocation (run a dream pass). |
 | `memory-dream config show` | Dump `dream.toml` as light-XML. |
-| `memory-dream config set <key> <value>` | Mutate a dotted key, e.g. `config set backend.mode headless` or `config set headless.timeout_ms 60000`. |
+| `memory-dream config set <key> <value>` | Mutate a dotted key, e.g. `config set backend.mode headless`, `config set headless.model claude-haiku-4-5-20251001`, or `config set headless.timeout_ms 60000`. |
 | `memory-dream use <model>` | Set `local.active_model` to a short-name **and** flip `backend.mode` to `local`. |
 | `memory-dream use --headless` | Flip the backend to `headless` (run an external CLI via the `headless.command` template). |
 | `memory-dream use --disabled` | Flip the backend to `disabled` (dedup-only pass — Stage B condense is skipped). |
@@ -784,8 +795,10 @@ The bare invocation (above) is equivalent to `memory-dream run`. The same global
 **cron (Linux/macOS)** — daily at 03:00 local time:
 
 ```cron
-0 3 * * * /opt/agentic/bin/memory-dream >> ~/.agentic/dream.log 2>&1
+0 3 * * * PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" /opt/agentic/bin/memory-dream >> ~/.agentic/dream.log 2>&1
 ```
+
+Scheduled passes are unlimited by default so every eligible memory is considered. Add `--limit N` only when deliberately splitting coverage across multiple passes.
 
 **launchd (macOS)** — run after login, again daily:
 
@@ -812,7 +825,7 @@ Register-ScheduledTask -TaskName "agent-memory-dream" -Action $action -Trigger $
 
 ### What gets condensed, what gets deduped
 
-A memory needs condensation when it has `content_raw IS NULL` (never processed) OR its `condenser_version` stamp no longer matches the current `<model>:<prompt-hash>` combo (prompt or model changed since last run). Stamping lets future passes detect and re-run stale rows without reprocessing everything.
+A memory needs condensation when it has `content_raw IS NULL` (never processed) OR its `condenser_version` stamp no longer matches the current `<backend-qualified-inference-identity>:<prompt-hash>` combo (prompt, backend, command identity, or model changed since last run). Stamping lets future passes detect and re-run stale rows without reprocessing everything.
 
 Dedup candidates must share the same `project` AND same `memory_type` AND same `embedding_model`. The cosine threshold defaults to `0.87` (empirically tuned for `all-MiniLM-L6-v2`). On match, the row with the earlier `created_at` is marked superseded. An exact-match short-circuit runs before the cosine scan so byte-identical inserts don't pay the vector cost.
 
@@ -822,6 +835,9 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 - **Length-ratio check**: if the model's "condensed" output is longer than the input, it's rejected and the raw memory stays untouched.
 - **Refusal detection**: responses matching `I cannot`, `I'm sorry, but`, `as a language model`, etc. fall back to the raw memory.
 - **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
+- **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.
+- **Headless prompt isolation**: Dream subprocesses disable automatic memory and agent-tools hooks, preventing recursive retrieval from being prepended to the curation prompt.
+- **Single-pass lock**: overlapping cron/manual invocations skip cleanly instead of curating the same rows concurrently.
 - **`--dry-run` writes nothing**: row counts are identical before/after a dry-run pass.
 - **BEGIN IMMEDIATE transactions**: every mutation runs inside a per-memory immediate transaction so concurrent `memory store` calls can't race.
 

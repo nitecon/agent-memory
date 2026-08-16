@@ -46,6 +46,7 @@ use super::{Inference, InferenceError};
 /// any format-spec mechanism, so prompts containing `{` or `}` pass through
 /// unharmed.
 pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
+pub const MODEL_PLACEHOLDER: &str = "{model}";
 
 /// External-CLI inference backend.
 ///
@@ -57,6 +58,7 @@ pub struct HeadlessInference {
     /// One or more tokens may contain the literal `{prompt}` marker; we
     /// replace each hit at call time.
     argv: Vec<String>,
+    model: String,
     /// Wall-clock bound on a single invocation. `None` = no timeout.
     timeout: Option<Duration>,
 }
@@ -72,6 +74,14 @@ impl HeadlessInference {
     /// `timeout_ms = 0` disables the timeout. Anything else is treated as a
     /// wall-clock bound on the subprocess.
     pub fn new(template: &str, timeout_ms: u64) -> Result<Self, InferenceError> {
+        Self::new_with_model(template, "", timeout_ms)
+    }
+
+    pub fn new_with_model(
+        template: &str,
+        model: &str,
+        timeout_ms: u64,
+    ) -> Result<Self, InferenceError> {
         let argv = shlex::split(template).ok_or_else(|| {
             InferenceError::Io(format!(
                 "headless command template {template:?} could not be tokenized \
@@ -88,7 +98,11 @@ impl HeadlessInference {
         } else {
             Some(Duration::from_millis(timeout_ms))
         };
-        Ok(Self { argv, timeout })
+        Ok(Self {
+            argv,
+            model: model.to_string(),
+            timeout,
+        })
     }
 
     /// Substitute `{prompt}` in every token. Exposed for tests; callers use
@@ -96,7 +110,10 @@ impl HeadlessInference {
     fn substitute(&self, prompt: &str) -> Vec<String> {
         self.argv
             .iter()
-            .map(|t| t.replace(PROMPT_PLACEHOLDER, prompt))
+            .map(|t| {
+                t.replace(PROMPT_PLACEHOLDER, prompt)
+                    .replace(MODEL_PLACEHOLDER, &self.model)
+            })
             .collect()
     }
 }
@@ -114,6 +131,9 @@ impl Inference for HeadlessInference {
 
         let mut child = Command::new(&program)
             .args(&args)
+            .env("AGENT_MEMORY_HOOK", "off")
+            .env("AGENT_TOOLS_HOOK", "off")
+            .env("MEMORY_DREAM_HEADLESS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -264,6 +284,36 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn substitute_uses_explicit_model_source_of_truth() {
+        let h = HeadlessInference::new_with_model(
+            "claude --model {model} -p {prompt}",
+            "claude-haiku-4-5-20251001",
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(
+            h.substitute("hello"),
+            vec![
+                "claude",
+                "--model",
+                "claude-haiku-4-5-20251001",
+                "-p",
+                "hello"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_process_disables_context_hooks() {
+        let h = echo_backend(
+            r#"sh -c 'printf "%s|%s|%s" "$AGENT_MEMORY_HOOK" "$AGENT_TOOLS_HOOK" "$MEMORY_DREAM_HEADLESS"'"#,
+        );
+        let out = h.generate("ignored", 32).unwrap();
+        assert_eq!(out, "off|off|1");
     }
 
     #[test]
