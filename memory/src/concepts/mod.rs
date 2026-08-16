@@ -287,6 +287,154 @@ pub fn current_revision(conn: &Connection, memory_id: &str) -> Result<i64, Memor
     .ok_or_else(|| MemoryError::NotFound(memory_id.to_string()))
 }
 
+/// One concept's descriptive OKF projection, captured so a replacement
+/// concept can inherit it.
+///
+/// Curation that replaces a memory with a rewritten one (Dream's supersede
+/// and extract decisions) destroys the original row. Everything the concept
+/// had accumulated — domain type, title, description, lifecycle, sources,
+/// unknown round-tripped frontmatter — is not re-derivable from the new body,
+/// so it has to be carried across explicitly or it is silently lost.
+///
+/// Deliberately excluded:
+/// - `generated_by`/`generated_at`, which describe who produced *this* body;
+/// - verifications, because a meaningful body change invalidates them;
+/// - `virtual_path`, `current_revision`, timestamps, all identity-bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CarriedConcept {
+    pub concept_type: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub resource: Option<String>,
+    pub status: String,
+    pub stale_after: Option<String>,
+    pub extensions_json: String,
+    pub raw_frontmatter: Option<String>,
+    pub sources: Vec<CarriedSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CarriedSource {
+    pub source_key: String,
+    pub ordinal: i64,
+    pub resource: String,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub usage_count: Option<i64>,
+    pub usage_window_from: Option<String>,
+    pub usage_window_to: Option<String>,
+    pub last_modified: Option<String>,
+    pub metadata_json: String,
+}
+
+/// Capture a concept's carryable OKF projection. Call before the delete that
+/// cascades it away. Returns `None` when the memory has no concept row.
+#[allow(dead_code)]
+pub fn capture_concept(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<Option<CarriedConcept>, MemoryError> {
+    let captured = conn
+        .query_row(
+            "SELECT concept_type, title, description, resource, status, stale_after,
+                    extensions_json, raw_frontmatter
+             FROM memory_concepts WHERE memory_id = ?1",
+            params![memory_id],
+            |row| {
+                Ok(CarriedConcept {
+                    concept_type: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    resource: row.get(3)?,
+                    status: row.get(4)?,
+                    stale_after: row.get(5)?,
+                    extensions_json: row.get(6)?,
+                    raw_frontmatter: row.get(7)?,
+                    sources: Vec::new(),
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut captured) = captured else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT source_key, ordinal, resource, title, author, usage_count,
+                usage_window_from, usage_window_to, last_modified, metadata_json
+         FROM memory_sources WHERE memory_id = ?1 ORDER BY ordinal, source_key",
+    )?;
+    let rows = stmt.query_map(params![memory_id], |row| {
+        Ok(CarriedSource {
+            source_key: row.get(0)?,
+            ordinal: row.get(1)?,
+            resource: row.get(2)?,
+            title: row.get(3)?,
+            author: row.get(4)?,
+            usage_count: row.get(5)?,
+            usage_window_from: row.get(6)?,
+            usage_window_to: row.get(7)?,
+            last_modified: row.get(8)?,
+            metadata_json: row.get(9)?,
+        })
+    })?;
+    for row in rows {
+        captured.sources.push(row?);
+    }
+    Ok(Some(captured))
+}
+
+/// Apply a captured projection onto a concept. Intended to run inside the
+/// `configure` callback of [`insert_memory_with`] so the carried metadata is
+/// part of the replacement's revision 1 snapshot rather than a later edit.
+#[allow(dead_code)]
+pub fn apply_carried_concept(
+    conn: &Connection,
+    memory_id: &str,
+    carried: &CarriedConcept,
+) -> Result<(), MemoryError> {
+    conn.execute(
+        "UPDATE memory_concepts SET
+             concept_type = ?1, title = ?2, description = ?3, resource = ?4,
+             status = ?5, stale_after = ?6, extensions_json = ?7, raw_frontmatter = ?8
+         WHERE memory_id = ?9",
+        params![
+            carried.concept_type,
+            carried.title,
+            carried.description,
+            carried.resource,
+            carried.status,
+            carried.stale_after,
+            carried.extensions_json,
+            carried.raw_frontmatter,
+            memory_id,
+        ],
+    )?;
+    for source in &carried.sources {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_sources (
+                 memory_id, source_key, ordinal, resource, title, author, usage_count,
+                 usage_window_from, usage_window_to, last_modified, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                memory_id,
+                source.source_key,
+                source.ordinal,
+                source.resource,
+                source.title,
+                source.author,
+                source.usage_count,
+                source.usage_window_from,
+                source.usage_window_to,
+                source.last_modified,
+                source.metadata_json,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Insert a durable memory and its canonical concept/revision atomically.
 pub fn insert_memory(
     conn: &Connection,
@@ -367,17 +515,24 @@ where
                 |row| row.get(0),
             )?;
             let linked_source = source_exists.then_some(source_id);
+            // Producer is derived from the actor, never a literal. Re-parsing a
+            // rendered document replaces only the rows its own producer owns, so
+            // a hardcoded producer misattributes every edge written on another
+            // actor's behalf — which is what migration v11 had to repair for
+            // Dream. A one-shot repair does not hold: the write site has to be
+            // right or the next curation pass reintroduces the same rows.
             conn.execute(
                 "INSERT INTO memory_relationships (
                      id, src_memory_id, dst_memory_id, dst_ref, relation, confidence,
                      producer, source_revision, ordinal, metadata_json, created_at
                  ) VALUES (?1, ?2, ?3, ?4, 'derived_from', 'asserted',
-                           'agent-memory', 1, 0, '{}', ?5)",
+                           ?5, 1, 0, '{}', ?6)",
                 params![
                     uuid::Uuid::new_v4().to_string(),
                     memory.id,
                     linked_source,
                     source_id,
+                    actor.unwrap_or("agent-memory"),
                     memory.created_at
                 ],
             )?;

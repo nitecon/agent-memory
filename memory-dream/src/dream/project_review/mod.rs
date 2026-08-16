@@ -479,6 +479,19 @@ fn bounded(value: &str, max_chars: usize) -> String {
     }
 }
 
+/// Replace `source` with `replacement`, carrying the concept across.
+///
+/// The source row is deleted and a distinct memory is inserted, so provenance
+/// reads as an audit trail rather than an in-place edit. That delete cascades
+/// the source's whole OKF projection, so its descriptive metadata and sources
+/// are captured first and re-applied inside the replacement's revision 1 —
+/// otherwise every supersede silently resets the concept to a bare
+/// `Agent Memory/<type>` with no title, description, lifecycle, or sources.
+///
+/// Both provenance edges address the predecessor by canonical URI. The row is
+/// gone by the time they are written, so `dst_memory_id` cannot resolve and
+/// the textual ref is the only usable target — a bare UUID there is not
+/// resolvable by any reader, while the URI carries scope and is.
 fn persist_replacement(
     conn: &Connection,
     source: &Memory,
@@ -486,15 +499,30 @@ fn persist_replacement(
     operation: &str,
     supersedes: bool,
 ) -> Result<(), ProjectReviewError> {
-    q::delete_memory_with_actor(conn, &source.id, Some("memory-dream"), Some(operation))?;
+    const ACTOR: &str = "memory-dream";
+    let carried = agent_memory::concepts::capture_concept(conn, &source.id)?;
+    q::delete_memory_with_actor(conn, &source.id, Some(ACTOR), Some(operation))?;
     let old_uri = agent_memory::concepts::canonical_uri(&source.id, source.project.as_deref());
     agent_memory::concepts::insert_memory_with(
         conn,
         replacement,
         operation,
-        Some("memory-dream"),
-        Some(&source.id),
+        Some(ACTOR),
+        None,
         |revision| {
+            if let Some(carried) = carried.as_ref() {
+                agent_memory::concepts::apply_carried_concept(conn, &replacement.id, carried)?;
+            }
+            agent_memory::concepts::insert_relationship_with_producer(
+                conn,
+                &replacement.id,
+                None,
+                &old_uri,
+                "derived_from",
+                ACTOR,
+                revision,
+                Some(0),
+            )?;
             if supersedes {
                 agent_memory::concepts::insert_relationship_with_producer(
                     conn,
@@ -502,7 +530,7 @@ fn persist_replacement(
                     None,
                     &old_uri,
                     "supersedes",
-                    "memory-dream",
+                    ACTOR,
                     revision,
                     None,
                 )?;
@@ -1254,9 +1282,114 @@ mod tests {
             "2026-04-21T00:00:00Z",
         );
         q::insert_memory(&conn, &source).unwrap();
+        // Give the source a full OKF projection so the assertions below prove
+        // carry-forward rather than passing vacuously on empty columns.
+        agent_memory::concepts::mutate(&conn, &source.id, "metadata", None, None, false, |_| {
+            conn.execute(
+                "UPDATE memory_concepts SET concept_type = 'Runbook/Deploy',
+                     title = 'Carried title', description = 'Carried description',
+                     resource = 'https://example.invalid/doc', status = 'draft',
+                     stale_after = '2099-01-01T00:00:00Z',
+                     extensions_json = '{\"x-producer\":{\"keep\":true}}',
+                     raw_frontmatter = 'unknown: field'
+                     WHERE memory_id = ?1",
+                rusqlite::params![source.id],
+            )?;
+            conn.execute(
+                "INSERT INTO memory_sources (
+                         memory_id, source_key, ordinal, resource, metadata_json
+                     ) VALUES (?1, 'src-1', 0, 'https://example.invalid/source', '{}')",
+                rusqlite::params![source.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
         let tx = conn.transaction().unwrap();
         persist_replacement(&tx, &source, &replacement, "supersede", true).unwrap();
         tx.commit().unwrap();
+
+        let carried = conn
+            .query_row(
+                "SELECT concept_type, COALESCE(title, ''), COALESCE(description, ''),
+                        COALESCE(resource, ''), status, COALESCE(stale_after, ''),
+                        extensions_json, COALESCE(raw_frontmatter, '')
+                 FROM memory_concepts WHERE memory_id = ?1",
+                rusqlite::params![replacement.id],
+                |row| {
+                    (0..8)
+                        .map(|column| row.get::<_, String>(column))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            carried,
+            vec![
+                "Runbook/Deploy",
+                "Carried title",
+                "Carried description",
+                "https://example.invalid/doc",
+                "draft",
+                "2099-01-01T00:00:00Z",
+                "{\"x-producer\":{\"keep\":true}}",
+                "unknown: field",
+            ],
+            "replacement must inherit the source's OKF projection"
+        );
+        let carried_source: String = conn
+            .query_row(
+                "SELECT resource FROM memory_sources WHERE memory_id = ?1",
+                rusqlite::params![replacement.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(carried_source, "https://example.invalid/source");
+
+        // Both provenance edges address the deleted predecessor by canonical
+        // URI, with the producer matching the acting curator.
+        let edges = conn
+            .prepare(
+                "SELECT relation, dst_ref, producer FROM memory_relationships
+                 WHERE src_memory_id = ?1 ORDER BY relation",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![replacement.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected_uri =
+            agent_memory::concepts::canonical_uri(&source.id, source.project.as_deref());
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    "derived_from".to_string(),
+                    expected_uri.clone(),
+                    "memory-dream".to_string()
+                ),
+                (
+                    "supersedes".to_string(),
+                    expected_uri,
+                    "memory-dream".to_string()
+                ),
+            ]
+        );
+        // Verification is NOT carried: the body changed.
+        let verifications: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_verifications WHERE memory_id = ?1",
+                rusqlite::params![replacement.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verifications, 0);
 
         let revision: (String, Option<String>) = conn
             .query_row(
