@@ -148,6 +148,12 @@ pub enum Decision {
     /// Preserve both memories and surface their incompatible claims for
     /// human/agent resolution. Contradictions are never silently deduplicated.
     Contradiction { target_id: String, reason: String },
+    /// Retire a memory that was true and is no longer the live answer.
+    ///
+    /// The middle ground the pass previously lacked. Without it every
+    /// judgement was keep-or-destroy, so a superseded approach could only be
+    /// carried as if current or erased along with the reasoning behind it.
+    Deprecate { reason: String },
 }
 
 /// JSON shape the model is asked to emit. Kept separate from [`Decision`]
@@ -175,6 +181,9 @@ enum RawDecision {
         target_id: String,
         reason: String,
     },
+    Deprecate {
+        reason: String,
+    },
 }
 
 /// Envelope the model returns. A map keyed by memory id keeps the
@@ -190,6 +199,7 @@ struct RawResponse {
 pub struct ProjectReviewStats {
     pub kept: usize,
     pub dropped: usize,
+    pub deprecated: usize,
     pub merged: usize,
     pub superseded: usize,
     pub extracted: usize,
@@ -518,6 +528,55 @@ pub(super) fn record_curation_review(
     Ok(())
 }
 
+/// Retire a memory: keep the body and its history, stop recalling it.
+///
+/// The reason is recorded in the concept's extensions so a reader can see why
+/// it was retired, which is the whole point of retiring rather than deleting.
+fn set_deprecated(
+    conn: &Connection,
+    memory_id: &str,
+    reason: &str,
+    model_name: &str,
+) -> Result<(), ProjectReviewError> {
+    agent_memory::concepts::mutate(
+        conn,
+        memory_id,
+        "dream_deprecate",
+        Some("memory-dream"),
+        None,
+        // The claim itself is unchanged; it has stopped applying. Clearing
+        // verification would discard an attestation that is still accurate
+        // about the body.
+        false,
+        |_| {
+            conn.execute(
+                "UPDATE memory_concepts SET status = 'deprecated' WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+            )?;
+            let extensions: String = conn.query_row(
+                "SELECT extensions_json FROM memory_concepts WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |row| row.get(0),
+            )?;
+            let mut parsed: serde_json::Value =
+                serde_json::from_str(&extensions).unwrap_or_else(|_| serde_json::json!({}));
+            if !parsed.is_object() {
+                parsed = serde_json::json!({});
+            }
+            parsed["x-agent-memory-deprecation"] = serde_json::json!({
+                "reason": reason,
+                "by": crate::dream::generated_by(model_name),
+            });
+            conn.execute(
+                "UPDATE memory_concepts SET extensions_json = ?1 WHERE memory_id = ?2",
+                rusqlite::params![parsed.to_string(), memory_id],
+            )?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Persist a `contradicts` edge between two memories the model flagged as
 /// making incompatible claims. Both keep their bodies; the conflict becomes
 /// queryable instead of scrolling past in a log.
@@ -752,6 +811,7 @@ impl From<RawDecision> for Decision {
             RawDecision::Contradiction { target_id, reason } => {
                 Decision::Contradiction { target_id, reason }
             }
+            RawDecision::Deprecate { reason } => Decision::Deprecate { reason },
         }
     }
 }
@@ -822,6 +882,10 @@ fn apply_decisions(
             let removes_or_hides = match &decision {
                 Decision::Keep => false,
                 Decision::Contradiction { .. } => false,
+                // Deprecation retires a memory without deleting it, so the
+                // remote row must survive too — it is pushed as an update
+                // below, not tombstoned.
+                Decision::Deprecate { .. } => false,
                 Decision::Drop | Decision::MergeInto { .. } => true,
                 Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
                     !materialize_failed.contains(&mem.id)
@@ -916,6 +980,36 @@ fn apply_decisions(
                         &[
                             ("id", render::short_id(&mem.id).to_string()),
                             ("target", render::short_id(&target_id).to_string()),
+                            ("project", project_label.to_string()),
+                            ("reason", reason),
+                        ]
+                    )
+                );
+            }
+            Decision::Deprecate { reason } => {
+                stats.deprecated += 1;
+                if apply {
+                    match set_deprecated(&tx, &mem.id, &reason, model_name) {
+                        Ok(()) => gateway_creates.push(mem.clone()),
+                        Err(e) => {
+                            stats.failed += 1;
+                            tracing::warn!(id = %mem.id, error = %e, "review deprecate failed");
+                            continue;
+                        }
+                    }
+                }
+                // Retired, so it does not flow into Stage A/B — but it is not
+                // gone, and its history and body remain readable.
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        if apply {
+                            "review_deprecate"
+                        } else {
+                            "review_would_deprecate"
+                        },
+                        &[
+                            ("id", render::short_id(&mem.id).to_string()),
                             ("project", project_label.to_string()),
                             ("reason", reason),
                         ]
@@ -1360,6 +1454,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn deprecation_retires_a_memory_without_destroying_it() {
+        let conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let memory = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000091",
+            "Old approach: we pinned the driver",
+            &["rule"],
+            "2026-04-20T00:00:00Z",
+        );
+        q::insert_memory(&conn, &memory).unwrap();
+        let before = revision_of(&conn, &memory.id);
+
+        set_deprecated(
+            &conn,
+            &memory.id,
+            "driver pin lifted in v3",
+            "backend/model-a",
+        )
+        .unwrap();
+
+        let (status, extensions): (String, String) = conn
+            .query_row(
+                "SELECT status, extensions_json FROM memory_concepts WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "deprecated");
+        assert!(extensions.contains("driver pin lifted in v3"));
+        assert_eq!(revision_of(&conn, &memory.id), before + 1);
+
+        // The body and its history survive — this is retirement, not deletion.
+        let still_there = q::get_memory_by_id(&conn, &memory.id).unwrap();
+        assert_eq!(still_there.content, "Old approach: we pinned the driver");
+        let tombstones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_concept_tombstones WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 0);
+    }
+
+    #[test]
+    fn deprecate_decisions_parse_and_carry_their_reason() {
+        let batch = vec![mk_memory(
+            "aaa",
+            "old approach",
+            &["rule"],
+            "2026-04-20T00:00:00Z",
+        )];
+        let raw = r#"{"decisions":{"aaa":{"action":"deprecate","reason":"replaced in v3"}}}"#;
+        let out = parse_response(raw, &batch).unwrap();
+        match out.get("aaa") {
+            Some(Decision::Deprecate { reason }) => assert_eq!(reason, "replaced in v3"),
+            other => panic!("expected Deprecate, got {other:?}"),
+        }
     }
 
     #[test]

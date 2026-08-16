@@ -151,6 +151,7 @@ pub struct DreamSummary {
     // -- Stage 0 (project review) counters ---------------------------------
     pub review_kept: usize,
     pub review_dropped: usize,
+    pub review_deprecated: usize,
     pub review_merged: usize,
     pub review_superseded: usize,
     pub review_extracted: usize,
@@ -261,6 +262,10 @@ pub fn run(
                     ("superseded", project_stats.superseded.to_string()),
                     ("review_kept", project_stats.review_kept.to_string()),
                     ("review_dropped", project_stats.review_dropped.to_string()),
+                    (
+                        "review_deprecated",
+                        project_stats.review_deprecated.to_string()
+                    ),
                     ("review_merged", project_stats.review_merged.to_string()),
                     (
                         "review_superseded",
@@ -302,6 +307,7 @@ pub fn run(
                 ("superseded", summary.superseded.to_string()),
                 ("review_kept", summary.review_kept.to_string()),
                 ("review_dropped", summary.review_dropped.to_string()),
+                ("review_deprecated", summary.review_deprecated.to_string()),
                 ("review_merged", summary.review_merged.to_string()),
                 ("review_superseded", summary.review_superseded.to_string()),
                 ("review_extracted", summary.review_extracted.to_string()),
@@ -336,6 +342,7 @@ struct ProjectStats {
     // Stage 0 tallies.
     review_kept: usize,
     review_dropped: usize,
+    review_deprecated: usize,
     review_merged: usize,
     review_superseded: usize,
     review_extracted: usize,
@@ -405,6 +412,7 @@ fn run_stage_0_project_review(
         Ok(outcome) => {
             project_stats.review_kept += outcome.stats.kept;
             project_stats.review_dropped += outcome.stats.dropped;
+            project_stats.review_deprecated += outcome.stats.deprecated;
             project_stats.review_merged += outcome.stats.merged;
             project_stats.review_superseded += outcome.stats.superseded;
             project_stats.review_extracted += outcome.stats.extracted;
@@ -413,6 +421,7 @@ fn run_stage_0_project_review(
 
             summary.review_kept += outcome.stats.kept;
             summary.review_dropped += outcome.stats.dropped;
+            summary.review_deprecated += outcome.stats.deprecated;
             summary.review_merged += outcome.stats.merged;
             summary.review_superseded += outcome.stats.superseded;
             summary.review_extracted += outcome.stats.extracted;
