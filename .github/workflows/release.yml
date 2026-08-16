@@ -57,12 +57,49 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Workspace build produces both binaries under
-      # target/<triple>/release/{memory,memory-dream}.
-      - name: Build workspace
+      # Linux release binaries must not inherit the moving hosted runner's
+      # glibc. Build inside Debian 11 (glibc 2.31) so the artifacts remain
+      # executable on Debian 11/12 and newer distributions.
+      - name: Build workspace (Linux, glibc 2.31 baseline)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            --env AGENT_MEMORY_VERSION \
+            --env CARGO_TARGET_DIR=/workspace/target/linux-abi \
+            --env CARGO_HOME=/tmp/cargo-home \
+            --env HOME=/tmp \
+            rust:1.96-bullseye@sha256:21d112adb6ab370d39eef8f861f10b42342419b9569e7a05dac15e19eb65a3b4 \
+            cargo build --release --target ${{ matrix.target }} --workspace
+        env:
+          AGENT_MEMORY_VERSION: ${{ github.ref_name }}
+
+      - name: Build workspace (Windows/macOS)
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} --workspace
         env:
           AGENT_MEMORY_VERSION: ${{ github.ref_name }}
+
+      - name: Resolve binary directory
+        id: paths
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "src=target/linux-abi/${{ matrix.target }}/release" >> "$GITHUB_OUTPUT"
+          else
+            echo "src=target/${{ matrix.target }}/release" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enforce Linux glibc compatibility ceiling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          scripts/check-glibc-floor.sh 2.31 \
+            "${{ steps.paths.outputs.src }}/${{ matrix.memory_bin }}" \
+            "${{ steps.paths.outputs.src }}/${{ matrix.dream_bin }}"
 
       - name: Compute archive name
         id: archive
@@ -74,7 +111,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $src = "target/${{ matrix.target }}/release"
+          $src = "${{ steps.paths.outputs.src }}"
           Compress-Archive -Path "$src/${{ matrix.memory_bin }}","$src/${{ matrix.dream_bin }}" `
             -DestinationPath "${{ steps.archive.outputs.name }}"
 
@@ -82,7 +119,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           tar czf ${{ steps.archive.outputs.name }} \
-            -C target/${{ matrix.target }}/release \
+            -C ${{ steps.paths.outputs.src }} \
             ${{ matrix.memory_bin }} ${{ matrix.dream_bin }}
 
       - name: Upload artifact

@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.12.2 - 2026-08-16
+
+- Built Linux release artifacts inside a fixed Debian 11 environment and
+  rejected binaries requiring newer than GLIBC 2.31, restoring compatibility
+  with Debian 11/12 and preventing moving GitHub runners from silently raising
+  the runtime ABI floor.
+- Documented the shell-installer recovery path for hosts where an incompatible
+  binary cannot launch its own updater.
+
 ## v1.12.1 - 2026-08-15
 
 - Made Dream's condenser audit stamp use the actual backend-qualified

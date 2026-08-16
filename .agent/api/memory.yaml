@@ -62,6 +62,12 @@ content:
         - memory forget --id or --query pushes a gateway tombstone before deleting a linked local row; if the tombstone fails, the local row is kept so the delete can be retried safely.
         - If a linked row is deleted locally without a successful direct gateway tombstone, memory records a pending delete queue item so the next memory push or memory push --all can tombstone the gateway record.
         - memory-dream uses the same direct gateway write helpers for condense rewrites, forget/drop decisions, and superseded memories when gateway auto-sync is enabled.
+    - name: Recover an incompatible Linux binary
+      steps:
+        - Recognize a startup error naming a missing GLIBC version as a release ABI incompatibility; the in-process memory update command cannot run in this state.
+        - Run curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash to bootstrap both binaries without executing the broken installation.
+        - Confirm memory --version and memory-dream --version after installation.
+      compatibility: Published Linux binaries require no newer than GLIBC_2.31 and are checked before release.
     - name: Run Dream curation safely
       steps:
         - Configure headless.model and use {model} in headless.command so execution and audit identity share one source of truth.

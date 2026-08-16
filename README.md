@@ -690,6 +690,19 @@ You can also trigger an update manually at any time with `memory update`.
 
 `memory update` fetches the combined release archive and atomically swaps **both** binaries (`memory` + `memory-dream`) in place. If `memory-dream` wasn't previously installed, the updater force-bundles it on the next upgrade — users who never run the compactor pay ~28MB of disk but no cognitive overhead.
 
+Linux release binaries target a maximum of glibc 2.31, covering Debian 11/12,
+Ubuntu 20.04, and newer compatible distributions. The release pipeline checks
+both executables' imported GLIBC symbol versions before publishing them.
+
+If an older release installed a binary that cannot start because its GLIBC
+requirement is newer than the host, `memory update` cannot repair itself. Use
+the shell installer, which does not execute the broken binary and replaces both
+executables from the latest compatible release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash
+```
+
 ## Dream compactor (offline condensation + dedup)
 
 `memory-dream` is a one-shot batch utility that walks your memory DB. Each pass runs three stages in order:

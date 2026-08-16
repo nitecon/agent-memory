@@ -31,9 +31,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The shell_injection_probe integration test drives the release
-      # binaries end-to-end and fails fast when they are missing.
-      - name: build release binaries (shell-injection probe fixture)
-        run: cargo build --release -p agent-memory -p memory-dream
+      # Build the shell-injection fixtures in the same fixed Debian 11
+      # environment used for Linux releases. This validates the container and
+      # ABI ceiling on main before a release tag is created.
+      - name: build Debian-compatible release binaries
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            --env AGENT_MEMORY_VERSION=0.0.0-ci \
+            --env CARGO_TARGET_DIR=/workspace/target \
+            --env CARGO_HOME=/tmp/cargo-home \
+            --env HOME=/tmp \
+            rust:1.96-bullseye@sha256:21d112adb6ab370d39eef8f861f10b42342419b9569e7a05dac15e19eb65a3b4 \
+            cargo build --release -p agent-memory -p memory-dream
+      - name: verify Linux glibc compatibility ceiling
+        run: |
+          scripts/check-glibc-floor.sh 2.31 \
+            target/release/memory \
+            target/release/memory-dream
       - name: cargo test
         run: cargo test --workspace
