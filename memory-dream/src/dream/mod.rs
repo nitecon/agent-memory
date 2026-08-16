@@ -72,6 +72,15 @@ pub enum DreamMode {
 /// default in `agent_memory::embedding::embed_text`.
 pub const EMBEDDING_MODEL_NAME: &str = "all-MiniLM-L6-v2";
 
+/// OKF `generated.by` for bodies this crate authored.
+///
+/// Carries the backend-qualified model identity, not just the producer, so a
+/// curated body can be traced to the exact inference that wrote it — the same
+/// identity discipline `condenser_version` already follows.
+pub fn generated_by(model_name: &str) -> String {
+    format!("memory-dream/{model_name}")
+}
+
 /// Configuration for a single dream pass.
 pub struct DreamConfig<'a> {
     /// Which execution mode to run in.
@@ -723,6 +732,7 @@ fn run_stage_b_condense(
                     &text,
                     source.content_raw.as_deref().unwrap_or(&source.content),
                     &prompt::condenser_version_stamp(cfg.model_name),
+                    &generated_by(cfg.model_name),
                     &new_emb,
                     EMBEDDING_MODEL_NAME,
                 ) {
@@ -1237,6 +1247,7 @@ mod tests {
             "concise body",
             "verbose original body",
             "test:stamp",
+            &generated_by("test-model"),
             &[1.0, 0.0],
             EMBEDDING_MODEL_NAME,
         )
@@ -1272,7 +1283,7 @@ mod tests {
         assert_eq!(state.2, 1);
         assert_eq!(state.3, 1);
         assert_eq!(state.4, 0);
-        assert_eq!(state.5, "condense");
+        assert_eq!(state.5, "dream_condense");
         assert_eq!(state.6, "memory-dream");
     }
 

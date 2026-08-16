@@ -498,6 +498,7 @@ fn persist_replacement(
     replacement: &Memory,
     operation: &str,
     supersedes: bool,
+    model_name: &str,
 ) -> Result<(), ProjectReviewError> {
     const ACTOR: &str = "memory-dream";
     let carried = agent_memory::concepts::capture_concept(conn, &source.id)?;
@@ -520,6 +521,13 @@ fn persist_replacement(
                 conn,
                 &replacement.id,
                 &replacement.content,
+            )?;
+            // The replacement body is model-authored, whatever the source's
+            // provenance was.
+            agent_memory::concepts::set_generated(
+                conn,
+                &replacement.id,
+                &crate::dream::generated_by(model_name),
             )?;
             agent_memory::concepts::insert_relationship_with_producer(
                 conn,
@@ -883,14 +891,26 @@ fn apply_decisions(
                 } else {
                     stats.extracted += 1;
                 }
-                let label_action = if is_supersede { "supersede" } else { "extract" };
+                // Revision operations are namespaced so an audit filter can
+                // select everything a curation pass did without enumerating
+                // bare verbs that other writers could also use.
+                let label_action = if is_supersede {
+                    "dream_supersede"
+                } else {
+                    "dream_extract"
+                };
 
                 if apply {
                     // Delete the old row and insert the new one as a
                     // distinct memory so provenance stays audit-friendly.
-                    if let Err(e) =
-                        persist_replacement(&tx, mem, &new_mem, label_action, is_supersede)
-                    {
+                    if let Err(e) = persist_replacement(
+                        &tx,
+                        mem,
+                        &new_mem,
+                        label_action,
+                        is_supersede,
+                        model_name,
+                    ) {
                         stats.failed += 1;
                         tracing::warn!(id = %new_mem.id, error = %e,
                             "review {label_action} replacement failed");
@@ -1314,7 +1334,15 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        persist_replacement(&tx, &source, &replacement, "supersede", true).unwrap();
+        persist_replacement(
+            &tx,
+            &source,
+            &replacement,
+            "dream_supersede",
+            true,
+            "test-backend/test-model",
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let carried = conn
@@ -1409,7 +1437,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             revision,
-            ("supersede".to_string(), Some("memory-dream".to_string()))
+            (
+                "dream_supersede".to_string(),
+                Some("memory-dream".to_string())
+            )
         );
         let relations = conn
             .prepare(

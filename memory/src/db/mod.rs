@@ -353,7 +353,32 @@ fn run_migrations_inner(conn: &Connection) -> Result<(), MemoryError> {
     if version < 11 {
         migrate_v11_dream_relationship_provenance(conn)?;
     }
+    if version < 12 {
+        migrate_v12_namespaced_dream_operations(conn)?;
+    }
 
+    Ok(())
+}
+
+/// Bring historical curation revisions onto the namespaced operation
+/// vocabulary.
+///
+/// `dream_merge` was already namespaced but `condense`, `extract` and
+/// `supersede` were not, so an audit filter written against the documented
+/// vocabulary silently missed most of what Dream had done. The operation is a
+/// label: it is not part of the semantic snapshot or content hash, so
+/// relabelling does not alter any recorded state.
+///
+/// Scoped to revisions actually written by the curator, so an unrelated writer
+/// that used a bare verb keeps its own history.
+fn migrate_v12_namespaced_dream_operations(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch(
+        "UPDATE memory_revisions
+         SET operation = 'dream_' || operation
+         WHERE actor = 'memory-dream'
+           AND operation IN ('condense', 'extract', 'supersede');
+         INSERT OR IGNORE INTO schema_version (version) VALUES (12);",
+    )?;
     Ok(())
 }
 
@@ -760,7 +785,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -803,7 +828,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
     }
 
     #[test]
@@ -868,7 +893,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -947,7 +972,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
 
         let existing: String = conn
             .query_row(
@@ -1010,7 +1035,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
 
         let sync_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
@@ -1112,7 +1137,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 11);
+        assert_eq!(max_v, 12);
 
         conn.execute(
             "INSERT INTO memory_gateway_sync (
@@ -1190,7 +1215,7 @@ mod migration_tests {
              DROP TABLE memory_revisions;
              DROP TABLE memory_concepts;
              DROP TABLE memory_concept_tombstones;
-             DELETE FROM schema_version WHERE version IN (9, 10, 11);
+             DELETE FROM schema_version WHERE version IN (9, 10, 11, 12);
              INSERT INTO memories (
                  id, content, tags, project, agent, source_file,
                  created_at, updated_at, access_count, embedding, memory_type,
@@ -1350,7 +1375,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version IN (10, 11);",
+             DELETE FROM schema_version WHERE version IN (10, 11, 12);",
         )
         .expect("restore v9 state");
 
@@ -1382,7 +1407,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version IN (10, 11);
+             DELETE FROM schema_version WHERE version IN (10, 11, 12);
              CREATE TABLE memory_segments_fts (wrong_column TEXT);",
         )
         .expect("construct incompatible v9 fixture");
@@ -1412,7 +1437,7 @@ mod migration_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]
@@ -1445,7 +1470,9 @@ mod migration_tests {
             None,
         )
         .unwrap();
-        conn.execute("DELETE FROM schema_version WHERE version = 11", [])
+        // Migrations gate on MAX(version), so every row at or above the one
+        // under test has to go for its guard to re-open.
+        conn.execute("DELETE FROM schema_version WHERE version >= 11", [])
             .unwrap();
 
         run_migrations(&conn).unwrap();
@@ -1458,6 +1485,55 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(producer, "memory-dream");
+    }
+
+    #[test]
+    fn v12_namespaces_dream_operations_without_touching_other_writers() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let mut expected = Vec::new();
+        for (actor, operation, want) in [
+            (Some("memory-dream"), "condense", "dream_condense"),
+            (Some("memory-dream"), "extract", "dream_extract"),
+            (Some("memory-dream"), "supersede", "dream_supersede"),
+            (Some("memory-dream"), "dream_merge", "dream_merge"),
+            // Another writer's bare verb keeps its own history.
+            (Some("someone-else"), "condense", "condense"),
+            (None, "store", "store"),
+        ] {
+            let memory = crate::db::models::Memory::new(
+                format!("body {operation} {actor:?}"),
+                None,
+                Some("project".to_string()),
+                None,
+                None,
+                Some("project".to_string()),
+            );
+            let id = memory.id.clone();
+            crate::db::queries::insert_memory(&conn, &memory).unwrap();
+            conn.execute(
+                "UPDATE memory_revisions SET actor = ?1, operation = ?2
+                 WHERE memory_id = ?3 AND revision = 1",
+                params![actor, operation, id],
+            )
+            .unwrap();
+            expected.push((id, want));
+        }
+        conn.execute("DELETE FROM schema_version WHERE version >= 12", [])
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        for (id, want) in expected {
+            let operation: String = conn
+                .query_row(
+                    "SELECT operation FROM memory_revisions WHERE memory_id = ?1 AND revision = 1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(operation, want);
+        }
     }
 
     #[test]

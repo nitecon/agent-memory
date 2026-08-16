@@ -1120,12 +1120,14 @@ pub fn list_dedup_candidates(
 /// inference, embedding) when using this helper, or concurrent
 /// `memory store`/`update`/`forget` invocations will block.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn update_condensation(
     conn: &Connection,
     id: &str,
     new_content: &str,
     new_content_raw: &str,
     condenser_version: &str,
+    generated_by: &str,
     embedding: &[f32],
     embedding_model: &str,
 ) -> Result<(), MemoryError> {
@@ -1134,11 +1136,15 @@ pub fn update_condensation(
     crate::concepts::mutate(
         conn,
         id,
-        "condense",
+        "dream_condense",
         Some("memory-dream"),
         None,
         true,
         |_| {
+            // The body is now model-authored. Leaving `generated` pointing at
+            // whoever stored the original makes the concept claim a human
+            // wrote text a model produced.
+            crate::concepts::set_generated(conn, id, generated_by)?;
             conn.execute(
                 "UPDATE memories SET
                  content = ?1,
@@ -2549,6 +2555,7 @@ mod resolve_id_tests {
             "condensed form",
             "original verbose raw content",
             "gemma3:abcd",
+            "memory-dream/gemma3",
             &[0.1_f32, 0.2, 0.3],
             "all-MiniLM-L6-v2",
         )
@@ -2563,5 +2570,21 @@ mod resolve_id_tests {
         assert_eq!(got.condenser_version.as_deref(), Some("gemma3:abcd"));
         assert_eq!(got.embedding_model.as_deref(), Some("all-MiniLM-L6-v2"));
         assert_eq!(got.embedding.as_ref().map(|v| v.len()), Some(3));
+
+        // A model-authored body must claim its producer, under the namespaced
+        // curation operation.
+        let (generated_by, operation): (Option<String>, String) = conn
+            .query_row(
+                "SELECT c.generated_by, r.operation
+                 FROM memory_concepts c
+                 JOIN memory_revisions r ON r.memory_id = c.memory_id
+                                        AND r.revision = c.current_revision
+                 WHERE c.memory_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(generated_by.as_deref(), Some("memory-dream/gemma3"));
+        assert_eq!(operation, "dream_condense");
     }
 }

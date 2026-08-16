@@ -719,6 +719,21 @@ pub fn forget(
     })
 }
 
+/// Record who produced the current body, as OKF `generated`.
+///
+/// Must be called by any writer that replaces a body with machine-authored
+/// text. Without it the concept keeps crediting whoever stored the original,
+/// so a curated memory reads as if a human wrote what a model rewrote. `by`
+/// should identify the producer and its model, e.g. `memory-dream/<model>`.
+#[allow(dead_code)]
+pub fn set_generated(conn: &Connection, memory_id: &str, by: &str) -> Result<(), MemoryError> {
+    conn.execute(
+        "UPDATE memory_concepts SET generated_by = ?1, generated_at = ?2 WHERE memory_id = ?3",
+        params![by, chrono::Utc::now().to_rfc3339(), memory_id],
+    )?;
+    Ok(())
+}
+
 pub fn canonical_uri(memory_id: &str, project: Option<&str>) -> String {
     match project {
         Some("__global__") => format!("memory://global/{memory_id}"),
