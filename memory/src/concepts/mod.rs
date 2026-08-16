@@ -763,6 +763,80 @@ pub fn insert_relationship(
     )
 }
 
+/// Record a machine confirmation, unless this actor already confirmed the
+/// current body.
+///
+/// An automated pass that re-reads a memory and leaves it alone has confirmed
+/// it, and that is worth keeping: it is the difference between "nothing has
+/// ever checked this" and "a curator read it and stood by it". Returns whether
+/// a new event was recorded.
+///
+/// Re-confirming an unchanged concept is deliberately a no-op. Verification is
+/// cleared whenever the claim changes, so a surviving confirmation still refers
+/// to the current body — refreshing its timestamp would add no information and
+/// would mint a revision on every scheduled pass.
+#[allow(dead_code)]
+pub fn record_verification(
+    conn: &Connection,
+    memory_id: &str,
+    actor: &str,
+    kind: &str,
+) -> Result<bool, MemoryError> {
+    let already: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_verifications WHERE memory_id = ?1 AND actor = ?2)",
+        params![memory_id, actor],
+        |row| row.get(0),
+    )?;
+    if already {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO memory_verifications (
+             id, memory_id, actor, verified_at, verification_kind, metadata_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, '{}')",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            memory_id,
+            actor,
+            chrono::Utc::now().to_rfc3339(),
+            kind,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Insert a relationship carrying producer-supplied metadata.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn insert_relationship_with_metadata(
+    conn: &Connection,
+    src_memory_id: &str,
+    dst_memory_id: Option<&str>,
+    dst_ref: &str,
+    relation: &str,
+    producer: &str,
+    source_revision: i64,
+    metadata: &serde_json::Value,
+) -> Result<(), MemoryError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_relationships (
+             id, src_memory_id, dst_memory_id, dst_ref, relation, confidence,
+             producer, source_revision, ordinal, metadata_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'asserted', ?6, ?7, NULL, ?8, ?9)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            src_memory_id,
+            dst_memory_id,
+            dst_ref,
+            relation,
+            producer,
+            source_revision,
+            metadata.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn insert_relationship_with_producer(
     conn: &Connection,

@@ -479,6 +479,93 @@ fn bounded(value: &str, max_chars: usize) -> String {
     }
 }
 
+/// Record that a curation pass re-read this memory and left it standing.
+///
+/// No-ops once this curator has already confirmed the current body, so a
+/// scheduled pass over an unchanged store mints no revisions.
+pub(super) fn record_curation_review(
+    conn: &Connection,
+    memory_id: &str,
+    model_name: &str,
+) -> Result<(), ProjectReviewError> {
+    let actor = crate::dream::generated_by(model_name);
+    let already: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_verifications WHERE memory_id = ?1 AND actor = ?2)",
+        rusqlite::params![memory_id, actor],
+        |row| row.get(0),
+    )?;
+    if already {
+        return Ok(());
+    }
+    agent_memory::concepts::mutate(
+        conn,
+        memory_id,
+        "dream_verify",
+        Some("memory-dream"),
+        None,
+        // A confirmation must not clear the verification it is adding.
+        false,
+        |_| {
+            agent_memory::concepts::record_verification(
+                conn,
+                memory_id,
+                &actor,
+                "curation-review",
+            )?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// Persist a `contradicts` edge between two memories the model flagged as
+/// making incompatible claims. Both keep their bodies; the conflict becomes
+/// queryable instead of scrolling past in a log.
+fn record_contradiction(
+    conn: &Connection,
+    memory_id: &str,
+    target_id: &str,
+    reason: &str,
+    model_name: &str,
+) -> Result<(), ProjectReviewError> {
+    let target_project: Option<String> = conn
+        .query_row(
+            "SELECT project FROM memories WHERE id = ?1",
+            rusqlite::params![target_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let target_uri = agent_memory::concepts::canonical_uri(target_id, target_project.as_deref());
+    agent_memory::concepts::mutate(
+        conn,
+        memory_id,
+        "dream_contradiction",
+        Some("memory-dream"),
+        None,
+        // Flagging a conflict does not alter either claim, so an existing
+        // attestation of this body still stands.
+        false,
+        |revision| {
+            agent_memory::concepts::insert_relationship_with_metadata(
+                conn,
+                memory_id,
+                Some(target_id),
+                &target_uri,
+                "contradicts",
+                "memory-dream",
+                revision,
+                &serde_json::json!({
+                    "reason": reason,
+                    "detected_by": crate::dream::generated_by(model_name),
+                }),
+            )?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Replace `source` with `replacement`, carrying the concept across.
 ///
 /// The source row is deleted and a distinct memory is inserted, so provenance
@@ -784,6 +871,16 @@ fn apply_decisions(
         match decision {
             Decision::Keep => {
                 stats.kept += 1;
+                if apply {
+                    // The model read this memory and stood by it. Recording
+                    // that lifts it out of "nothing has ever checked this",
+                    // which is the only signal separating an unreviewed note
+                    // from a curated one.
+                    if let Err(e) = record_curation_review(&tx, &mem.id, model_name) {
+                        tracing::warn!(id = %mem.id, error = %e,
+                            "review keep confirmation failed");
+                    }
+                }
                 survivors.push(mem.clone());
                 println!(
                     "{}",
@@ -800,6 +897,17 @@ fn apply_decisions(
                 stats.contradictions += 1;
                 contradiction_ids.insert(mem.id.clone());
                 contradiction_ids.insert(target_id.clone());
+                if apply {
+                    // Contradictions are surfaced, never silently resolved —
+                    // and a line on stdout is not surfacing. Persisting the
+                    // edge is what lets the conflict be found again later.
+                    if let Err(e) =
+                        record_contradiction(&tx, &mem.id, &target_id, &reason, model_name)
+                    {
+                        tracing::warn!(id = %mem.id, target = %target_id, error = %e,
+                            "review contradiction edge failed");
+                    }
+                }
                 survivors.push(mem.clone());
                 println!(
                     "{}",
@@ -1205,6 +1313,98 @@ mod tests {
             }
             other => panic!("expected Extract, got {other:?}"),
         }
+    }
+
+    fn revision_of(conn: &Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT current_revision FROM memory_concepts WHERE memory_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn curation_review_confirms_once_and_repeat_passes_mint_no_revisions() {
+        let conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let memory = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000071",
+            "Kept body: a claim",
+            &["rule"],
+            "2026-04-20T00:00:00Z",
+        );
+        q::insert_memory(&conn, &memory).unwrap();
+        let before = revision_of(&conn, &memory.id);
+
+        record_curation_review(&conn, &memory.id, "backend/model-a").unwrap();
+        let (actor, kind): (String, Option<String>) = conn
+            .query_row(
+                "SELECT actor, verification_kind FROM memory_verifications WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "memory-dream/backend/model-a");
+        assert_eq!(kind.as_deref(), Some("curation-review"));
+        let after = revision_of(&conn, &memory.id);
+        assert_eq!(after, before + 1);
+
+        // A second pass over an unchanged memory must not churn history.
+        record_curation_review(&conn, &memory.id, "backend/model-a").unwrap();
+        assert_eq!(revision_of(&conn, &memory.id), after);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_verifications WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn contradictions_are_persisted_as_edges_with_their_reason() {
+        let conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let first = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000081",
+            "Claim A: the runner retries",
+            &["rule"],
+            "2026-04-20T00:00:00Z",
+        );
+        let second = mk_memory(
+            "aaaaaaaa-0000-1111-2222-000000000082",
+            "Claim B: the runner never retries",
+            &["rule"],
+            "2026-04-21T00:00:00Z",
+        );
+        q::insert_memory(&conn, &first).unwrap();
+        q::insert_memory(&conn, &second).unwrap();
+
+        record_contradiction(
+            &conn,
+            &first.id,
+            &second.id,
+            "retry behaviour stated both ways",
+            "backend/model-a",
+        )
+        .unwrap();
+
+        let (relation, dst, producer, metadata): (String, Option<String>, String, String) = conn
+            .query_row(
+                "SELECT relation, dst_memory_id, producer, metadata_json
+                 FROM memory_relationships WHERE src_memory_id = ?1",
+                rusqlite::params![first.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(relation, "contradicts");
+        assert_eq!(dst.as_deref(), Some(second.id.as_str()));
+        assert_eq!(producer, "memory-dream");
+        assert!(metadata.contains("retry behaviour stated both ways"));
+
+        // Both memories survive: a contradiction is a finding, not a merge.
+        assert!(q::get_memory_by_id(&conn, &first.id).is_ok());
+        assert!(q::get_memory_by_id(&conn, &second.id).is_ok());
     }
 
     #[test]

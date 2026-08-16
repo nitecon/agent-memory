@@ -623,6 +623,16 @@ fn run_stage_b_condense(
     match outcome {
         Ok(condense::Decision::Skip) => {
             stats.kept += 1;
+            if cfg.mode == DreamMode::Apply {
+                // A skip is the condenser reading the body and finding nothing
+                // to improve — the same confirmation the review pass records.
+                if let Err(e) =
+                    project_review::record_curation_review(conn, &source.id, cfg.model_name)
+                {
+                    tracing::warn!(id = %source.id, error = %e,
+                        "condense skip confirmation failed");
+                }
+            }
             println!(
                 "{}",
                 render::render_action_result(
