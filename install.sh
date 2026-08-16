@@ -106,6 +106,28 @@ $DOWNLOAD_OUT "${TMPDIR}/${ARCHIVE_NAME}" "$DOWNLOAD_URL"
 info "Extracting..."
 tar xzf "${TMPDIR}/${ARCHIVE_NAME}" -C "$TMPDIR"
 
+# --- Compatibility validation ----------------------------------------------
+
+# Validate the downloaded pair before replacing either installed binary. This
+# is especially important for recovery from a GLIBC mismatch: the installer
+# must never overwrite a working/older executable with an artifact the host
+# loader cannot start.
+for bin in "${BINARIES[@]}"; do
+  if [ ! -f "${TMPDIR}/${bin}" ]; then
+    if [ "$bin" = "memory" ]; then
+      error "Archive did not contain 'memory' binary"
+    fi
+    warn "Archive did not contain '${bin}' — skipping compatibility check (older release?)"
+    continue
+  fi
+
+  chmod +x "${TMPDIR}/${bin}"
+  if ! VERSION_OUTPUT=$("${TMPDIR}/${bin}" --version 2>&1); then
+    error "Downloaded ${bin} cannot run on this host. The existing installation was not changed. Loader output: ${VERSION_OUTPUT}"
+  fi
+  info "Validated ${bin}: ${VERSION_OUTPUT}"
+done
+
 # --- Install ----------------------------------------------------------------
 
 mkdir -p "$INSTALL_DIR"
@@ -121,7 +143,6 @@ for bin in "${BINARIES[@]}"; do
     continue
   fi
   mv "${TMPDIR}/${bin}" "${INSTALL_DIR}/${bin}"
-  chmod +x "${INSTALL_DIR}/${bin}"
   info "Installed ${INSTALL_DIR}/${bin}"
 done
 

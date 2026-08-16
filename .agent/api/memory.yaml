@@ -65,7 +65,7 @@ content:
     - name: Recover an incompatible Linux binary
       steps:
         - Recognize a startup error naming a missing GLIBC version as a release ABI incompatibility; the in-process memory update command cannot run in this state.
-        - Run curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash to bootstrap both binaries without executing the broken installation.
+        - Run curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash to bootstrap both binaries without executing the broken installation; the installer validates both staged binaries before replacing either installed executable.
         - Confirm memory --version and memory-dream --version after installation.
       compatibility: Published Linux binaries require no newer than GLIBC_2.36 and are checked before release.
     - name: Run Dream curation safely

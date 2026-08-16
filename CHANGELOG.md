@@ -7,7 +7,8 @@
   with Debian 12 and preventing moving GitHub runners from silently raising
   the runtime ABI floor.
 - Documented the shell-installer recovery path for hosts where an incompatible
-  binary cannot launch its own updater.
+  binary cannot launch its own updater, and made that installer execute-check
+  both staged binaries before replacing either installed executable.
 
 ## v1.12.1 - 2026-08-15
 

@@ -697,7 +697,8 @@ both executables' imported GLIBC symbol versions before publishing them.
 If an older release installed a binary that cannot start because its GLIBC
 requirement is newer than the host, `memory update` cannot repair itself. Use
 the shell installer, which does not execute the broken binary and replaces both
-executables from the latest compatible release:
+executables from the latest compatible release. It validates both downloaded
+binaries on the host before replacing either installed executable:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash
