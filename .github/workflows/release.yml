@@ -58,9 +58,10 @@ jobs:
           key: ${{ matrix.target }}
 
       # Linux release binaries must not inherit the moving hosted runner's
-      # glibc. Build inside Debian 11 (glibc 2.31) so the artifacts remain
-      # executable on Debian 11/12 and newer distributions.
-      - name: Build workspace (Linux, glibc 2.31 baseline)
+      # glibc. Build inside Debian 12 (glibc 2.36), the oldest baseline that
+      # also satisfies FastEmbed's bundled ONNX Runtime, so the artifacts
+      # remain executable on Debian 12 and newer compatible distributions.
+      - name: Build workspace (Linux, glibc 2.36 baseline)
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -72,7 +73,7 @@ jobs:
             --env CARGO_TARGET_DIR=/workspace/target/linux-abi \
             --env CARGO_HOME=/tmp/cargo-home \
             --env HOME=/tmp \
-            rust:1.96-bullseye@sha256:21d112adb6ab370d39eef8f861f10b42342419b9569e7a05dac15e19eb65a3b4 \
+            rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 \
             cargo build --release --target ${{ matrix.target }} --workspace
         env:
           AGENT_MEMORY_VERSION: ${{ github.ref_name }}
@@ -97,7 +98,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          scripts/check-glibc-floor.sh 2.31 \
+          scripts/check-glibc-floor.sh 2.36 \
             "${{ steps.paths.outputs.src }}/${{ matrix.memory_bin }}" \
             "${{ steps.paths.outputs.src }}/${{ matrix.dream_bin }}"
 

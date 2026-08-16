@@ -690,8 +690,8 @@ You can also trigger an update manually at any time with `memory update`.
 
 `memory update` fetches the combined release archive and atomically swaps **both** binaries (`memory` + `memory-dream`) in place. If `memory-dream` wasn't previously installed, the updater force-bundles it on the next upgrade — users who never run the compactor pay ~28MB of disk but no cognitive overhead.
 
-Linux release binaries target a maximum of glibc 2.31, covering Debian 11/12,
-Ubuntu 20.04, and newer compatible distributions. The release pipeline checks
+Linux release binaries target a maximum of glibc 2.36, covering Debian 12,
+Ubuntu 22.04, and newer compatible distributions. The release pipeline checks
 both executables' imported GLIBC symbol versions before publishing them.
 
 If an older release installed a binary that cannot start because its GLIBC

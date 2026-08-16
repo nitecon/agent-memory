@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Build the shell-injection fixtures in the same fixed Debian 11
+      # Build the shell-injection fixtures in the same fixed Debian 12
       # environment used for Linux releases. This validates the container and
       # ABI ceiling on main before a release tag is created.
       - name: build Debian-compatible release binaries
@@ -44,11 +44,11 @@ jobs:
             --env CARGO_TARGET_DIR=/workspace/target \
             --env CARGO_HOME=/tmp/cargo-home \
             --env HOME=/tmp \
-            rust:1.96-bullseye@sha256:21d112adb6ab370d39eef8f861f10b42342419b9569e7a05dac15e19eb65a3b4 \
+            rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 \
             cargo build --release -p agent-memory -p memory-dream
       - name: verify Linux glibc compatibility ceiling
         run: |
-          scripts/check-glibc-floor.sh 2.31 \
+          scripts/check-glibc-floor.sh 2.36 \
             target/release/memory \
             target/release/memory-dream
       - name: cargo test

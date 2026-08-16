@@ -67,7 +67,7 @@ content:
         - Recognize a startup error naming a missing GLIBC version as a release ABI incompatibility; the in-process memory update command cannot run in this state.
         - Run curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/main/install.sh | sudo bash to bootstrap both binaries without executing the broken installation.
         - Confirm memory --version and memory-dream --version after installation.
-      compatibility: Published Linux binaries require no newer than GLIBC_2.31 and are checked before release.
+      compatibility: Published Linux binaries require no newer than GLIBC_2.36 and are checked before release.
     - name: Run Dream curation safely
       steps:
         - Configure headless.model and use {model} in headless.command so execution and audit identity share one source of truth.
