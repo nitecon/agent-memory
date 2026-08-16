@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.13.0 - 2026-08-16
+
+- Applied one OKF lifecycle predicate to every retrieval surface. Graph
+  expansion traverses both directions, so a live memory's `supersedes` edge
+  reached the predecessor Dream had merged away and recall injected both the
+  survivor and the row it replaced; `memory get` then refused the advertised
+  short id because prefix resolution hides superseded rows. Superseded and
+  deprecated concepts are now excluded before ranking, and a prefix that
+  matches only an audit row resolves instead of reporting not found.
+- Derived OKF descriptors structurally on write and on use. `title`,
+  `description` and `sources` no longer wait on a scheduled Dream pass: they
+  are derived from the body's own structure, fill only absent fields, record
+  what was inferred under `x-agent-memory-derived`, and decline rather than
+  invent a title when the body has no headline shape. Added `memory enrich`
+  to sweep an existing store. Concepts written from OKF documents are left
+  alone, since the document is authoritative.
+- Carried the OKF concept across Dream replacements. A supersede or extract
+  previously restarted the concept at revision 1, discarding domain type,
+  descriptors, lifecycle, sources and round-tripped unknown frontmatter.
+  Provenance edges now address the deleted predecessor by canonical URI, and
+  the relationship producer is derived from the acting actor rather than
+  hardcoded.
+- Attributed curated bodies. Dream stamps OKF `generated` with the
+  backend-qualified model identity when it rewrites a body, so a
+  model-authored memory no longer credits whoever stored the original text.
+- Namespaced curation revision operations and relabelled existing history, so
+  an audit filter written against the documented vocabulary sees every
+  revision Dream wrote.
+- Persisted contradictions as `contradicts` edges carrying their reason
+  instead of only printing them, and recorded a machine confirmation when a
+  pass re-reads a memory and leaves it standing. Confirming is a no-op once
+  the current body already carries that curator's attestation.
+- Added `deprecate` as a curation decision between keep and drop, retiring a
+  memory that has stopped being the live answer while keeping its body and
+  history.
+
 ## v1.12.2 - 2026-08-16
 
 - Built Linux release artifacts inside a fixed Debian 12 environment and
