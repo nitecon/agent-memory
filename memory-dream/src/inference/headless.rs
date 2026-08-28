@@ -47,6 +47,7 @@ use super::{Inference, InferenceError};
 /// unharmed.
 pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
 pub const MODEL_PLACEHOLDER: &str = "{model}";
+pub const MAX_TOKENS_PLACEHOLDER: &str = "{max_tokens}";
 
 /// External-CLI inference backend.
 ///
@@ -107,20 +108,21 @@ impl HeadlessInference {
 
     /// Substitute `{prompt}` in every token. Exposed for tests; callers use
     /// [`Self::generate`] which does the full spawn.
-    fn substitute(&self, prompt: &str) -> Vec<String> {
+    fn substitute(&self, prompt: &str, max_tokens: u32) -> Vec<String> {
         self.argv
             .iter()
             .map(|t| {
                 t.replace(PROMPT_PLACEHOLDER, prompt)
                     .replace(MODEL_PLACEHOLDER, &self.model)
+                    .replace(MAX_TOKENS_PLACEHOLDER, &max_tokens.to_string())
             })
             .collect()
     }
 }
 
 impl Inference for HeadlessInference {
-    fn generate(&self, prompt: &str, _max_tokens: u32) -> Result<String, InferenceError> {
-        let argv = self.substitute(prompt);
+    fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, InferenceError> {
+        let argv = self.substitute(prompt, max_tokens);
         // argv is guaranteed non-empty by `new` — no `expect` needed on
         // `argv[0]`, but being defensive costs nothing.
         let program = argv
@@ -145,11 +147,16 @@ impl Inference for HeadlessInference {
                 _ => InferenceError::Io(format!("spawn {program}: {e}")),
             })?;
 
-        let (status, stdout, stderr_tail) = if let Some(timeout) = self.timeout {
-            wait_with_timeout(&mut child, timeout)?
-        } else {
-            wait_blocking(&mut child)?
-        };
+        // Drain both pipes while the child runs. Waiting first can deadlock when
+        // a local model emits more than the kernel pipe buffer (observed with an
+        // Ollama response that ran to its 32K context limit).
+        let stdout_reader = spawn_reader(child.stdout.take(), "stdout");
+        let stderr_reader = spawn_reader(child.stderr.take(), "stderr");
+
+        let status = wait_for_exit(&mut child, self.timeout)?;
+        let stdout = join_reader(stdout_reader, "stdout")?;
+        let stderr = join_reader(stderr_reader, "stderr")?;
+        let stderr_tail = tail(&stderr, 256);
 
         if !status.success() {
             let code = status
@@ -165,51 +172,58 @@ impl Inference for HeadlessInference {
     }
 }
 
-/// Blocking wait — collect stdout/stderr and the exit status when no
-/// timeout is configured. Factored out so the timeout path can reuse the
-/// same stdout/stderr collection logic.
-fn wait_blocking(
-    child: &mut std::process::Child,
-) -> Result<(std::process::ExitStatus, String, String), InferenceError> {
-    // `wait_with_output` consumes the child; we can't re-use it. The
-    // equivalent for a `&mut Child` is to take the pipes, drain them, then
-    // `wait()`. Order matters: drain stdout/stderr *before* `wait` so a
-    // child writing more than the pipe-buffer worth of output doesn't
-    // deadlock on its own stdout.
-    let mut out = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut out)
-            .map_err(|e| InferenceError::Io(format!("read stdout: {e}")))?;
-    }
-    let mut err = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut err)
-            .map_err(|e| InferenceError::Io(format!("read stderr: {e}")))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| InferenceError::Io(format!("wait: {e}")))?;
-    Ok((status, out, tail(&err, 256)))
+fn spawn_reader<R>(
+    pipe: Option<R>,
+    label: &'static str,
+) -> std::thread::JoinHandle<Result<String, String>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_string(&mut output)
+                .map_err(|e| format!("read {label}: {e}"))?;
+        }
+        Ok(output)
+    })
 }
 
-/// Poll for completion up to `timeout`, killing the child on deadline.
+fn join_reader(
+    handle: std::thread::JoinHandle<Result<String, String>>,
+    label: &str,
+) -> Result<String, InferenceError> {
+    handle
+        .join()
+        .map_err(|_| InferenceError::Io(format!("{label} reader thread panicked")))?
+        .map_err(InferenceError::Io)
+}
+
+/// Poll for completion up to `timeout`, killing the child on deadline. A
+/// missing timeout uses the ordinary blocking wait while the reader threads
+/// continue draining output.
 ///
 /// Poll interval is 50ms — fast enough that a snappy CLI (Claude, echo)
 /// returns within a tick or two, slow enough that 100s of dream rows don't
 /// saturate a core on the polling itself.
-fn wait_with_timeout(
+fn wait_for_exit(
     child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<(std::process::ExitStatus, String, String), InferenceError> {
+    timeout: Option<Duration>,
+) -> Result<std::process::ExitStatus, InferenceError> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait()
+            .map_err(|e| InferenceError::Io(format!("wait: {e}")));
+    };
     let deadline = Instant::now() + timeout;
     let poll_interval = Duration::from_millis(50);
 
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => {
-                // Child exited — fall through to the blocking drain, which
-                // now returns immediately since `try_wait` confirmed exit.
-                return wait_blocking(child);
+                return child
+                    .wait()
+                    .map_err(|e| InferenceError::Io(format!("wait: {e}")));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -276,7 +290,7 @@ mod tests {
     #[test]
     fn substitute_replaces_every_placeholder() {
         let h = echo_backend("echo prefix {prompt} suffix {prompt}");
-        let argv = h.substitute("HELLO");
+        let argv = h.substitute("HELLO", 512);
         assert_eq!(
             argv,
             vec!["echo", "prefix", "HELLO", "suffix", "HELLO"]
@@ -295,12 +309,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            h.substitute("hello"),
+            h.substitute("hello", 512),
             vec![
                 "claude",
                 "--model",
                 "claude-haiku-4-5-20251001",
                 "-p",
+                "hello"
+            ]
+        );
+    }
+
+    #[test]
+    fn substitute_forwards_generation_limit() {
+        let h = HeadlessInference::new_with_model(
+            "runner --model {model} --max-tokens {max_tokens} {prompt}",
+            "gemma3:1b",
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(
+            h.substitute("hello", 8192),
+            vec![
+                "runner",
+                "--model",
+                "gemma3:1b",
+                "--max-tokens",
+                "8192",
                 "hello"
             ]
         );
@@ -319,7 +354,7 @@ mod tests {
     #[test]
     fn substitute_passes_through_when_no_placeholder() {
         let h = echo_backend("echo fixed argument");
-        let argv = h.substitute("ignored");
+        let argv = h.substitute("ignored", 512);
         assert_eq!(
             argv,
             vec!["echo", "fixed", "argument"]
