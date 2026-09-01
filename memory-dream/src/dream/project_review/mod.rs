@@ -213,6 +213,7 @@ pub struct ProjectReviewOutcome {
     pub stats: ProjectReviewStats,
     pub survivors: Vec<Memory>,
     pub contradiction_ids: HashSet<String>,
+    pub failures: Vec<String>,
 }
 
 /// Run the project review pass for a single project's memory set.
@@ -242,6 +243,7 @@ pub fn run_project(
             stats,
             survivors: Vec::new(),
             contradiction_ids: HashSet::new(),
+            failures: Vec::new(),
         });
     }
 
@@ -250,19 +252,22 @@ pub fn run_project(
 
     let mut survivors: Vec<Memory> = Vec::new();
     let mut contradiction_ids = HashSet::new();
+    let mut failures = Vec::new();
 
     for batch in batches {
         // Model round-trip per batch. A batch is either "whole project"
         // (normal path) or one cluster (fallback path).
         //
-        // On inference / parse failure we do NOT inflate `stats.failed`
-        // here — the downstream Stages A + B will run on the passthrough
-        // survivors and tally their own failures. Counting the failure
-        // at both layers would double-count "this memory couldn't be
-        // processed" into the final summary.
+        // Review inference/parse failures are distinct failed operations.
+        // Stage B may still successfully keep or rewrite the passthrough
+        // memories, but that does not make the missing cross-memory review
+        // successful. Count and expose the batch failure so scheduled passes
+        // cannot report a silent all-keep success.
         let decisions = match invoke_review_with_context(conn, inference, project, &batch) {
             Ok(d) => d,
             Err(e) => {
+                stats.failed += 1;
+                failures.push(e.to_string());
                 tracing::warn!(project = ?project, error = %e,
                     "project review inference failed; treating batch as all-keep");
                 // Keep everything in this batch so Stage B still runs.
@@ -290,6 +295,7 @@ pub fn run_project(
         stats,
         survivors,
         contradiction_ids,
+        failures,
     })
 }
 
@@ -741,12 +747,21 @@ pub fn parse_response(
     let known_ids: HashSet<&String> = batch.iter().map(|m| &m.id).collect();
     let mut out: HashMap<String, Decision> = HashMap::new();
 
+    let response_count = parsed.decisions.len();
     for (id, raw_d) in parsed.decisions {
         if !known_ids.contains(&id) {
-            tracing::warn!(id = %id, "project review response referenced unknown memory id; skipping");
-            continue;
+            return Err(ProjectReviewError::Parse(format!(
+                "response referenced unknown memory id {id}"
+            )));
         }
         out.insert(id, raw_d.into());
+    }
+
+    if out.len() != batch.len() {
+        return Err(ProjectReviewError::Parse(format!(
+            "response decision coverage mismatch: expected {} memory ids, received {response_count}",
+            batch.len()
+        )));
     }
 
     // Validate merge targets — dangling or into-a-dropped-memory pointers
@@ -775,11 +790,6 @@ pub fn parse_response(
         tracing::warn!(id = %id, target = %target,
             "merge_into target missing or not alive; downgrading to keep");
         out.insert(id, Decision::Keep);
-    }
-
-    // Default missing ids → Keep.
-    for mem in batch {
-        out.entry(mem.id.clone()).or_insert(Decision::Keep);
     }
 
     Ok(out)
@@ -1314,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_id_defaults_to_keep() {
+    fn parse_missing_id_rejects_incomplete_coverage() {
         let batch = vec![
             mk_memory("aaa", "first", &["t1"], "2026-04-20T00:00:00Z"),
             mk_memory("bbb", "second", &["t2"], "2026-04-21T00:00:00Z"),
@@ -1325,13 +1335,12 @@ mod tests {
                 "aaa": {"action": "drop"}
             }
         }"#;
-        let out = parse_response(raw, &batch).unwrap();
-        assert_eq!(out.get("aaa"), Some(&Decision::Drop));
-        assert_eq!(out.get("bbb"), Some(&Decision::Keep));
+        let err = parse_response(raw, &batch).unwrap_err();
+        assert!(err.to_string().contains("coverage mismatch"));
     }
 
     #[test]
-    fn parse_unknown_id_is_dropped_from_response() {
+    fn parse_unknown_id_rejects_invented_key() {
         let batch = vec![mk_memory("aaa", "first", &["t1"], "2026-04-20T00:00:00Z")];
         let raw = r#"{
             "decisions": {
@@ -1339,9 +1348,8 @@ mod tests {
                 "unknown_id_the_model_invented": {"action": "drop"}
             }
         }"#;
-        let out = parse_response(raw, &batch).unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(out.contains_key("aaa"));
+        let err = parse_response(raw, &batch).unwrap_err();
+        assert!(err.to_string().contains("unknown memory id"));
     }
 
     #[test]
@@ -1598,7 +1606,8 @@ mod tests {
 
         let dangling = r#"{
             "decisions": {
-                "aaa": {"action": "contradiction", "target_id": "missing", "reason": "x"}
+                "aaa": {"action": "contradiction", "target_id": "missing", "reason": "x"},
+                "bbb": {"action": "keep"}
             }
         }"#;
         assert_eq!(

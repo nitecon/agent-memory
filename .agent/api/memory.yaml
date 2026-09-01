@@ -59,7 +59,7 @@ content:
       steps:
         - Leave AGENT_MEMORY_GATEWAY_AUTO_SYNC unset or true to make memory update and memory forget write directly to the gateway when URL/API key exist.
         - memory update <id> --content ... rewrites the local row first, then pushes that single updated memory to the gateway; on gateway failure the local update remains and memory push is the retry surface.
-        - memory forget --id or --query pushes a gateway tombstone before deleting a linked local row; if the tombstone fails, the local row is kept so the delete can be retried safely.
+        - memory forget --id or --query pushes a gateway tombstone before deleting a linked local row; if the gateway explicitly reports that the linked target is already absent, that is accepted as an idempotent success, while all other failures keep the local row for a safe retry.
         - If a linked row is deleted locally without a successful direct gateway tombstone, memory records a pending delete queue item so the next memory push or memory push --all can tombstone the gateway record.
         - memory-dream uses the same direct gateway write helpers for condense rewrites, forget/drop decisions, and superseded memories when gateway auto-sync is enabled.
     - name: Recover an incompatible Linux binary
@@ -71,6 +71,7 @@ content:
     - name: Run Dream curation safely
       steps:
         - Configure headless.model and use {model} in headless.command so execution and audit identity share one source of truth.
+        - Prefer the standalone {prompt_stdin} marker for custom adapters; Dream removes it from argv and streams the prompt verbatim to stdin, avoiding per-argument OS limits. Do not combine it with {prompt}.
         - Scheduled passes are unlimited by default so every eligible memory is considered; use memory-dream --limit N only when deliberately splitting coverage across multiple passes.
         - Treat dream_skipped reason=already_running as a healthy no-op and any non-zero process exit as a failed pass.
         - Ensure scheduled environments can resolve the configured headless binary; Dream suppresses automatic memory and agent-tools hooks in its child process.
@@ -151,9 +152,13 @@ content:
           - Only one pass may own the database-adjacent run lock; concurrent passes emit dream_skipped with reason already_running.
           - Passes are unlimited by default; when explicitly supplied, the limit is global across projects, and zero also means unlimited.
           - Headless subprocesses receive AGENT_MEMORY_HOOK=off, AGENT_TOOLS_HOOK=off, and MEMORY_DREAM_HEADLESS=1.
+          - A standalone {prompt_stdin} marker is removed from argv and selects verbatim stdin prompt transport; {prompt} remains the argv transport and the two markers are mutually exclusive.
           - condenser_version uses the backend-qualified inference identity plus prompt hash.
           - Dream-created relationship producer and revision actor are both memory-dream.
           - A terminal summary with failed greater than zero is followed by a non-zero process exit.
+          - Each project-review inference or parse fallback emits review_failed and increments failed while conservatively passing the affected memories onward.
+          - Structured project-review output must cover every memory in the batch exactly and may not invent IDs; incomplete or unknown-key responses fail closed to the visible all-keep fallback.
+          - Stage B accepts KEEP_UNCHANGED as its no-op token and rejects the legacy skip token so a stuck model cannot report total non-response as successful curation.
       - name: memory okf
         purpose: Operate on SQLite-canonical OKF concepts through virtual Markdown document and bundle handlers.
         subcommands:
@@ -287,7 +292,7 @@ content:
         purpose: Delete memories by ID or by top search matches.
         behavior:
           - If gateway auto-sync is enabled and the memory has gateway sync metadata, pushes a tombstone for the linked gateway memory before deleting locally.
-          - If that tombstone push conflicts, is rejected, or fails transport/config validation, the local row is kept so a retry still has gateway ID and base revision metadata.
+          - If a rejection explicitly states that gateway_memory_id is already absent, the client records the desired tombstoned end state and proceeds. Other conflicts, rejections, and transport/config failures keep the local row so a retry still has gateway ID and base revision metadata.
           - Unlinked or unscoped memories delete locally without contacting the gateway.
           - Auto-sync-disabled linked memories delete locally without contacting the gateway, but leave a pending gateway delete for a later manual memory push.
       - name: memory prune

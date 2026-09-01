@@ -221,7 +221,8 @@ pub struct HeadlessConfig {
     /// and in Dream's condenser-version audit stamp.
     #[serde(default)]
     pub model: String,
-    /// Shell-style command template with a literal `{prompt}` placeholder.
+    /// Shell-style command template with either a literal `{prompt}` argv
+    /// placeholder or a standalone `{prompt_stdin}` marker.
     /// Tokenized via `shlex::split` at use time; never re-interpreted by a shell.
     pub command: String,
     /// Per-invocation timeout in milliseconds. `0` = no timeout.

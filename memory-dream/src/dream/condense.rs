@@ -4,7 +4,7 @@
 //! ([`crate::dream::prompt::CONDENSE_PROMPT_TEMPLATE`]) instructs the
 //! model to respond with EXACTLY ONE of:
 //!
-//!   1. The single word `skip` — no change needed.
+//!   1. The single token `KEEP_UNCHANGED` — no change needed.
 //!   2. The single word `forget` — noise; delete the memory.
 //!   3. A rewritten condensed body — headline + bullets, strictly
 //!      shorter than the input.
@@ -17,7 +17,7 @@
 //!
 //! * The raw response is trimmed of leading/trailing whitespace before
 //!   any matching. Empty → [`CondenseError::ParseFailed`].
-//! * Case-insensitive literal match for `skip` / `forget` on the first
+//! * Case-insensitive literal match for `KEEP_UNCHANGED` / `forget` on the first
 //!   line, but any trailing content after the literal marker is rejected
 //!   as malformed (the model broke the "exactly one of these forms"
 //!   contract and we refuse to guess intent).
@@ -140,12 +140,12 @@ pub fn parse_response(raw_response: &str, baseline_input: &str) -> Result<Decisi
         ));
     }
 
-    // Literal-word short-circuits. Strict — a `skip` or `forget` reply
+    // Literal-word short-circuits. Strict — a `KEEP_UNCHANGED` or `forget` reply
     // followed by explanatory text violates the "exactly one form"
     // contract. Accepting it would let the model silently substitute its
     // own interpretation for our parser's.
     let lower = body.to_lowercase();
-    if lower == "skip" {
+    if lower == "keep_unchanged" {
         return Ok(Decision::Skip);
     }
     if lower == "forget" {
@@ -154,10 +154,15 @@ pub fn parse_response(raw_response: &str, baseline_input: &str) -> Result<Decisi
 
     // Detect the "keyword + extra text" shape explicitly so the error
     // message is actionable (vs. a generic "too long").
-    if let Some(rest) = lower.strip_prefix("skip") {
+    if lower == "skip" {
+        return Err(CondenseError::ParseFailed(
+            "legacy `skip` response is not accepted; expected `KEEP_UNCHANGED`".to_string(),
+        ));
+    }
+    if let Some(rest) = lower.strip_prefix("keep_unchanged") {
         if rest.starts_with(|c: char| c.is_whitespace()) {
             return Err(CondenseError::ParseFailed(
-                "response starts with `skip` but contains extra text".to_string(),
+                "response starts with `KEEP_UNCHANGED` but contains extra text".to_string(),
             ));
         }
     }
@@ -256,28 +261,29 @@ mod tests {
     }
 
     #[test]
-    fn literal_skip_returns_skip_decision() {
-        let out = parse_response("skip", "some input").unwrap();
+    fn literal_keep_unchanged_returns_skip_decision() {
+        let out = parse_response("KEEP_UNCHANGED", "some input").unwrap();
         assert_eq!(out, Decision::Skip);
     }
 
     #[test]
-    fn literal_skip_is_case_insensitive() {
-        let out = parse_response("SKIP", "some input").unwrap();
+    fn literal_keep_unchanged_is_case_insensitive() {
+        let out = parse_response("keep_unchanged", "some input").unwrap();
         assert_eq!(out, Decision::Skip);
     }
 
     #[test]
-    fn skip_with_trailing_newline_is_accepted() {
+    fn keep_unchanged_with_trailing_newline_is_accepted() {
         // `claude -p` appends a newline by default; the pre-trim in the
-        // parser must strip it so `skip\n` reads as the literal word.
-        let out = parse_response("skip\n", "some input").unwrap();
+        // parser must strip it so the sentinel reads as the literal token.
+        let out = parse_response("KEEP_UNCHANGED\n", "some input").unwrap();
         assert_eq!(out, Decision::Skip);
     }
 
     #[test]
-    fn skip_then_explanation_is_rejected_as_malformed() {
-        let err = parse_response("skip because the memory is fine", "some input").unwrap_err();
+    fn keep_unchanged_then_explanation_is_rejected_as_malformed() {
+        let err =
+            parse_response("KEEP_UNCHANGED because the memory is fine", "some input").unwrap_err();
         match err {
             CondenseError::ParseFailed(msg) => assert!(msg.contains("extra text")),
             other => panic!("expected ParseFailed, got {other:?}"),
@@ -396,10 +402,10 @@ mod tests {
 
     #[test]
     fn run_per_memory_wires_inputs_through_prompt() {
-        // FixedInference ignores the prompt and returns "skip" — we just
+        // FixedInference ignores the prompt and returns the no-op sentinel.
         // verify the outer plumbing compiles and runs.
         let mem = mk_memory("hello world");
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let d = run_per_memory(&inf, &mem).unwrap();
         assert_eq!(d, Decision::Skip);
     }
@@ -433,7 +439,7 @@ mod tests {
         // guards the wiring.
         let mut mem = mk_memory("x");
         mem.project = Some(GLOBAL_PROJECT_IDENT.to_string());
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let d = run_per_memory(&inf, &mem).unwrap();
         assert_eq!(d, Decision::Skip);
     }

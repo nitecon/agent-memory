@@ -4,7 +4,7 @@
 //! orchestrator now runs a straight per-project pipeline: cosine dedup
 //! (algorithmic, no LLM) → per-memory condense via headless subprocess.
 //! The condense step uses a three-way response contract — the model must
-//! reply with exactly `skip`, `forget`, or a rewritten memory body.
+//! reply with exactly `KEEP_UNCHANGED`, `forget`, or a rewritten memory body.
 //!
 //! * [`CONDENSE_PROMPT_TEMPLATE`] — memory content wrapped in
 //!   `<<<MEMORY>>> ... <<<END>>>` delimiters. Output is parsed by a tiny
@@ -25,7 +25,7 @@ pub const MAX_OUTPUT_TOKENS: u32 = 512;
 /// Per-memory condensation prompt.
 ///
 /// Three-way response contract:
-///   * `skip` — memory is already concise and scoped correctly.
+///   * `KEEP_UNCHANGED` — memory is already concise and scoped correctly.
 ///   * `forget` — memory is pure noise with no re-usable insight.
 ///   * anything else — a rewritten condensed body (headline + bullets).
 ///
@@ -37,7 +37,7 @@ const CONDENSE_PROMPT_TEMPLATE: &str = r#"You are reviewing a single stored memo
 with EXACTLY ONE of these three forms — no preamble, no explanation,
 no markdown fences, no commentary:
 
-1. The single word:  skip
+1. The single token:  KEEP_UNCHANGED
    Use when the memory is already concise, useful, and correctly scoped.
    No changes needed. If it already explains HOW to act or WHY a
    constraint matters, keep it as-is unless it is truly too verbose.
@@ -86,9 +86,9 @@ RULES
   user/repo/tool guidance, and why.
 - Memory should increase knowledge about how and why to work, not act as
   a scratchpad. Prefer one strong memory over several overlapping notes.
-- If you are uncertain whether the memory is worth keeping, default
-  to `skip`. "When in doubt, keep" applies ONLY to the forget decision.
-  Do NOT default to `skip` when the memory is clearly bloated and
+- If you are uncertain whether the memory is worth keeping, answer
+  `KEEP_UNCHANGED`. "When in doubt, keep" applies ONLY to the forget decision.
+  Do NOT answer `KEEP_UNCHANGED` when the memory is clearly bloated and
   could be tightened — in that case you MUST rewrite.
 
 INPUT
@@ -241,10 +241,10 @@ mod tests {
     #[test]
     fn prompt_defines_three_way_contract() {
         // Response contract language must survive verbatim — the parser
-        // matches the literal words `skip` and `forget`, so the prompt
+        // matches the literal tokens `KEEP_UNCHANGED` and `forget`, so the prompt
         // must name them exactly that way.
         let p = build_condense_prompt(&inputs_for("x"));
-        assert!(p.contains("The single word:  skip"));
+        assert!(p.contains("The single token:  KEEP_UNCHANGED"));
         assert!(p.contains("The single word:  forget"));
         assert!(
             p.contains("A rewritten condensed memory"),

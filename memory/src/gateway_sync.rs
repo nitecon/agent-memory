@@ -124,7 +124,14 @@ pub fn tombstone_memory_before_local_removal(
             memory.id
         ))),
         PushMemoryAction::Conflict | PushMemoryAction::Rejected => {
-            Err(push_result_error("gateway tombstone", &result))
+            if tombstone_target_is_already_absent(&result) {
+                record_already_absent_tombstone(conn, &sync)?;
+                Ok(GatewayMutationOutcome::Skipped {
+                    reason: "gateway tombstone target already absent",
+                })
+            } else {
+                Err(push_result_error("gateway tombstone", &result))
+            }
         }
     }
 }
@@ -348,6 +355,48 @@ fn push_result_error(operation: &str, result: &PushMemoryResult) -> MemoryError 
     MemoryError::Config(message)
 }
 
+fn tombstone_target_is_already_absent(result: &PushMemoryResult) -> bool {
+    if !matches!(
+        result.action,
+        PushMemoryAction::Conflict | PushMemoryAction::Rejected
+    ) {
+        return false;
+    }
+    let missing = |message: &str| {
+        let message = message.to_ascii_lowercase();
+        message.contains("gateway_memory_id was not found")
+            || message.contains("gateway memory id was not found")
+            || message.contains("gateway memory not found")
+    };
+    result
+        .conflict
+        .as_ref()
+        .is_some_and(|conflict| missing(&conflict.reason))
+        || result.error.as_deref().is_some_and(missing)
+        || result.errors.iter().any(|error| missing(&error.message))
+}
+
+fn record_already_absent_tombstone(
+    conn: &Connection,
+    sync: &MemoryGatewaySync,
+) -> Result<(), MemoryError> {
+    queries::upsert_memory_gateway_sync(
+        conn,
+        &MemoryGatewaySyncUpsert {
+            local_memory_id: sync.local_memory_id.clone(),
+            project: sync.project.clone(),
+            gateway_memory_id: sync.gateway_memory_id.clone(),
+            last_seen_server_revision: sync.last_seen_server_revision,
+            last_pushed_content_hash: sync.last_pushed_content_hash.clone(),
+            last_pulled_content_hash: sync.last_pulled_content_hash.clone(),
+            sync_state: "already_absent".to_string(),
+            tombstone_deleted: true,
+            tombstone_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+    )?;
+    Ok(())
+}
+
 fn push_action_label(action: &PushMemoryAction) -> &'static str {
     match action {
         PushMemoryAction::Created => "created",
@@ -560,6 +609,51 @@ mod tests {
                 reason: "memory is not linked to gateway"
             }
         );
+    }
+
+    #[test]
+    fn tombstone_treats_missing_remote_target_as_idempotent_success() {
+        let conn = open_mem_db();
+        let memory = insert_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000304",
+            "remote row already gone",
+        );
+        link_memory(&conn, &memory, "gw-missing", 17);
+        let (base_url, server) = spawn_gateway(|request| {
+            let memory = request["memories"].as_array().unwrap().first().unwrap();
+            json!({
+                "project_ident": "agent-memory",
+                "server_revision": 18,
+                "results": [{
+                    "local_memory_id": memory["local_memory_id"],
+                    "gateway_memory_id": "gw-missing",
+                    "action": "rejected",
+                    "error": "gateway_memory_id was not found for this project"
+                }]
+            })
+        });
+
+        let outcome = tombstone_memory_before_local_removal(
+            &conn,
+            &gateway_config(base_url),
+            &memory,
+            "test delete",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GatewayMutationOutcome::Skipped {
+                reason: "gateway tombstone target already absent"
+            }
+        );
+        let sync = queries::get_memory_gateway_sync(&conn, &memory.id)
+            .unwrap()
+            .expect("sync row retained until local delete");
+        assert_eq!(sync.sync_state, "already_absent");
+        assert!(sync.tombstone_deleted);
+        assert_eq!(server.join().unwrap()["memories"][0]["tombstone"], true);
     }
 
     #[test]

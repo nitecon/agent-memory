@@ -33,7 +33,7 @@
 //! with a `Timeout` error regardless of child state so the dream pass
 //! continues.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,12 @@ use super::{Inference, InferenceError};
 /// any format-spec mechanism, so prompts containing `{` or `}` pass through
 /// unharmed.
 pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
+/// Standalone argv marker selecting stdin prompt transport.
+///
+/// The marker is removed before spawn and the prompt is written verbatim to
+/// the child's stdin. This avoids Linux's per-argument `MAX_ARG_STRLEN` limit
+/// while preserving the shell-free command execution contract.
+pub const PROMPT_STDIN_PLACEHOLDER: &str = "{prompt_stdin}";
 pub const MODEL_PLACEHOLDER: &str = "{model}";
 pub const MAX_TOKENS_PLACEHOLDER: &str = "{max_tokens}";
 
@@ -94,6 +100,20 @@ impl HeadlessInference {
                 "headless command template {template:?} tokenizes to zero arguments"
             )));
         }
+        let prompt_on_argv = argv.iter().any(|token| token.contains(PROMPT_PLACEHOLDER));
+        let prompt_on_stdin = argv.iter().any(|token| token == PROMPT_STDIN_PLACEHOLDER);
+        if argv.iter().any(|token| {
+            token.contains(PROMPT_STDIN_PLACEHOLDER) && token != PROMPT_STDIN_PLACEHOLDER
+        }) {
+            return Err(InferenceError::Io(format!(
+                "{PROMPT_STDIN_PLACEHOLDER} must be a standalone command token"
+            )));
+        }
+        if prompt_on_argv && prompt_on_stdin {
+            return Err(InferenceError::Io(format!(
+                "headless command cannot combine {PROMPT_PLACEHOLDER} and {PROMPT_STDIN_PLACEHOLDER}"
+            )));
+        }
         let timeout = if timeout_ms == 0 {
             None
         } else {
@@ -111,6 +131,7 @@ impl HeadlessInference {
     fn substitute(&self, prompt: &str, max_tokens: u32) -> Vec<String> {
         self.argv
             .iter()
+            .filter(|t| t.as_str() != PROMPT_STDIN_PLACEHOLDER)
             .map(|t| {
                 t.replace(PROMPT_PLACEHOLDER, prompt)
                     .replace(MODEL_PLACEHOLDER, &self.model)
@@ -122,6 +143,10 @@ impl HeadlessInference {
 
 impl Inference for HeadlessInference {
     fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, InferenceError> {
+        let prompt_on_stdin = self
+            .argv
+            .iter()
+            .any(|token| token == PROMPT_STDIN_PLACEHOLDER);
         let argv = self.substitute(prompt, max_tokens);
         // argv is guaranteed non-empty by `new` — no `expect` needed on
         // `argv[0]`, but being defensive costs nothing.
@@ -136,7 +161,11 @@ impl Inference for HeadlessInference {
             .env("AGENT_MEMORY_HOOK", "off")
             .env("AGENT_TOOLS_HOOK", "off")
             .env("MEMORY_DREAM_HEADLESS", "1")
-            .stdin(Stdio::null())
+            .stdin(if prompt_on_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -152,8 +181,25 @@ impl Inference for HeadlessInference {
         // Ollama response that ran to its 32K context limit).
         let stdout_reader = spawn_reader(child.stdout.take(), "stdout");
         let stderr_reader = spawn_reader(child.stderr.take(), "stderr");
+        let stdin_writer = if prompt_on_stdin {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                InferenceError::Io("headless command stdin pipe was unavailable".into())
+            })?;
+            let prompt = prompt.as_bytes().to_vec();
+            Some(std::thread::spawn(move || {
+                stdin.write_all(&prompt).map_err(|e| e.to_string())
+            }))
+        } else {
+            None
+        };
 
         let status = wait_for_exit(&mut child, self.timeout)?;
+        if let Some(writer) = stdin_writer {
+            writer
+                .join()
+                .map_err(|_| InferenceError::Io("stdin writer thread panicked".into()))?
+                .map_err(|e| InferenceError::Io(format!("write prompt to stdin: {e}")))?;
+        }
         let stdout = join_reader(stdout_reader, "stdout")?;
         let stderr = join_reader(stderr_reader, "stderr")?;
         let stderr_tail = tail(&stderr, 256);
@@ -339,6 +385,32 @@ mod tests {
                 "hello"
             ]
         );
+    }
+
+    #[test]
+    fn stdin_marker_is_removed_from_argv() {
+        let h = echo_backend("runner --max-tokens {max_tokens} {prompt_stdin}");
+        assert_eq!(
+            h.substitute("a prompt too large for argv", 8192),
+            vec!["runner", "--max-tokens", "8192"]
+        );
+    }
+
+    #[test]
+    fn stdin_marker_must_be_standalone_and_exclusive() {
+        assert!(HeadlessInference::new("runner --prompt={prompt_stdin}", 0).is_err());
+        assert!(HeadlessInference::new("runner {prompt} {prompt_stdin}", 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_marker_streams_prompt_larger_than_linux_arg_limit_verbatim() {
+        let h = echo_backend("sh -c cat {prompt_stdin}");
+        let prompt = format!(
+            "large prompt with spaces and $() shell syntax\n{}",
+            "x".repeat(200_000)
+        );
+        assert_eq!(h.generate(&prompt, 32).unwrap(), prompt);
     }
 
     #[cfg(unix)]

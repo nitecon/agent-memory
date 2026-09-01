@@ -784,6 +784,22 @@ timeout_ms = 600000
 
 This identity—not `local.active_model`—is recorded in `condenser_version` and terminal audit output. Existing commands with `--model VALUE` are migrated automatically; custom commands without a discoverable model use a stable command-derived identity. Dream marks headless children with `MEMORY_DREAM_HEADLESS=1` and disables automatic memory/agent-tools prompt hooks so the curation prompt remains self-contained.
 
+For adapters that read the prompt from standard input, use the standalone
+`{prompt_stdin}` marker. Dream removes the marker from argv and streams the
+prompt verbatim to the child, avoiding Linux's per-argument
+`MAX_ARG_STRLEN` limit for large project-review batches:
+
+```toml
+[headless]
+model = "qwen3:8b"
+command = "/opt/agentic/bin/ollama-dream.sh {max_tokens} {prompt_stdin}"
+timeout_ms = 600000
+```
+
+Do not combine `{prompt}` and `{prompt_stdin}`. The former remains available
+for CLIs that only accept prompt arguments; the latter is preferred for
+custom adapters and unbounded memory content.
+
 The bare invocation (above) is equivalent to `memory-dream run`. The same global flags — `--model`, `--headless-model`, `--dry-run`, `--limit`, `--full` / `--refresh`, `--batch-size`, `--backend`, `--command-override` — apply to the bare pass and to the `test` subcommand; they override settings for a single invocation and never mutate `dream.toml`.
 
 ### Subcommands
@@ -845,11 +861,14 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 
 ### Safety nets
 
-- **Prompt injection defense**: the condensation prompt wraps memory content in `<<<MEMORY>>> ... <<<END>>>` and explicitly instructs the model to treat anything inside as data, not instructions. A single few-shot example anchors verbatim preservation of paths / numbers / dates. The response must be JSON (`{"condensed": "..."}`); non-JSON triggers a fallback to the raw memory.
+- **Prompt injection defense**: the condensation prompt wraps memory content in `<<<MEMORY>>> ... <<<END>>>` and explicitly instructs the model to treat anything inside as data, not instructions. The no-op response is the explicit token `KEEP_UNCHANGED`; the legacy `skip` response is rejected so a model stuck on that generic fallback cannot masquerade as a successful curation pass.
 - **Length-ratio check**: if the model's "condensed" output is longer than the input, it's rejected and the raw memory stays untouched.
 - **Refusal detection**: responses matching `I cannot`, `I'm sorry, but`, `as a language model`, etc. fall back to the raw memory.
 - **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
 - **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.
+- **Truthful review fallback**: every project-review inference or parse failure emits `review_failed`, increments the pass failure count, and still conservatively passes the affected memories to later stages.
+- **Exact review coverage**: structured review output must contain exactly the real memory IDs in its batch. Missing or invented keys reject the whole response instead of turning constrained-but-incompetent JSON into a silent all-keep success.
+- **Idempotent gateway deletion**: a gateway response proving that a linked tombstone target is already absent is accepted as the desired end state; other conflicts and rejections remain hard failures.
 - **Headless prompt isolation**: Dream subprocesses disable automatic memory and agent-tools hooks, preventing recursive retrieval from being prepended to the curation prompt.
 - **Single-pass lock**: overlapping cron/manual invocations skip cleanly instead of curating the same rows concurrently.
 - **`--dry-run` writes nothing**: row counts are identical before/after a dry-run pass.

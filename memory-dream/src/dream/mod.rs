@@ -18,7 +18,7 @@
 //! 4. **Stage B — per-memory condense**. For every remaining candidate we
 //!    invoke the configured inference backend with the strict three-way
 //!    prompt contract ([`condense::run_per_memory`]):
-//!      * `skip` → no change.
+//!      * `KEEP_UNCHANGED` → no change.
 //!      * `forget` → delete via the DB layer (not a `memory forget` shell).
 //!      * otherwise → treat as a rewritten body, persist via
 //!        `update_content` so `content_raw` preserves provenance.
@@ -426,6 +426,19 @@ fn run_stage_0_project_review(
             summary.review_superseded += outcome.stats.superseded;
             summary.review_extracted += outcome.stats.extracted;
             summary.review_contradictions += outcome.stats.contradictions;
+
+            for reason in &outcome.failures {
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "review_failed",
+                        &[
+                            ("project", project_label.to_string()),
+                            ("reason", reason.clone()),
+                        ]
+                    )
+                );
+            }
 
             println!(
                 "{}",
@@ -867,7 +880,7 @@ mod tests {
     #[test]
     fn empty_db_exits_cleanly() {
         let mut conn = open_mem_db();
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
@@ -882,7 +895,7 @@ mod tests {
         let mut conn = open_mem_db();
         q::set_working_context(&conn, "p1", "transient handoff").unwrap();
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
@@ -898,7 +911,7 @@ mod tests {
         let mut conn = open_mem_db();
         insert_already_processed(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", "p1");
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
@@ -917,7 +930,7 @@ mod tests {
         );
         q::set_last_dream_at(&conn, Some("p1"), "2099-01-01T00:00:00Z").unwrap();
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let mut cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         cfg.full = true;
@@ -936,7 +949,7 @@ mod tests {
         ] {
             insert(&conn, id, id, Some(project));
         }
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let mut cfg = DreamConfig::new(DreamMode::Apply, "test/model", &tmp);
         cfg.limit = 3;
@@ -1128,20 +1141,21 @@ mod tests {
         );
     }
 
-    /// `skip` response keeps the memory untouched.
+    /// `KEEP_UNCHANGED` response keeps the memory untouched.
     #[test]
-    fn skip_response_keeps_memory() {
+    fn keep_unchanged_response_keeps_memory() {
         let mut conn = open_mem_db();
         let id = "aaaaaaaa-0000-1111-2222-000000000001";
         insert(&conn, id, "already concise", Some("p1"));
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
         assert_eq!(summary.kept, 1);
         assert_eq!(summary.rewritten, 0);
         assert_eq!(summary.forgot, 0);
+        assert_eq!(summary.failed, 1, "review failure remains visible");
 
         // Memory still present.
         let got = q::get_memory_by_id(&conn, id).unwrap();
@@ -1317,7 +1331,7 @@ mod tests {
             Some("p1"),
         );
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         run(&mut conn, &inf, &cfg).expect("dream ok");
@@ -1339,7 +1353,7 @@ mod tests {
             Some("p1"),
         );
 
-        let inf = FixedInference::new("skip");
+        let inf = FixedInference::new("KEEP_UNCHANGED");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Dry, "sonnet", &tmp);
         run(&mut conn, &inf, &cfg).expect("dream ok");
@@ -1348,7 +1362,7 @@ mod tests {
         assert!(ts.is_none(), "dry-run must not stamp project_state");
     }
 
-    /// A malformed response (neither `skip`/`forget` nor shorter than
+    /// A malformed response (neither `KEEP_UNCHANGED`/`forget` nor shorter than
     /// input) lands in the failed bucket and the row survives unchanged.
     #[test]
     fn malformed_response_is_counted_as_failed() {
@@ -1362,7 +1376,7 @@ mod tests {
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
-        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failed, 2);
 
         // Row still there with original content.
         let got = q::get_memory_by_id(&conn, id).unwrap();

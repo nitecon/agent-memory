@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.13.1 - 2026-09-01
+
+- Added `{prompt_stdin}` transport for headless Dream adapters. The marker is
+  removed from argv and the complete prompt is streamed verbatim to the child,
+  so project-review prompts are no longer bounded by Linux `MAX_ARG_STRLEN`.
+- Made inference degradation fail visibly. Project-review inference and parse
+  fallbacks now emit `review_failed` and increment the pass failure count, and
+  the Stage B no-op contract now requires `KEEP_UNCHANGED`; the pathological
+  legacy `skip` response is rejected instead of recording a false success.
+  Review JSON must also cover exactly the real batch IDs; missing or invented
+  keys reject the response rather than silently defaulting to keep.
+- Made gateway tombstones idempotent when a rejected response explicitly says
+  the linked gateway memory is already absent. Dream can then complete the
+  local removal while unrelated gateway conflicts remain fail-closed.
+
 ## v1.13.0 - 2026-08-16
 
 - Applied one OKF lifecycle predicate to every retrieval surface. Graph
