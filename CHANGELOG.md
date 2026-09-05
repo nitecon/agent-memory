@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.13.2 - 2026-09-04
+
+- Added `memory working append`, which preserves the current WorkingContext and
+  adds a blank-line-delimited `## Ammendment N` section. Amendment numbering is
+  automatic, and inline, stdin, and file input are supported.
+
 ## v1.13.1 - 2026-09-01
 
 - Added `{prompt_stdin}` transport for headless Dream adapters. The marker is

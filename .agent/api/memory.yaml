@@ -48,6 +48,7 @@ content:
       steps:
         - Replace the current handoff with memory working set "current state and next step".
         - Use memory working set - < handoff.md for multiline stdin bodies.
+        - Preserve the current handoff across iterations with memory working append "new progress"; each call adds the next numbered amendment.
         - Keep durable decisions and reusable lessons in memory store, not only in WorkingContext.
     - name: Store and auto-sync project memory
       steps:
@@ -344,6 +345,23 @@ content:
           - Content arg "-" reads stdin.
           - Enforces a 65536 character cap.
           - Rejects missing project idents and __global__.
+      - name: memory working append
+        purpose: Preserve the current project's WorkingContext and append a numbered amendment.
+        args:
+          required_one_of:
+            - inline content
+            - "-"
+            - --file PATH
+          optional:
+            - --project
+        output: <result status="working_context_appended" project="..." version="..." updated_at="..."/>
+        behavior:
+          - Content arg "-" reads stdin.
+          - Appends a blank-line divider, a `## Ammendment N` heading, and the supplied content.
+          - Starts at amendment 1 when no numbered amendment exists and otherwise advances from the highest existing number.
+          - Creates a WorkingContext when no row exists.
+          - Enforces the 65536 character cap on the combined content without changing the existing context on failure.
+          - Rejects missing project idents and __global__.
       - name: memory working clear
         purpose: Delete the current project's WorkingContext row.
         args:
@@ -576,7 +594,6 @@ content:
         copy: memory copy never duplicates WorkingContext.
         projects: memory projects lists durable memory rows only, not WorkingContext-only projects.
       omitted_v1:
-        - append command
         - status command/tool
         - CAS or --expect-version
         - updated_by column
@@ -605,6 +622,8 @@ content:
       command: memory context "continue WorkingContext implementation" -k 8
     - name: Set multiline handoff
       command: memory working set - --project agent-memory < handoff.md
+    - name: Append a handoff update
+      command: memory working append "Tests pass; release remains" --project agent-memory
     - name: Clear handoff
       command: memory working clear --project agent-memory
     - name: MCP set handoff

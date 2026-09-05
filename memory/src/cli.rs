@@ -519,6 +519,17 @@ pub enum WorkingCommands {
         #[arg(short, long)]
         project: Option<String>,
     },
+    /// Append a numbered amendment to the current project's WorkingContext.
+    Append {
+        /// Amendment body. Use "-" to read from stdin.
+        content: Option<String>,
+        /// Read amendment body from a file.
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+        /// Project identifier (defaults to cwd-derived ident).
+        #[arg(short, long)]
+        project: Option<String>,
+    },
     /// Clear the current project's WorkingContext.
     Clear {
         /// Project identifier (defaults to cwd-derived ident).
@@ -1074,12 +1085,32 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 file,
             } => {
                 let project = resolve_working_project(project, cwd_project.as_deref())?;
-                let content = read_working_content(content, file)?;
+                let content = read_working_content("set", content, file)?;
                 let ctx = queries::set_working_context(conn, &project, &content)?;
                 println!(
                     "{}",
                     render::render_action_result(
                         "working_context_set",
+                        &[
+                            ("project", ctx.project),
+                            ("version", ctx.version.to_string()),
+                            ("updated_at", ctx.updated_at),
+                        ],
+                    )
+                );
+            }
+            WorkingCommands::Append {
+                project,
+                content,
+                file,
+            } => {
+                let project = resolve_working_project(project, cwd_project.as_deref())?;
+                let content = read_working_content("append", content, file)?;
+                let ctx = queries::append_working_context(conn, &project, &content)?;
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "working_context_appended",
                         &[
                             ("project", ctx.project),
                             ("version", ctx.version.to_string()),
@@ -3492,13 +3523,14 @@ fn resolve_working_project(
 }
 
 fn read_working_content(
+    command: &str,
     content: Option<String>,
     file: Option<PathBuf>,
 ) -> Result<String, MemoryError> {
     match (content, file) {
-        (Some(_), Some(_)) => Err(MemoryError::Config(
-            "`memory working set` accepts either inline content or --file, not both".to_string(),
-        )),
+        (Some(_), Some(_)) => Err(MemoryError::Config(format!(
+            "`memory working {command}` accepts either inline content or --file, not both"
+        ))),
         (Some(raw), None) if raw == "-" => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -3506,9 +3538,9 @@ fn read_working_content(
         }
         (Some(raw), None) => Ok(raw),
         (None, Some(path)) => Ok(std::fs::read_to_string(path)?),
-        (None, None) => Err(MemoryError::Config(
-            "`memory working set` requires content, '-' for stdin, or --file PATH".to_string(),
-        )),
+        (None, None) => Err(MemoryError::Config(format!(
+            "`memory working {command}` requires content, '-' for stdin, or --file PATH"
+        ))),
     }
 }
 
@@ -5075,6 +5107,35 @@ mod tests {
                 assert_eq!(project.as_deref(), Some("agent-memory"));
             }
             _ => panic!("expected Working::Set variant"),
+        }
+    }
+
+    #[test]
+    fn parse_working_append_file() {
+        let cli = Cli::try_parse_from([
+            "memory",
+            "working",
+            "append",
+            "--file",
+            "update.md",
+            "--project",
+            "agent-memory",
+        ])
+        .unwrap();
+        match cli {
+            Cli::Working {
+                command:
+                    WorkingCommands::Append {
+                        content,
+                        file,
+                        project,
+                    },
+            } => {
+                assert!(content.is_none());
+                assert_eq!(file.as_deref(), Some(std::path::Path::new("update.md")));
+                assert_eq!(project.as_deref(), Some("agent-memory"));
+            }
+            _ => panic!("expected Working::Append variant"),
         }
     }
 

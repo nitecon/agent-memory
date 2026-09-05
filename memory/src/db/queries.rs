@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::db::models::{
     blob_to_embedding, embedding_to_blob, Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert,
@@ -325,6 +325,66 @@ pub fn set_working_context(
         MemoryError::NotFound(format!(
             "WorkingContext for project {project} not found after set"
         ))
+    })
+}
+
+/// Append a numbered amendment to a project's WorkingContext without replacing it.
+///
+/// An immediate transaction keeps amendment numbering and the content update atomic
+/// when multiple CLI processes append to the same project concurrently.
+pub fn append_working_context(
+    conn: &Connection,
+    project: &str,
+    appendage: &str,
+) -> Result<WorkingContext, MemoryError> {
+    validate_working_project(project)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let current = get_working_context(&tx, project)?;
+    let amendment_number = current
+        .as_ref()
+        .map(|ctx| next_amendment_number(&ctx.content))
+        .transpose()?
+        .unwrap_or(1);
+
+    let mut content = current.map(|ctx| ctx.content).unwrap_or_default();
+    if !content.is_empty() {
+        if !content.ends_with('\n') {
+            content.push_str("\n\n");
+        } else if !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+    }
+    content.push_str(&format!("## Ammendment {amendment_number}\n{appendage}"));
+    validate_working_content(&content)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO project_working_context (project, content, version, updated_at)
+         VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(project) DO UPDATE SET
+             content = excluded.content,
+             version = project_working_context.version + 1,
+             updated_at = excluded.updated_at",
+        params![project, content, now],
+    )?;
+    let result = get_working_context(&tx, project)?.ok_or_else(|| {
+        MemoryError::NotFound(format!(
+            "WorkingContext for project {project} not found after append"
+        ))
+    })?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn next_amendment_number(content: &str) -> Result<u64, MemoryError> {
+    let highest = content
+        .lines()
+        .filter_map(|line| line.strip_prefix("## Ammendment "))
+        .filter_map(|suffix| suffix.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    highest.checked_add(1).ok_or_else(|| {
+        MemoryError::Config("WorkingContext amendment number overflowed".to_string())
     })
 }
 
@@ -2148,6 +2208,64 @@ mod resolve_id_tests {
 
         let after_clear = set_working_context(&conn, "agent-memory", "new handoff").unwrap();
         assert_eq!(after_clear.version, 1);
+    }
+
+    #[test]
+    fn working_context_append_preserves_content_and_numbers_amendments() {
+        let conn = fresh_db();
+        set_working_context(&conn, "agent-memory", "original handoff").unwrap();
+
+        let first = append_working_context(&conn, "agent-memory", "first update").unwrap();
+        assert_eq!(
+            first.content,
+            "original handoff\n\n## Ammendment 1\nfirst update"
+        );
+        assert_eq!(first.version, 2);
+
+        let second = append_working_context(&conn, "agent-memory", "second\nupdate").unwrap();
+        assert_eq!(
+            second.content,
+            "original handoff\n\n## Ammendment 1\nfirst update\n\n## Ammendment 2\nsecond\nupdate"
+        );
+        assert_eq!(second.version, 3);
+    }
+
+    #[test]
+    fn working_context_append_creates_an_absent_context() {
+        let conn = fresh_db();
+        let ctx = append_working_context(&conn, "agent-memory", "initial update").unwrap();
+        assert_eq!(ctx.content, "## Ammendment 1\ninitial update");
+        assert_eq!(ctx.version, 1);
+    }
+
+    #[test]
+    fn working_context_append_uses_highest_existing_amendment_number() {
+        let conn = fresh_db();
+        set_working_context(
+            &conn,
+            "agent-memory",
+            "handoff\n\n## Ammendment 4\nolder update\n\n## Ammendment nope\ntext",
+        )
+        .unwrap();
+
+        let ctx = append_working_context(&conn, "agent-memory", "new update").unwrap();
+        assert!(ctx.content.ends_with("## Ammendment 5\nnew update"));
+    }
+
+    #[test]
+    fn working_context_append_size_failure_preserves_existing_content() {
+        let conn = fresh_db();
+        set_working_context(&conn, "agent-memory", "original").unwrap();
+        let too_large = "x".repeat(WORKING_CONTEXT_MAX_CHARS);
+
+        let err = append_working_context(&conn, "agent-memory", &too_large)
+            .expect_err("combined content above the cap must fail");
+        assert!(err.to_string().contains("maximum is 65536"));
+        let unchanged = get_working_context(&conn, "agent-memory")
+            .unwrap()
+            .expect("original context remains");
+        assert_eq!(unchanged.content, "original");
+        assert_eq!(unchanged.version, 1);
     }
 
     #[test]

@@ -183,12 +183,19 @@ memory working get
 memory working set "Current state and exact next step"
 memory working set - < handoff.md
 
+# Preserve the handoff and add the next numbered amendment.
+memory working append "Tests now pass; next step is release validation"
+memory working append - < update.md
+
 # Delete the handoff when the project thread completes.
 memory working clear
 ```
 
-WorkingContext is project-only, rejects `__global__`, and is capped at 65,536
-characters so every future `memory context` call stays bounded.
+`working append` preserves the existing body and adds `## Ammendment N` plus
+the supplied text after a blank-line divider. It starts at 1 and advances from
+the highest existing numbered amendment. WorkingContext is project-only,
+rejects `__global__`, and is capped at 65,536 characters so every future
+`memory context` call stays bounded.
 Project-wide `memory move --from X --to Y` transfers the handoff to `Y`;
 moving to an empty target clears it. `memory copy` does not duplicate
 WorkingContext, and `memory projects` lists durable-memory projects only.

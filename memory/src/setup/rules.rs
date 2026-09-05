@@ -116,8 +116,9 @@ Relevant project + global memory is injected into your context automatically eac
 
 - `memory context` renders the current project's WorkingContext before
   project_memories. Treat it as the authoritative handoff state.
-- Use `memory working set` when pausing substantial active work; `memory working clear`
-  when the project thread completes. Durable lessons still go through `memory store`.
+- Use `memory working set` when first pausing substantial active work and
+  `memory working append` for later progress updates; use `memory working clear` when the
+  project thread completes. Durable lessons still go through `memory store`.
 "#;
 
 /// Conditionally-included save-side directive: Rule B (post-action scope
@@ -1027,6 +1028,10 @@ mod tests {
         assert!(
             b.contains("memory working set"),
             "block must mention the set command"
+        );
+        assert!(
+            b.contains("memory working append"),
+            "block must mention the append command"
         );
         assert!(
             b.contains("memory working clear"),
