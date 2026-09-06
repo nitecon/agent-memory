@@ -359,8 +359,9 @@ pub enum Cli {
     /// Runtime hook entrypoint invoked by an agent CLI's per-turn hook (installed
     /// by `memory setup hooks`). Reads the hook JSON payload on stdin, runs the
     /// per-turn memory retrieval, and emits a `hookSpecificOutput` envelope on
-    /// stdout for the agent to inject as additionalContext. Fail-soft: always
-    /// exits 0.
+    /// stdout for the agent to inject as additionalContext. With terminal or
+    /// empty stdin, returns only the current project's WorkingContext.
+    /// Fail-soft: always exits 0.
     Hook {
         /// Agent name (claude, codex, gemini). Selects the hook event name.
         #[arg(long, default_value = "claude")]

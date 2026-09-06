@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.13.3 - 2026-09-06
+
+- Fixed `memory hook` waiting indefinitely for terminal input. Terminal and
+  empty-stdin calls now return the current project's WorkingContext directly.
+- Included the latest WorkingContext and all appended amendments in agent
+  prompt hook results, with a WorkingContext fallback if memory retrieval fails.
+- Added a trailing hint to use `memory working append` for follow-up notes,
+  decisions, and next steps for future agents continuing the current task.
+
 ## v1.13.2 - 2026-09-04
 
 - Added `memory working append`, which preserves the current WorkingContext and

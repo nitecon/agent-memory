@@ -231,6 +231,17 @@ content:
             - --tag
             - --graph-depth
         output: Optional <working_context present="true"> block, grouped memory sections, hints, and usage.
+      - name: memory hook
+        purpose: Emit agent hook additionalContext; direct terminal or empty-stdin invocation returns current-project WorkingContext without waiting for terminal input.
+        args:
+          optional:
+            - --agent claude|codex|gemini
+            - -k/--limit
+        behavior:
+          - Nonempty stdin is an agent JSON payload; retrieve prompt-relevant memories with the latest WorkingContext, including all appended amendments.
+          - Terminal or empty stdin returns only WorkingContext, including the absent marker when the detected project has no handoff; no embedding model is loaded.
+          - If prompt retrieval fails, fall back to current-project WorkingContext. Malformed payloads, missing prompts, and undetectable projects in WorkingContext-only mode emit nothing; exits zero.
+        output: hookSpecificOutput JSON envelope with hookEventName and additionalContext, ending with a hint to use memory working append for follow-up notes, decisions, and next steps for future agents continuing the current task.
       - name: memory push status
         purpose: Show durable memories that would be created, updated, or deleted on the gateway for the current project, or for every local durable-memory project ident when --all is set.
         args:

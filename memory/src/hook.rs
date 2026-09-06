@@ -4,7 +4,7 @@
 //! CLI's per-turn hook (Claude `UserPromptSubmit`, Gemini `BeforeAgent`, Codex
 //! `UserPromptSubmit`). On every turn the agent runs that command, piping the
 //! hook JSON payload on stdin. This module reads it, extracts the prompt, runs
-//! the same retrieval `memory context --no-working-context` performs, and emits
+//! the same retrieval `memory context` performs, and emits
 //!
 //! ```json
 //! {"hookSpecificOutput":{"hookEventName":"<event>","additionalContext":"<text>"}}
@@ -15,19 +15,38 @@
 //! editor). A binary subcommand is cross-platform by construction.
 //!
 //! MASTER RULE: this path is fail-soft. [`run`] never returns an error and
-//! never panics — any failure (bad JSON, no prompt, DB error, empty result)
-//! emits nothing and returns. Emitting nothing on stdout injects nothing, which
+//! never panics — bad JSON, no prompt, or unavailable context emits nothing and
+//! returns. Failed prompt retrieval falls back to WorkingContext. Emitting
+//! nothing on stdout injects nothing, which
 //! is exactly the desired behavior for low-signal turns and must NEVER block
 //! the user's prompt. stderr may carry diagnostics; stdout carries only the
 //! envelope or nothing.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 use rusqlite::Connection;
 
 use crate::cli;
 use crate::config::Config;
+use crate::db::queries;
 use crate::project;
+use crate::render;
+
+/// A direct terminal invocation has no hook payload. Never wait for terminal
+/// EOF; an empty redirected stdin takes the same WorkingContext-only path.
+fn read_payload(mut reader: impl Read, is_terminal: bool) -> std::io::Result<String> {
+    let mut payload = String::new();
+    if !is_terminal {
+        reader.read_to_string(&mut payload)?;
+    }
+    Ok(payload)
+}
+
+fn working_context_block(conn: &Connection, project: Option<&str>) -> Option<String> {
+    let project = project?;
+    let context = queries::get_working_context(conn, project).ok()?;
+    Some(render::render_working_context(context.as_ref(), project))
+}
 
 /// Set to a false-like value by non-interactive curation subprocesses that
 /// already carry complete context and must not recursively retrieve memory.
@@ -81,32 +100,43 @@ fn extract_prompt(payload: &str) -> Option<String> {
     None
 }
 
-/// Build the `hookSpecificOutput` envelope as a JSON string. Uses `serde_json`
+const HANDOFF_HINT: &str = "<hint>Use `memory working append \"...\"` to add follow-up notes, decisions, and next steps for future agents continuing the current task.</hint>";
+
+/// Build the `hookSpecificOutput` envelope with a trailing handoff hint. Uses `serde_json`
 /// so `event` and `context` are escaped correctly. Pure — unit testable.
 fn build_envelope(event: &str, context: &str) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": event,
-            "additionalContext": context,
+            "additionalContext": format!("{context}\n\n{HANDOFF_HINT}"),
         }
     })
     .to_string()
 }
 
-/// Runtime hook entrypoint. Fail-soft per the module MASTER RULE: any failure
-/// emits nothing and returns; this function never errors and never panics.
+/// Runtime hook entrypoint. Fail-soft per the module MASTER RULE: retrieval
+/// errors fall back to WorkingContext; unavailable context emits nothing.
 ///
 /// Steps: read stdin → [`extract_prompt`] → run the shared
-/// [`cli::retrieve_context_block`] retrieval (`no_working_context = true`, since
-/// the SessionStart hook already injects WorkingContext) → emit
+/// [`cli::retrieve_context_block`] retrieval including the latest WorkingContext → emit
 /// [`build_envelope`] on stdout. Any empty/blank result short-circuits to "emit
 /// nothing".
+/// With terminal or empty stdin, emit only the current project's WorkingContext
+/// (including its absent marker), without loading the embedding model.
 pub fn run(agent: &str, limit: usize, conn: &Connection, config: &Config) {
     if !hook_enabled(std::env::var(HOOK_ENABLE_ENV).ok().as_deref()) {
         return;
     }
-    let mut payload = String::new();
-    if std::io::stdin().read_to_string(&mut payload).is_err() {
+    let stdin = std::io::stdin();
+    let Ok(payload) = read_payload(stdin.lock(), stdin.is_terminal()) else {
+        return;
+    };
+
+    if payload.trim().is_empty() {
+        let cwd_project = project::project_ident_from_cwd().ok();
+        if let Some(block) = working_context_block(conn, cwd_project.as_deref()) {
+            println!("{}", build_envelope(event_name(agent), &block));
+        }
         return;
     }
 
@@ -126,14 +156,17 @@ pub fn run(agent: &str, limit: usize, conn: &Connection, config: &Config) {
         config,
         &prompt,
         limit,
-        /* no_working_context */ true,
+        /* no_working_context */ false,
         /* project */ None,
         cwd_project.as_deref(),
         /* no_project_boost */ false,
         /* only */ None,
     ) {
         Ok(block) => block,
-        Err(_) => return,
+        Err(_) => match working_context_block(conn, cwd_project.as_deref()) {
+            Some(block) => block,
+            None => return,
+        },
     };
 
     if block.trim().is_empty() {
@@ -148,6 +181,37 @@ pub fn run(agent: &str, limit: usize, conn: &Connection, config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_input_is_never_read() {
+        struct Terminal;
+        impl Read for Terminal {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("reading terminal stdin would hang waiting for EOF");
+            }
+        }
+        assert_eq!(read_payload(Terminal, true).unwrap(), "");
+    }
+
+    #[test]
+    fn redirected_input_preserves_hook_payload_and_empty_eof() {
+        let payload = r#"{"prompt":"continue"}"#;
+        assert_eq!(read_payload(payload.as_bytes(), false).unwrap(), payload);
+        assert_eq!(read_payload(std::io::empty(), false).unwrap(), "");
+    }
+
+    #[test]
+    fn direct_context_returns_current_project_handoff_or_absent_marker() {
+        let conn = crate::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        queries::set_working_context(&conn, "project-a", "Continue the hook fix").unwrap();
+        let block = working_context_block(&conn, Some("project-a")).unwrap();
+        assert!(block.contains("Continue the hook fix"));
+        assert!(block.contains("present=\"true\""));
+        let absent = working_context_block(&conn, Some("project-b")).unwrap();
+        assert!(absent.contains("present=\"false\""));
+        assert!(!absent.contains("Continue the hook fix"));
+        assert!(working_context_block(&conn, None).is_none());
+    }
 
     #[test]
     fn extract_prompt_reads_each_field() {
@@ -193,7 +257,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let inner = &parsed["hookSpecificOutput"];
         assert_eq!(inner["hookEventName"], "UserPromptSubmit");
-        assert_eq!(inner["additionalContext"], "some context");
+        assert_eq!(
+            inner["additionalContext"],
+            format!("some context\n\n{HANDOFF_HINT}")
+        );
     }
 
     #[test]
@@ -202,7 +269,10 @@ mod tests {
         let ctx = "line1\n\"quoted\"\tand\\back";
         let out = build_envelope("BeforeAgent", ctx);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], ctx);
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"],
+            format!("{ctx}\n\n{HANDOFF_HINT}")
+        );
     }
 
     #[test]

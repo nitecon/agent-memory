@@ -363,9 +363,19 @@ All three merges are conservative: unrelated keys, tables, and array entries are
 
 ### Hooks (automatic per-turn injection)
 
+Running `memory hook --agent claude` directly in a terminal returns the current
+project's WorkingContext in a `hookSpecificOutput` JSON envelope without waiting
+for stdin. Empty redirected stdin has the same behavior. This path does not load
+the embedding model; a detected project without a handoff returns a
+`present="false"` WorkingContext marker. Nonempty piped hook JSON continues to
+select prompt-based memory retrieval.
+Each emitted hook result ends with a hint to use `memory working append "..."`
+for follow-up notes, decisions, and next steps for future agents continuing the
+current task.
+
 > **Status: opt-in POC.** `memory setup hooks` is deliberately **not** part of `memory setup all`; you must request it explicitly (or pick it as the 4th option in the interactive `memory setup` checklist).
 
-Where `memory setup rules` *tells* the agent to call `memory context` itself, `memory setup hooks` wires each agent CLI's per-turn hook system to inject relevant memory **automatically** — no model-initiated tool call required. It installs a single shared bridge script and registers it once per detected agent:
+Where `memory setup rules` *tells* the agent to call `memory context` itself, `memory setup hooks` wires each agent CLI's per-turn hook system to inject relevant memory **automatically** — no model-initiated tool call required. It registers the binary hook command once per detected agent:
 
 | Agent  | Hook event         | Config file                                                        | Timeout |
 |--------|--------------------|--------------------------------------------------------------------|---------|
@@ -373,7 +383,7 @@ Where `memory setup rules` *tells* the agent to call `memory context` itself, `m
 | Gemini | `BeforeAgent`      | `~/.gemini/settings.json`                                          | 10000 ms |
 | Codex  | `UserPromptSubmit` | `$CODEX_HOME/config.toml` (or `~/.codex/`, then `~/.config/codex/`) | (none)  |
 
-The shared bridge script lives at `~/.agentic/hooks/memory-inject.sh`. On every turn the agent passes the hook's JSON payload on stdin; the script extracts the user's prompt, runs `memory context … --no-working-context`, and emits a `hookSpecificOutput` envelope whose `additionalContext` carries the retrieved memory. It uses `--no-working-context` because WorkingContext is already injected once by the session-start hook (and refreshed across compaction) — re-emitting it every turn would just duplicate it, so the per-turn hook carries only the prompt-relevant ranked recall. When there is no prompt or no relevant memory it emits nothing (exit 0), so low-signal turns stay cheap. Two environment knobs tune it: `MEMORY_BIN` (override the resolved `memory` binary) and `MEMORY_INJECT_LIMIT` (the `-k` result count, default 5).
+The installed command is `memory hook --agent <agent>`. On every turn the agent passes its hook JSON payload on stdin; the command extracts the prompt and emits a `hookSpecificOutput` envelope containing the latest WorkingContext (including every appended amendment) followed by prompt-relevant memories and a handoff hint. If prompt retrieval fails, it falls back to WorkingContext. Invalid payloads or missing prompts emit nothing and exit 0. Set `AGENT_MEMORY_HOOK=off` to disable injection; `--limit` controls the memory result count (default 5).
 
 Agent detection reuses the same logic as `memory setup rules`, so both commands agree on which agents are present and where their config lives (including `CODEX_HOME` / XDG precedence). All merges are conservative and idempotent: unrelated keys, events, and the user's own hooks are preserved; corrupt input fails loudly; re-runs replace our entry in place rather than accumulating duplicates; writes are atomic. `memory setup hooks --remove` strips only our marker-matching entries, collapses any emptied parents, and deletes the shared script.
 
