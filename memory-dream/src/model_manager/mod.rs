@@ -230,6 +230,9 @@ pub enum ProgressEvent {
 /// it natively); the trait only cares about "file ends up on disk at
 /// the given path with the given content".
 #[async_trait]
+// async_trait adds #[must_use] to methods returning boxed futures; Rust 1.99
+// flags that generated attribute as redundant. Keep the exception on this trait.
+#[allow(clippy::double_must_use)]
 pub trait HubClient: Send + Sync {
     /// Fetch the expected size of `file` in `repo`. Used to initialize
     /// the progress bar before the stream starts.
