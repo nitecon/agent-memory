@@ -154,7 +154,11 @@ content:
           - Passes are unlimited by default; when explicitly supplied, the limit is global across projects, and zero also means unlimited.
           - Headless subprocesses receive AGENT_MEMORY_HOOK=off, AGENT_TOOLS_HOOK=off, and MEMORY_DREAM_HEADLESS=1.
           - A standalone {prompt_stdin} marker is removed from argv and selects verbatim stdin prompt transport; {prompt} remains the argv transport and the two markers are mutually exclusive.
-          - condenser_version uses the backend-qualified inference identity plus prompt hash.
+          - Single-memory rewrites may grow by at most 50% of the original baseline; merged output is capped at 75% of combined source lengths, measured in Unicode characters.
+          - Successful unchanged decisions are stamped as processed. Ordinary passes skip unchanged successful work while keeping older memories as context and valid replacement/removal targets for pending evidence. Failed processing remains retryable.
+          - Review replacements are already curated and do not undergo redundant per-memory condensation. Explicit refresh still re-evaluates existing memories.
+          - Run-time review hints identify pending work, encourage useful combinations, and request complete decisions including unchanged context.
+          - condenser_version uses the backend-qualified inference identity plus the condensation and project-review policy hash.
           - Dream-created relationship producer and revision actor are both memory-dream.
           - A terminal summary with failed greater than zero is followed by a non-zero process exit.
           - Each project-review inference or parse fallback emits review_failed and increments failed while conservatively passing the affected memories onward.

@@ -213,35 +213,74 @@ pub fn run(
             continue;
         }
 
+        let pending_ids: HashSet<String> = candidates.iter().map(|m| m.id.clone()).collect();
+        // Review can compare new evidence against already-processed memories.
+        // Only pending memories consume the explicit pass limit.
+        let mut review_context = q::list_dream_candidates(conn, project.as_deref(), None, None, 0)?;
+        review_context.retain(|m| {
+            pending_ids.contains(&m.id)
+                || (m.condenser_version.as_deref() == Some(current_stamp.as_str())
+                    && cutoff.as_ref().is_none_or(|last| &m.updated_at <= last))
+        });
         let mut project_stats = ProjectStats::default();
 
         // Stage 0 — project-level cross-memory review. Primary
         // consolidation path. Survivors (including newly-materialized
         // supersede/extract memories) flow into Stage A + B for the
         // existing cosine + per-memory polish work.
-        let stage0 = run_stage_0_project_review(
+        let mut stage0 = run_stage_0_project_review(
             conn,
             inference,
             cfg,
             project.as_deref(),
-            candidates,
+            review_context,
+            &pending_ids,
             &mut project_stats,
             &mut summary,
         );
 
         // Stage A — cosine dedup over the Stage 0 survivors for this project.
         // Survivors move to Stage B.
+        let pending_survivors: Vec<_> = stage0
+            .survivors
+            .iter()
+            .filter(|m| pending_ids.contains(&m.id))
+            .cloned()
+            .collect();
         let survivors = run_stage_a_dedup(
             conn,
             cfg,
-            &stage0.survivors,
+            &pending_survivors,
             &stage0.contradiction_ids,
             &mut project_stats,
+            &mut stage0.retry_ids,
         );
 
         // Stage B — per-memory condense via the three-way contract.
         for mem in &survivors {
+            let failed_before = project_stats.failed;
             run_stage_b_condense(conn, inference, cfg, mem, &mut project_stats);
+            if cfg.mode == DreamMode::Apply && q::get_memory_by_id(conn, &mem.id).is_ok() {
+                let successful =
+                    project_stats.failed == failed_before && !stage0.retry_ids.contains(&mem.id);
+                if let Err(e) = q::set_dream_processed(
+                    conn,
+                    &mem.id,
+                    successful.then_some(current_stamp.as_str()),
+                ) {
+                    project_stats.failed += 1;
+                    tracing::warn!(id = %mem.id, error = %e, "failed to record Dream processing outcome");
+                }
+            }
+        }
+        // Review replacements are already curated and stamped. Clear only
+        // failed outcomes, including failures against older context targets.
+        if cfg.mode == DreamMode::Apply {
+            for id in &stage0.retry_ids {
+                if q::get_memory_by_id(conn, id).is_ok() {
+                    q::set_dream_processed(conn, id, None)?;
+                }
+            }
         }
 
         summary.kept += project_stats.kept;
@@ -352,6 +391,7 @@ struct ProjectStats {
 struct Stage0Outcome {
     survivors: Vec<Memory>,
     contradiction_ids: HashSet<String>,
+    retry_ids: HashSet<String>,
 }
 
 /// Decide which `last_dream_at` cutoff applies for `project`.
@@ -387,23 +427,26 @@ fn resolve_incremental_cutoff(
 /// pass through as survivors, failures are counted, and Stages A + B
 /// still run. This matches the existing `NoopInference` fallback used
 /// when no model is available.
+#[allow(clippy::too_many_arguments)]
 fn run_stage_0_project_review(
     conn: &mut rusqlite::Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
     project: Option<&str>,
     candidates: Vec<Memory>,
+    pending_ids: &HashSet<String>,
     project_stats: &mut ProjectStats,
     summary: &mut DreamSummary,
 ) -> Stage0Outcome {
     let apply = cfg.mode == DreamMode::Apply;
     let project_label = project.unwrap_or("(null)");
 
-    match project_review::run_project(
+    match project_review::run_project_with_pending(
         conn,
         inference,
         project,
         candidates.clone(),
+        pending_ids,
         cfg.model_name,
         cfg.embedding_cache_dir,
         cfg.gateway_config,
@@ -459,9 +502,11 @@ fn run_stage_0_project_review(
             Stage0Outcome {
                 survivors: outcome.survivors,
                 contradiction_ids: outcome.contradiction_ids,
+                retry_ids: outcome.retry_ids,
             }
         }
         Err(e) => {
+            project_stats.failed += 1;
             // A Stage 0 failure is a single "batch didn't parse" event,
             // not a per-memory failure. We pass the candidates through
             // to Stages A + B, which do their own counting; inflating
@@ -479,6 +524,7 @@ fn run_stage_0_project_review(
                 )
             );
             Stage0Outcome {
+                retry_ids: candidates.iter().map(|m| m.id.clone()).collect(),
                 survivors: candidates,
                 contradiction_ids: HashSet::new(),
             }
@@ -499,6 +545,7 @@ fn run_stage_a_dedup(
     candidates: &[Memory],
     contradiction_ids: &HashSet<String>,
     stats: &mut ProjectStats,
+    retry_ids: &mut HashSet<String>,
 ) -> Vec<Memory> {
     let mut survivors: Vec<Memory> = Vec::with_capacity(candidates.len());
     for mem in candidates {
@@ -515,6 +562,8 @@ fn run_stage_a_dedup(
         ) {
             Ok(p) => p,
             Err(e) => {
+                stats.failed += 1;
+                retry_ids.insert(mem.id.clone());
                 tracing::warn!(id = %mem.id, error = %e,
                     "stage A dedup peer lookup failed; keeping memory");
                 survivors.push(mem.clone());
@@ -538,6 +587,8 @@ fn run_stage_a_dedup(
                                 )
                             {
                                 stats.failed += 1;
+                                retry_ids.insert(mem.id.clone());
+                                retry_ids.insert(older.id.clone());
                                 tracing::warn!(id = %older.id, error = %e,
                                     "stage A gateway tombstone failed; keeping memory");
                                 survivors.push(mem.clone());
@@ -550,6 +601,7 @@ fn run_stage_a_dedup(
                             if let Err(e) = q::prepare_memory_gateway_sync_for_delete(conn, &older)
                             {
                                 stats.failed += 1;
+                                retry_ids.insert(mem.id.clone());
                                 tracing::warn!(id = %older, error = %e,
                                     "stage A gateway sync cleanup failed");
                                 survivors.push(mem.clone());
@@ -579,6 +631,7 @@ fn run_stage_a_dedup(
                         Ok(None) => survivors.push(mem.clone()),
                         Err(e) => {
                             stats.failed += 1;
+                            retry_ids.insert(mem.id.clone());
                             tracing::warn!(id = %mem.id, error = %e,
                                 "stage A apply_policy failed");
                             survivors.push(mem.clone());
@@ -651,6 +704,7 @@ fn run_stage_b_condense(
                 if let Err(e) =
                     project_review::record_curation_review(conn, &source.id, cfg.model_name)
                 {
+                    stats.failed += 1;
                     tracing::warn!(id = %source.id, error = %e,
                         "condense skip confirmation failed");
                 }

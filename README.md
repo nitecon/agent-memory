@@ -870,6 +870,16 @@ $trigger = New-ScheduledTaskTrigger -Daily -At 3am
 Register-ScheduledTask -TaskName "agent-memory-dream" -Action $action -Trigger $trigger
 ```
 
+Successful keep and rewrite decisions are stamped as processed. Ordinary passes
+skip unchanged successful work; failed work remains retryable. When new evidence
+arrives, older processed memories remain available to the review as context and
+as merge, replacement, or removal targets. Review hints encourage combining
+related memories while preserving distinct supported context. `--refresh`
+deliberately re-evaluates all memories.
+
+For the validated Codex Luna configuration and SRE cutover steps, see
+[Dream with Luna](docs/dream-luna.md).
+
 ### What gets condensed, what gets deduped
 
 A memory needs condensation when it has `content_raw IS NULL` (never processed) OR its `condenser_version` stamp no longer matches the current `<backend-qualified-inference-identity>:<prompt-hash>` combo (prompt, backend, command identity, or model changed since last run). Stamping lets future passes detect and re-run stale rows without reprocessing everything.
@@ -879,7 +889,7 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 ### Safety nets
 
 - **Prompt injection defense**: the condensation prompt wraps memory content in `<<<MEMORY>>> ... <<<END>>>` and explicitly instructs the model to treat anything inside as data, not instructions. The no-op response is the explicit token `KEEP_UNCHANGED`; the legacy `skip` response is rejected so a model stuck on that generic fallback cannot masquerade as a successful curation pass.
-- **Length-ratio check**: if the model's "condensed" output is longer than the input, it's rejected and the raw memory stays untouched.
+- **Bounded growth**: source-supported single-memory rewrites may grow by at most 50% of their original baseline. Merged output must fit within 75% of the combined source lengths. Limits count Unicode characters; rejected output leaves the sources available for retry.
 - **Refusal detection**: responses matching `I cannot`, `I'm sorry, but`, `as a language model`, etc. fall back to the raw memory.
 - **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
 - **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.

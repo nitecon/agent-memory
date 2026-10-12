@@ -214,6 +214,8 @@ pub struct ProjectReviewOutcome {
     pub survivors: Vec<Memory>,
     pub contradiction_ids: HashSet<String>,
     pub failures: Vec<String>,
+    /// Failed review work must remain eligible even if Stage B succeeds.
+    pub retry_ids: HashSet<String>,
 }
 
 /// Run the project review pass for a single project's memory set.
@@ -236,6 +238,34 @@ pub fn run_project(
     gateway_config: Option<&GatewayConfig>,
     apply: bool,
 ) -> Result<ProjectReviewOutcome, ProjectReviewError> {
+    let pending_ids = candidates.iter().map(|m| m.id.clone()).collect();
+    run_project_with_pending(
+        conn,
+        inference,
+        project,
+        candidates,
+        &pending_ids,
+        model_name,
+        embedding_cache_dir,
+        gateway_config,
+        apply,
+    )
+}
+
+/// Process only batches containing pending work, retaining older memories as
+/// context and legitimate merge/removal targets. Old-only batches need no review.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_project_with_pending(
+    conn: &mut Connection,
+    inference: &dyn Inference,
+    project: Option<&str>,
+    candidates: Vec<Memory>,
+    pending_ids: &HashSet<String>,
+    model_name: &str,
+    embedding_cache_dir: &std::path::Path,
+    gateway_config: Option<&GatewayConfig>,
+    apply: bool,
+) -> Result<ProjectReviewOutcome, ProjectReviewError> {
     let mut stats = ProjectReviewStats::default();
 
     if candidates.is_empty() {
@@ -244,6 +274,7 @@ pub fn run_project(
             survivors: Vec::new(),
             contradiction_ids: HashSet::new(),
             failures: Vec::new(),
+            retry_ids: HashSet::new(),
         });
     }
 
@@ -253,8 +284,12 @@ pub fn run_project(
     let mut survivors: Vec<Memory> = Vec::new();
     let mut contradiction_ids = HashSet::new();
     let mut failures = Vec::new();
+    let mut retry_ids = HashSet::new();
 
     for batch in batches {
+        if !batch.iter().any(|m| pending_ids.contains(&m.id)) {
+            continue;
+        }
         // Model round-trip per batch. A batch is either "whole project"
         // (normal path) or one cluster (fallback path).
         //
@@ -263,18 +298,20 @@ pub fn run_project(
         // memories, but that does not make the missing cross-memory review
         // successful. Count and expose the batch failure so scheduled passes
         // cannot report a silent all-keep success.
-        let decisions = match invoke_review_with_context(conn, inference, project, &batch) {
-            Ok(d) => d,
-            Err(e) => {
-                stats.failed += 1;
-                failures.push(e.to_string());
-                tracing::warn!(project = ?project, error = %e,
+        let decisions =
+            match invoke_review_with_context(conn, inference, project, &batch, pending_ids) {
+                Ok(d) => d,
+                Err(e) => {
+                    stats.failed += 1;
+                    retry_ids.extend(batch.iter().map(|m| m.id.clone()));
+                    failures.push(e.to_string());
+                    tracing::warn!(project = ?project, error = %e,
                     "project review inference failed; treating batch as all-keep");
-                // Keep everything in this batch so Stage B still runs.
-                survivors.extend(batch);
-                continue;
-            }
-        };
+                    // Keep everything in this batch so Stage B still runs.
+                    survivors.extend(batch);
+                    continue;
+                }
+            };
 
         apply_decisions(
             conn,
@@ -288,6 +325,8 @@ pub fn run_project(
             &mut stats,
             &mut survivors,
             &mut contradiction_ids,
+            pending_ids,
+            &mut retry_ids,
         )?;
     }
 
@@ -296,6 +335,7 @@ pub fn run_project(
         survivors,
         contradiction_ids,
         failures,
+        retry_ids,
     })
 }
 
@@ -346,7 +386,12 @@ fn cluster_memories(candidates: Vec<Memory>) -> Vec<Vec<Memory>> {
 /// within [`CLUSTER_WINDOW_DAYS`] days AND they share at least
 /// [`MIN_TAG_OVERLAP`] tags.
 fn memories_cluster_together(a: &Memory, b: &Memory) -> bool {
-    if !within_window(&a.updated_at, &b.updated_at, CLUSTER_WINDOW_DAYS) {
+    // Processed context can predate new evidence by more than the ordinary
+    // clustering window. Related older guidance must still be considered.
+    if a.condenser_version.is_none()
+        && b.condenser_version.is_none()
+        && !within_window(&a.updated_at, &b.updated_at, CLUSTER_WINDOW_DAYS)
+    {
         return false;
     }
     tag_overlap(a.tags.as_deref(), b.tags.as_deref()) >= MIN_TAG_OVERLAP
@@ -392,8 +437,21 @@ fn invoke_review_with_context(
     inference: &dyn Inference,
     project: Option<&str>,
     batch: &[Memory],
+    pending_ids: &HashSet<String>,
 ) -> Result<HashMap<String, Decision>, ProjectReviewError> {
     let mut prompt_text = prompt::build_project_review_prompt(project, batch);
+    let pending: Vec<_> = batch
+        .iter()
+        .filter(|m| pending_ids.contains(&m.id))
+        .map(|m| m.id.as_str())
+        .collect();
+    prompt_text.push_str(&format!(
+        "\n\nRUN HINT: pending memory ids: {}. Other memories were already successfully processed. \
+        Keep those unchanged unless the pending evidence warrants merging, replacement, removal \
+        or a contradiction. They remain context and valid targets. Return decisions for EVERY \
+        id in this batch, including keep decisions for unchanged context. Look for useful combinations.",
+        pending.join(", ")
+    ));
     let context = okf_review_context(conn, batch)?;
     if !context.is_empty() {
         prompt_text.push_str("\n\nOKF METADATA AND ONE-HOP GRAPH CONTEXT (DATA)\n");
@@ -774,7 +832,7 @@ pub fn parse_response(
                 out.get(target_id),
                 Some(Decision::Keep) | Some(Decision::SupersedeBy { .. })
             );
-            if !target_known || !target_alive {
+            if target_id == id || !target_known || !target_alive {
                 downgrades.push((id.clone(), target_id.clone()));
             }
         }
@@ -790,6 +848,45 @@ pub fn parse_response(
         tracing::warn!(id = %id, target = %target,
             "merge_into target missing or not alive; downgrading to keep");
         out.insert(id, Decision::Keep);
+    }
+
+    // Validate output lengths before embeddings, gateway calls or DB writes.
+    // A merged target's budget includes its incoming sources; single rewrites
+    // retain the original raw baseline so refreshes cannot compound growth.
+    for mem in batch {
+        let incoming: Vec<_> = batch.iter().filter(|source| {
+            matches!(out.get(&source.id), Some(Decision::MergeInto { target_id }) if target_id == &mem.id)
+        }).collect();
+        let replacement = match out.get(&mem.id) {
+            Some(Decision::SupersedeBy { content, .. })
+            | Some(Decision::Extract { content, .. }) => Some(content.as_str()),
+            _ => None,
+        };
+        let (body, maximum) = if incoming.is_empty() {
+            let Some(body) = replacement else { continue };
+            (
+                body,
+                super::condense::rewrite_char_limit(
+                    mem.content_raw.as_deref().unwrap_or(&mem.content),
+                ),
+            )
+        } else {
+            let combined = mem.content.trim().chars().count()
+                + incoming
+                    .iter()
+                    .map(|m| m.content.trim().chars().count())
+                    .sum::<usize>();
+            (
+                replacement.unwrap_or(&mem.content),
+                combined.saturating_mul(3) / 4,
+            )
+        };
+        if body.trim().is_empty() || body.trim().chars().count() > maximum {
+            return Err(ProjectReviewError::Parse(format!(
+                "replacement length outside allowed budget for {}: characters={}, maximum={maximum}",
+                mem.id, body.trim().chars().count()
+            )));
+        }
     }
 
     Ok(out)
@@ -857,6 +954,8 @@ fn apply_decisions(
     stats: &mut ProjectReviewStats,
     survivors: &mut Vec<Memory>,
     contradiction_ids: &mut HashSet<String>,
+    pending_ids: &HashSet<String>,
+    retry_ids: &mut HashSet<String>,
 ) -> Result<(), ProjectReviewError> {
     let project_label = project.unwrap_or("(null)");
 
@@ -876,6 +975,7 @@ fn apply_decisions(
             }
             Err(e) => {
                 stats.failed += 1;
+                retry_ids.insert(mem.id.clone());
                 tracing::warn!(id = %mem.id, error = %e,
                     "review materialize failed; keeping source memory alive");
                 materialize_failed.insert(mem.id.clone());
@@ -884,6 +984,10 @@ fn apply_decisions(
     }
 
     let mut gateway_creates: Vec<Memory> = Vec::new();
+    let replacement_ids: HashMap<_, _> = materialized
+        .iter()
+        .map(|(old, new)| (old.clone(), new.id.clone()))
+        .collect();
 
     let mut gateway_blocked: HashMap<String, String> = HashMap::new();
     if apply {
@@ -896,7 +1000,8 @@ fn apply_decisions(
                 // remote row must survive too — it is pushed as an update
                 // below, not tombstoned.
                 Decision::Deprecate { .. } => false,
-                Decision::Drop | Decision::MergeInto { .. } => true,
+                Decision::Drop => true,
+                Decision::MergeInto { target_id } => !materialize_failed.contains(target_id),
                 Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
                     !materialize_failed.contains(&mem.id)
                 }
@@ -914,9 +1019,21 @@ fn apply_decisions(
                 "memory-dream project review removed memory",
             ) {
                 stats.failed += 1;
+                retry_ids.insert(mem.id.clone());
                 tracing::warn!(id = %mem.id, error = %e,
                     "review gateway tombstone failed; keeping source memory alive");
                 gateway_blocked.insert(mem.id.clone(), e.to_string());
+            }
+        }
+    }
+
+    // Never remove merge sources if their canonical target could not be
+    // materialized or its gateway removal failed.
+    for mem in batch {
+        if let Some(Decision::MergeInto { target_id }) = decisions.get(&mem.id) {
+            if materialize_failed.contains(target_id) || gateway_blocked.contains_key(target_id) {
+                gateway_blocked.insert(mem.id.clone(), "merge target replacement failed".into());
+                retry_ids.insert(mem.id.clone());
             }
         }
     }
@@ -945,12 +1062,14 @@ fn apply_decisions(
         match decision {
             Decision::Keep => {
                 stats.kept += 1;
-                if apply {
+                if apply && pending_ids.contains(&mem.id) {
                     // The model read this memory and stood by it. Recording
                     // that lifts it out of "nothing has ever checked this",
                     // which is the only signal separating an unreviewed note
                     // from a curated one.
                     if let Err(e) = record_curation_review(&tx, &mem.id, model_name) {
+                        stats.failed += 1;
+                        retry_ids.insert(mem.id.clone());
                         tracing::warn!(id = %mem.id, error = %e,
                             "review keep confirmation failed");
                     }
@@ -978,6 +1097,8 @@ fn apply_decisions(
                     if let Err(e) =
                         record_contradiction(&tx, &mem.id, &target_id, &reason, model_name)
                     {
+                        stats.failed += 1;
+                        retry_ids.insert(mem.id.clone());
                         tracing::warn!(id = %mem.id, target = %target_id, error = %e,
                             "review contradiction edge failed");
                     }
@@ -1003,6 +1124,7 @@ fn apply_decisions(
                         Ok(()) => gateway_creates.push(mem.clone()),
                         Err(e) => {
                             stats.failed += 1;
+                            retry_ids.insert(mem.id.clone());
                             tracing::warn!(id = %mem.id, error = %e, "review deprecate failed");
                             continue;
                         }
@@ -1036,6 +1158,7 @@ fn apply_decisions(
                         Some("project review drop"),
                     ) {
                         stats.failed += 1;
+                        retry_ids.insert(mem.id.clone());
                         tracing::warn!(id = %mem.id, error = %e, "review drop failed");
                         continue;
                     }
@@ -1056,16 +1179,22 @@ fn apply_decisions(
                 );
             }
             Decision::MergeInto { target_id } => {
+                let target_id = replacement_ids
+                    .get(&target_id)
+                    .cloned()
+                    .unwrap_or(target_id);
                 stats.merged += 1;
                 if apply {
                     if let Err(e) = q::mark_superseded(&tx, &mem.id, &target_id) {
                         stats.failed += 1;
+                        retry_ids.insert(mem.id.clone());
                         tracing::warn!(id = %mem.id, target = %target_id, error = %e,
                             "review merge failed");
                         continue;
                     }
                     if let Err(e) = q::prepare_memory_gateway_sync_for_delete(&tx, &mem.id) {
                         stats.failed += 1;
+                        retry_ids.insert(mem.id.clone());
                         tracing::warn!(id = %mem.id, error = %e,
                             "review merge gateway sync cleanup failed");
                         continue;
@@ -1124,10 +1253,45 @@ fn apply_decisions(
                         model_name,
                     ) {
                         stats.failed += 1;
+                        retry_ids.extend(batch.iter().map(|m| m.id.clone()));
                         tracing::warn!(id = %new_mem.id, error = %e,
                             "review {label_action} replacement failed");
                         let _ = tx.rollback();
                         return Ok(());
+                    }
+                    // Every merged source remains discoverable as derivation
+                    // provenance, including when the target itself was replaced.
+                    let merged_sources: Vec<_> = batch.iter().filter(|source| {
+                        matches!(decisions.get(&source.id), Some(Decision::MergeInto { target_id }) if target_id == &mem.id)
+                    }).collect();
+                    if !merged_sources.is_empty() {
+                        agent_memory::concepts::mutate(
+                            &tx,
+                            &new_mem.id,
+                            "dream_merge_sources",
+                            Some("memory-dream"),
+                            None,
+                            false,
+                            |revision| {
+                                for source in &merged_sources {
+                                    let uri = agent_memory::concepts::canonical_uri(
+                                        &source.id,
+                                        source.project.as_deref(),
+                                    );
+                                    agent_memory::concepts::insert_relationship_with_producer(
+                                        &tx,
+                                        &new_mem.id,
+                                        None,
+                                        &uri,
+                                        "derived_from",
+                                        "memory-dream",
+                                        revision,
+                                        Some(0),
+                                    )?;
+                                }
+                                Ok(())
+                            },
+                        )?;
                     }
                     gateway_creates.push(new_mem.clone());
                 }
@@ -1168,6 +1332,7 @@ fn apply_decisions(
                     mem,
                 ) {
                     stats.failed += 1;
+                    retry_ids.insert(mem.id.clone());
                     tracing::warn!(id = %mem.id, error = %e,
                         "review replacement gateway push failed");
                     println!(
@@ -1380,8 +1545,18 @@ mod tests {
     #[test]
     fn parse_supersede_and_extract_carry_content_and_tags() {
         let batch = vec![
-            mk_memory("aaa", "bloated", &["old"], "2026-04-20T00:00:00Z"),
-            mk_memory("bbb", "mixed", &["old"], "2026-04-21T00:00:00Z"),
+            mk_memory(
+                "aaa",
+                "bloated canonical form",
+                &["old"],
+                "2026-04-20T00:00:00Z",
+            ),
+            mk_memory(
+                "bbb",
+                "mixed durable architectural note",
+                &["old"],
+                "2026-04-21T00:00:00Z",
+            ),
         ];
         let raw = r#"{
             "decisions": {
@@ -1932,6 +2107,24 @@ mod tests {
         let b = mk_memory("b", "y", &["t1", "t2"], "2025-01-01T00:00:00Z");
         let out = cluster_memories(vec![a, b]);
         assert_eq!(out.len(), 2, "outside window must split clusters");
+    }
+
+    #[test]
+    fn processed_related_context_can_predate_new_evidence() {
+        let mut old = mk_memory(
+            "old",
+            "guidance",
+            &["cuda", "driver"],
+            "2025-01-01T00:00:00Z",
+        );
+        old.condenser_version = Some("processed".into());
+        let new = mk_memory(
+            "new",
+            "updated evidence",
+            &["cuda", "driver"],
+            "2026-10-12T00:00:00Z",
+        );
+        assert_eq!(cluster_memories(vec![old, new]).len(), 1);
     }
 
     #[test]

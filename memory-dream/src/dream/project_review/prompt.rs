@@ -20,6 +20,11 @@
 
 use agent_memory::db::models::Memory;
 
+/// Review policy participates in the existing processing freshness stamp.
+pub(crate) fn policy_hash_input() -> String {
+    format!("{PREAMBLE}{RULES}")
+}
+
 /// Construct the full prompt for a batch of memories.
 ///
 /// `project` is the project ident the batch is scoped to (or `None` for
@@ -52,13 +57,17 @@ pub fn build_project_review_prompt(project: Option<&str>, memories: &[Memory]) -
             .unwrap_or_else(|| "-".to_string());
         let mtype = mem.memory_type.as_deref().unwrap_or("-");
         prompt.push_str(&format!(
-            "---\nid: {id}\ntype: {mtype}\ntags: {tags}\ncreated_at: {created}\nupdated_at: {updated}\n<<<CONTENT>>>\n{content}\n<<<END_CONTENT>>>\n",
+            "---\nid: {id}\ntype: {mtype}\ntags: {tags}\ncreated_at: {created}\nupdated_at: {updated}\ncharacters: {chars}\nsingle_rewrite_max_characters: {maximum}\n<<<CONTENT>>>\n{content}\n<<<END_CONTENT>>>\n",
             id = mem.id,
             mtype = mtype,
             tags = tags,
             created = mem.created_at,
             updated = mem.updated_at,
             content = mem.content,
+            chars = mem.content.trim().chars().count(),
+            maximum = crate::dream::condense::rewrite_char_limit(
+                mem.content_raw.as_deref().unwrap_or(&mem.content)
+            ),
         ));
     }
 
@@ -134,7 +143,13 @@ const RULES: &str = r#"RULES
    duplicated, or needs a self-contained headline. Do not rewrite just
    for style.
 
-4. MERGE SAFETY. `merge_into.target_id` MUST be another id from the
+4. MERGE SAFETY. Actively look for related memories that can be combined
+   into one useful canonical entry. Preserve all distinct supported context.
+   Use `supersede_by` on the target with the combined body, and `merge_into`
+   on its sources. Use a `keep` target only when it already covers the sources.
+   The final merged body MUST be at most 75% (three quarters) of the
+   combined source lengths, counting Unicode characters. Do not add a
+   growth allowance to this merge cap. `merge_into.target_id` MUST be another id from the
    same batch, AND the target's own decision must be `keep` or
    `supersede_by`. Never merge into a memory you're also dropping.
 
@@ -147,6 +162,9 @@ const RULES: &str = r#"RULES
 6. PRESERVE FACTS. When you rewrite (supersede or extract), preserve
    every path, date, number, proper noun, and exact quote verbatim.
    Do not invent details that aren't in the input.
+   A single-memory rewrite may add useful source-supported context but MUST
+   be at most 150% of its original baseline (50% growth). Use the supplied
+   character hints. Prefer concise text; never pad to reach the limit.
 
 7. WHEN IN DOUBT, KEEP. Default to `keep` if you aren't confident the
    memory is redundant or reconstructable. False drops cost more than

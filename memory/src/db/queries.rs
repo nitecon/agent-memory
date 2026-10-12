@@ -1511,13 +1511,11 @@ pub fn snapshot_dream_rows(
 ///   - Have `condenser_version IS NULL` or a stale value (prompt revision),
 ///   - AND are not superseded.
 ///
-/// When `last_dream_at` is `None` (project has never been dreamed) the
-/// update-time filter is effectively epoch, i.e. every live row matches.
+/// Without `last_dream_at`, the version stamp still skips successful work.
 ///
 /// `current_condenser_version` scopes the "stale" check — rows whose
-/// `condenser_version` equals the current stamp are skipped even if they
-/// are newer than `last_dream_at`, because re-walking them produces no
-/// work. Passing `None` disables the condenser-version guard so the caller
+/// `condenser_version` equals the current stamp are skipped unless edited
+/// since `last_dream_at`. Passing `None` disables the version guard so the caller
 /// gets every live row (`--full` flag semantics).
 #[allow(dead_code)]
 pub fn list_dream_candidates(
@@ -1541,10 +1539,8 @@ pub fn list_dream_candidates(
         None => sql.push_str(" AND project IS NULL"),
     }
 
-    // Incremental gate: either the row is newer than the last dream cutoff,
-    // or its condenser_version is stale (or unstamped). Both branches fall
-    // through when `last_dream_at` is None (never dreamed) or when no
-    // current condenser version is provided (--full path).
+    // Incremental gate: new/edited rows or stale/unstamped processing.
+    // With neither cutoff nor version (--full), return every live row.
     match (last_dream_at, current_condenser_version) {
         (Some(last), Some(cur)) => {
             sql.push_str(&format!(
@@ -1559,7 +1555,14 @@ pub fn list_dream_candidates(
             sql.push_str(&format!(" AND updated_at > ?{}", bind.len() + 1));
             bind.push(Box::new(last.to_string()));
         }
-        (None, _) => {
+        (None, Some(cur)) => {
+            sql.push_str(&format!(
+                " AND (condenser_version IS NULL OR condenser_version != ?{})",
+                bind.len() + 1
+            ));
+            bind.push(Box::new(cur.to_string()));
+        }
+        (None, None) => {
             // No cutoff — every live row in this project is a candidate.
         }
     }
@@ -1578,6 +1581,36 @@ pub fn list_dream_candidates(
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Record successful Dream processing (including keep), or clear it for retry.
+/// No timestamp bump: processing is not new evidence. Repeating a stamp is a no-op.
+#[allow(dead_code)]
+pub fn set_dream_processed(
+    conn: &Connection,
+    id: &str,
+    version: Option<&str>,
+) -> Result<(), MemoryError> {
+    let memory = get_memory_by_id(conn, id)?;
+    if memory.condenser_version.as_deref() == version {
+        return Ok(());
+    }
+    crate::concepts::mutate(
+        conn,
+        id,
+        "dream_processed",
+        Some("memory-dream"),
+        None,
+        false,
+        |_| {
+            conn.execute(
+                "UPDATE memories SET condenser_version = ?1 WHERE id = ?2",
+                params![version, id],
+            )?;
+            Ok(())
+        },
+    )?;
+    Ok(())
 }
 
 // -- Tests ------------------------------------------------------------------

@@ -6,8 +6,7 @@
 //!
 //!   1. The single token `KEEP_UNCHANGED` — no change needed.
 //!   2. The single word `forget` — noise; delete the memory.
-//!   3. A rewritten condensed body — headline + bullets, strictly
-//!      shorter than the input.
+//!   3. A rewritten body — headline + bullets, at most 150% of baseline.
 //!
 //! This module parses that response and returns a [`Decision`] that the
 //! orchestrator maps onto DB side effects. Deliberately small — all the
@@ -21,10 +20,8 @@
 //!   line, but any trailing content after the literal marker is rejected
 //!   as malformed (the model broke the "exactly one of these forms"
 //!   contract and we refuse to guess intent).
-//! * Anything else is treated as a rewritten body. It must not grow
-//!   meaningfully vs. the baseline input — a small char-count slack
-//!   ([`REWRITE_CHAR_SLACK`]) is allowed so clarity can trump pure
-//!   brevity — and must not match a refusal marker.
+//! * Anything else is treated as a rewritten body. Source-supported
+//!   enrichment may grow by up to 50%, and must not match a refusal marker.
 
 use thiserror::Error;
 
@@ -37,16 +34,11 @@ use crate::inference::{Inference, InferenceError};
 /// Mirrors the value used by the `memory` crate's CLI surface.
 const GLOBAL_PROJECT_IDENT: &str = "__global__";
 
-/// Extra characters a rewrite is allowed to exceed the baseline by before
-/// being rejected as "too long". The intent: clarity trumps brevity when
-/// a handful of characters buys a self-contained headline or preserves a
-/// path/date verbatim. Measured in Unicode scalar values (chars), matching
-/// the length comparison below.
-///
-/// Sized so a stubborn model can't grow the corpus meaningfully over
-/// many passes when combined with the `content_raw` anchoring in
-/// [`run_per_memory`].
-pub const REWRITE_CHAR_SLACK: usize = 16;
+/// Unicode character ceiling for source-supported single-memory enrichment.
+pub fn rewrite_char_limit(baseline: &str) -> usize {
+    let chars = baseline.trim().chars().count();
+    chars.saturating_add(chars / 2)
+}
 
 /// Parsed per-memory decision from a model response.
 ///
@@ -69,12 +61,12 @@ pub enum CondenseError {
     ParseFailed(String),
 
     #[error(
-        "condensed text exceeds baseline + slack (baseline={raw_len}, condensed={condensed_len}, slack={slack})"
+        "rewritten text exceeds 150% of baseline (baseline={raw_len}, rewritten={condensed_len}, maximum={maximum})"
     )]
     TooLong {
         raw_len: usize,
         condensed_len: usize,
-        slack: usize,
+        maximum: usize,
     },
 
     #[error("model refused the task: {0}")]
@@ -125,11 +117,8 @@ fn detect_refusal(raw: &str) -> Option<&'static str> {
 /// Parse a model response against the three-way contract.
 ///
 /// * `raw_response` is the model's stdout, pre-trim.
-/// * `baseline_input` is the text a rewrite must not meaningfully grow
-///   beyond (callers should pass the original raw body when a prior
-///   condensation has already run — see [`run_per_memory`] — so
-///   repeated dream passes can't chain +[`REWRITE_CHAR_SLACK`] each
-///   time).
+/// * `baseline_input` anchors the 150% ceiling to the original raw body
+///   when present, so repeated passes cannot compound the growth allowance.
 ///
 /// Returns a [`Decision`] on success.
 pub fn parse_response(raw_response: &str, baseline_input: &str) -> Result<Decision, CondenseError> {
@@ -182,20 +171,15 @@ pub fn parse_response(raw_response: &str, baseline_input: &str) -> Result<Decisi
         )));
     }
 
-    // Length gate: the rewrite may exceed the baseline by at most
-    // REWRITE_CHAR_SLACK chars. Clarity (self-contained headline, verbatim
-    // paths/dates) is worth a few extra chars; meaningful growth is not.
-    // The prompt is explicit about this; the orchestrator enforces it so a
-    // stubborn model can't grow the corpus. Callers anchor against the
-    // original raw body (when available) so this ceiling doesn't drift
-    // across repeated dream passes.
+    // Anchor the percentage ceiling to the original body, not a prior rewrite.
     let condensed_len = body.chars().count();
     let raw_len = baseline_input.trim().chars().count();
-    if condensed_len > raw_len.saturating_add(REWRITE_CHAR_SLACK) {
+    let maximum = rewrite_char_limit(baseline_input);
+    if condensed_len > maximum {
         return Err(CondenseError::TooLong {
             raw_len,
             condensed_len,
-            slack: REWRITE_CHAR_SLACK,
+            maximum,
         });
     }
 
@@ -234,14 +218,18 @@ pub fn run_per_memory_with_context(
         content: &source.content,
         okf_context,
     };
-    let prompt = build_condense_prompt(&inputs);
-    let response = inference.generate(&prompt, MAX_OUTPUT_TOKENS)?;
-    // Anchor the length gate against the ORIGINAL raw body when it exists
-    // (i.e. this memory has been condensed before) so re-condensations
-    // can't chain +REWRITE_CHAR_SLACK each pass. Falls back to the current
-    // content for first-time dreams where content_raw is still NULL.
     let baseline = source.content_raw.as_deref().unwrap_or(&source.content);
-    parse_response(&response, baseline)
+    let prompt = format!(
+        "{}\nLength hint: at most {} Unicode characters (150% of original baseline).",
+        build_condense_prompt(&inputs),
+        rewrite_char_limit(baseline)
+    );
+    let response = inference.generate(&prompt, MAX_OUTPUT_TOKENS)?;
+    let decision = parse_response(&response, baseline)?;
+    if matches!(&decision, Decision::Rewrite { text } if text == source.content.trim()) {
+        return Ok(Decision::Skip);
+    }
+    Ok(decision)
 }
 
 #[cfg(test)]
@@ -339,36 +327,36 @@ mod tests {
             CondenseError::TooLong {
                 raw_len,
                 condensed_len,
-                slack,
+                maximum,
             } => {
                 assert_eq!(raw_len, raw.chars().count());
-                assert_eq!(slack, REWRITE_CHAR_SLACK);
-                assert!(condensed_len > raw_len + slack);
+                assert_eq!(maximum, raw_len + raw_len / 2);
+                assert!(condensed_len > maximum);
             }
             other => panic!("expected TooLong, got {other:?}"),
         }
     }
 
     #[test]
-    fn rewrite_within_slack_is_accepted() {
-        // Baseline and rewrite are the same length: the old strict-
-        // shorter rule would reject, the new slack-aware rule accepts
-        // because clarity can legitimately need a few extra chars.
-        let raw = "user prefers tabs over spaces for indentation";
-        let resp = "user prefers tabs over spaces for indentation";
-        assert_eq!(raw.chars().count(), resp.chars().count());
-        let out = parse_response(resp, raw).expect("equal-length rewrite allowed by slack");
-        assert!(matches!(out, Decision::Rewrite { .. }));
+    fn source_supported_enrichment_can_grow_by_fifty_percent() {
+        let source = "Pin cu128: PyTorch nightly cu130 falls back to cu128 on sm_120.";
+        let enriched =
+            "Pin cu128 on sm_120 to avoid fallback: PyTorch nightly cu130 falls back to cu128.";
+        assert!(enriched.len() > source.len());
+        assert!(matches!(
+            parse_response(enriched, source).unwrap(),
+            Decision::Rewrite { .. }
+        ));
     }
 
     #[test]
-    fn rewrite_just_over_slack_is_rejected() {
-        // One char past the slack ceiling must still be rejected so the
-        // corpus can't drift indefinitely.
-        let raw = "abcdefghij"; // 10 chars
-        let over_by_one: String = std::iter::repeat_n('x', 10 + REWRITE_CHAR_SLACK + 1).collect();
-        let err = parse_response(&over_by_one, raw).unwrap_err();
-        assert!(matches!(err, CondenseError::TooLong { .. }));
+    fn fifty_percent_ceiling_counts_unicode_and_rounds_down() {
+        let baseline = "é".repeat(11);
+        assert!(parse_response(&"é".repeat(16), &baseline).is_ok());
+        assert!(matches!(
+            parse_response(&"é".repeat(17), &baseline),
+            Err(CondenseError::TooLong { maximum: 16, .. })
+        ));
     }
 
     #[test]

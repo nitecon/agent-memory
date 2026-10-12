@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.13.4 - 2026-10-12
+
+- Allow source-supported single-memory enrichment up to 150% of the original
+  baseline; cap merged output at 75% of combined source lengths.
+- Stamp successful keep decisions as processed and skip unchanged successful
+  work on ordinary passes, while keeping failures retryable and older memories
+  available as context and merge/removal targets for new evidence.
+- Encourage useful combinations through review instructions and per-run hints;
+  preserve merge source provenance and point sources at live replacements.
+- Avoid redundant condensation of review replacements and unchanged replies.
+- Validate `gpt-6-luna` through the existing Codex headless integration, including
+  complete 70-memory decisions over stdin beyond Linux's per-argument limit.
+  Document the minimal SRE configuration and read-only cutover validation.
+
 ## v1.13.3 - 2026-09-06
 
 - Fixed `memory hook` waiting indefinitely for terminal input. Terminal and

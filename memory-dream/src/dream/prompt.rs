@@ -62,10 +62,9 @@ no markdown fences, no commentary:
      - atomic fact 2
      - ...
 
-   The rewritten text MUST NOT meaningfully grow the input. Aim to be
-   shorter; a handful of extra characters is tolerated only when they
-   buy real clarity (a self-contained headline, a preserved path or
-   date). Never pad, re-phrase for style, or add commentary.
+   Prefer concise text. Useful, source-supported context may grow the
+   memory by at most 50% of its original baseline (150% maximum).
+   Never pad, re-phrase for style, or add invented context or commentary.
    The headline MUST stand alone — do not put load-bearing context
    in the bullets that the headline fails to preview.
 
@@ -160,6 +159,7 @@ fn tag_display(tags: Option<&str>) -> &str {
 pub fn prompt_hash() -> String {
     let mut hasher = Sha256::new();
     hasher.update(CONDENSE_PROMPT_TEMPLATE.as_bytes());
+    hasher.update(super::project_review::prompt::policy_hash_input().as_bytes());
     let full = hex::encode(hasher.finalize());
     full.chars().take(8).collect()
 }
@@ -280,19 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn prompt_requires_non_growing_rewrite() {
-        // The parser allows a small char-count slack so clarity can trump
-        // brevity, but the prompt must still push the model toward "don't
-        // grow the memory" and explain what narrow slack is tolerated.
+    fn prompt_allows_bounded_source_supported_growth() {
         let p = build_condense_prompt(&inputs_for("x"));
-        assert!(
-            p.contains("MUST NOT meaningfully grow the input"),
-            "rewrite must be told not to grow the memory"
-        );
-        assert!(
-            p.contains("Aim to be\n   shorter"),
-            "rewrite must still prefer shorter output"
-        );
+        assert!(p.contains("source-supported context"));
+        assert!(p.contains("150% maximum"));
+        assert!(!p.contains("MUST NOT meaningfully grow"));
     }
 
     #[test]
