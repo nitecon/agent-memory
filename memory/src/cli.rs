@@ -2996,15 +2996,25 @@ fn apply_pull_plans(
                     if plan.remote.okf.is_some() {
                         apply_remote_okf(conn, config, project, &plan.remote, Some(local_id))?;
                     } else {
-                        let tags = plan.remote.tags.clone();
-                        queries::update_content(
+                        // An omitted wire tag list is empty, while legacy local
+                        // rows may store NULL. Preserve that equivalent no-tags
+                        // state so reconciliation does not manufacture an edit.
+                        let local = queries::get_memory_by_id(conn, local_id)?;
+                        let tags = if plan.remote.tags.is_empty() && local.tags.is_none() {
+                            None
+                        } else {
+                            Some(plan.remote.tags.as_slice())
+                        };
+                        let changed = queries::update_content(
                             conn,
                             local_id,
                             &plan.remote.content,
-                            Some(&tags),
+                            tags,
                             Some(&plan.remote.memory_type),
                         )?;
-                        reembed_memory(conn, config, local_id, &plan.remote.content)?;
+                        if changed {
+                            reembed_memory(conn, config, local_id, &plan.remote.content)?;
+                        }
                     }
                     upsert_pull_sync(conn, project, local_id, &plan.remote, false, None)?;
                 }

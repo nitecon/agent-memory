@@ -43,6 +43,16 @@ Single rewrites allow at most 50% growth over the original baseline; merged
 output allows at most 75% of the combined source lengths. Limits count Unicode
 characters and round down. Model instructions forbid unsupported additions.
 
+On 2026-10-13, persistent SQLite regressions also verify that failed reviews
+retain completed condensation across database reopening. A partial processing
+stamp ending in `:review-pending` keeps review retryable while skipping repeated
+per-memory inference and writes. Real condensation/dedup/gateway-write failures
+remain unstamped. Edits, model/policy changes and explicit refresh invalidate
+partial progress; processed memories remain eligible replacement/removal targets.
+Loopback gateway tests verify successful push and same-content CLI pull
+reconciliation without changing memory revisions or edit timestamps, and verify
+that rejected pushes remain failures and retry after reopening.
+
 ## SRE cutover
 
 SRE owns the scheduled host configuration and adapter deployment. After
@@ -78,6 +88,12 @@ After the authorized host cutover, observe two scheduled passes. Unchanged
 successful processing should disappear from ordinary work; failures should
 remain retryable, and fresh related evidence should still permit consolidation.
 Keep the SRE tracker open until these observations are complete.
+
+After upgrading from a version that erased successful processing stamps, rows
+with those missing stamps need one successful corrected pass to record progress.
+Then verify that review failures alone produce no repeat per-memory rewrites on
+unchanged successful rows. Preserve actual gateway failures as separate retries;
+do not infer historical success from a missing stamp.
 
 To rerun the isolated live validation from this repository:
 

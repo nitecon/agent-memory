@@ -179,6 +179,10 @@ pub fn run(
         let project_label = project.as_deref().unwrap_or("(null)");
         let cutoff = resolve_incremental_cutoff(conn, project.as_deref(), cfg)?;
         let current_stamp = prompt::condenser_version_stamp(cfg.model_name);
+        // A failed review must retry, but must not discard successful Stage A/B
+        // work. This partial stamp remains an ordinary review candidate because
+        // it differs from current_stamp; only its condensation is complete.
+        let review_pending_stamp = format!("{current_stamp}:review-pending");
 
         let candidates = q::list_dream_candidates(
             conn,
@@ -222,6 +226,16 @@ pub fn run(
                 || (m.condenser_version.as_deref() == Some(current_stamp.as_str())
                     && cutoff.as_ref().is_none_or(|last| &m.updated_at <= last))
         });
+        let mut condensed_ids: HashSet<String> = review_context
+            .iter()
+            .filter(|m| {
+                !cfg.full
+                    && (m.condenser_version.as_deref() == Some(current_stamp.as_str())
+                        || m.condenser_version.as_deref() == Some(review_pending_stamp.as_str()))
+                    && cutoff.as_ref().is_none_or(|last| &m.updated_at <= last)
+            })
+            .map(|m| m.id.clone())
+            .collect();
         let mut project_stats = ProjectStats::default();
 
         // Stage 0 — project-level cross-memory review. Primary
@@ -244,41 +258,51 @@ pub fn run(
         let pending_survivors: Vec<_> = stage0
             .survivors
             .iter()
-            .filter(|m| pending_ids.contains(&m.id))
+            .filter(|m| pending_ids.contains(&m.id) && !condensed_ids.contains(&m.id))
             .cloned()
             .collect();
+        let mut dedup_retry_ids = HashSet::new();
         let survivors = run_stage_a_dedup(
             conn,
             cfg,
             &pending_survivors,
             &stage0.contradiction_ids,
             &mut project_stats,
-            &mut stage0.retry_ids,
+            &mut dedup_retry_ids,
         );
+        stage0.retry_ids.extend(dedup_retry_ids.iter().cloned());
+        for id in &dedup_retry_ids {
+            condensed_ids.remove(id);
+        }
 
         // Stage B — per-memory condense via the three-way contract.
         for mem in &survivors {
             let failed_before = project_stats.failed;
             run_stage_b_condense(conn, inference, cfg, mem, &mut project_stats);
-            if cfg.mode == DreamMode::Apply && q::get_memory_by_id(conn, &mem.id).is_ok() {
-                let successful =
-                    project_stats.failed == failed_before && !stage0.retry_ids.contains(&mem.id);
-                if let Err(e) = q::set_dream_processed(
-                    conn,
-                    &mem.id,
-                    successful.then_some(current_stamp.as_str()),
-                ) {
-                    project_stats.failed += 1;
-                    tracing::warn!(id = %mem.id, error = %e, "failed to record Dream processing outcome");
-                }
+            if project_stats.failed == failed_before && !dedup_retry_ids.contains(&mem.id) {
+                condensed_ids.insert(mem.id.clone());
+            } else {
+                condensed_ids.remove(&mem.id);
             }
         }
-        // Review replacements are already curated and stamped. Clear only
-        // failed outcomes, including failures against older context targets.
+        // Review-only retries retain their successful condensation. A genuine
+        // condensation/dedup/gateway-write failure remains unstamped. Newly
+        // materialized review replacements are already stamped; failed ones
+        // lack prior completed condensation and remain wholly retryable.
         if cfg.mode == DreamMode::Apply {
-            for id in &stage0.retry_ids {
-                if q::get_memory_by_id(conn, id).is_ok() {
-                    q::set_dream_processed(conn, id, None)?;
+            for id in pending_ids.union(&stage0.retry_ids) {
+                if q::get_memory_by_id(conn, id).is_ok_and(|m| m.superseded_by.is_none()) {
+                    let version = if !condensed_ids.contains(id) {
+                        None
+                    } else if stage0.retry_ids.contains(id) {
+                        Some(review_pending_stamp.as_str())
+                    } else {
+                        Some(current_stamp.as_str())
+                    };
+                    if let Err(e) = q::set_dream_processed(conn, id, version) {
+                        project_stats.failed += 1;
+                        tracing::warn!(id = %id, error = %e, "failed to record Dream processing outcome");
+                    }
                 }
             }
         }

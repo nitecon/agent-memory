@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.13.6 - 2026-10-13
+
+- Retain successful condensation when project review fails. Ordinary passes
+  retry the pending review without re-condensing unchanged successful memories;
+  edits, model/policy changes and explicit refresh still invalidate that work.
+- Preserve processing freshness during same-content gateway pulls, including
+  equivalent absent/empty tags, without redundant re-embedding or edit timestamps.
+- Add persistent-storage regressions for review retries, successful gateway
+  reconciliation, rejected gateway writes and valid replacement/removal.
+- Disable automatic updates in CLI fixtures so regression checks exercise
+  the freshly built release binaries.
+
 ## v1.13.5 - 2026-10-12
 
 - Correct the Codex Luna cron command with `--skip-git-repo-check` so inference

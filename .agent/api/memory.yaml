@@ -160,6 +160,8 @@ content:
           - Review replacements are already curated and do not undergo redundant per-memory condensation. Explicit refresh still re-evaluates existing memories.
           - Run-time review hints identify pending work, encourage useful combinations, and request complete decisions including unchanged context.
           - condenser_version uses the backend-qualified inference identity plus the condensation and project-review policy hash.
+          - A condenser_version ending in ':review-pending' records completed condensation with a failed review. Ordinary passes retry review without repeating dedup/condensation of unchanged rows; edits, model/policy changes and explicit refresh invalidate this partial progress. Actual dedup/condensation/gateway-write failures remain unstamped.
+          - Same-content legacy gateway pulls preserve absent local tags when the wire tag list is empty, and avoid re-embedding or advancing updated_at on semantic no-ops. Sync revisions and cursors still reconcile normally.
           - Dream-created relationship producer and revision actor are both memory-dream.
           - A terminal summary with failed greater than zero is followed by a non-zero process exit.
           - Each project-review inference or parse fallback emits review_failed and increments failed while conservatively passing the affected memories onward.

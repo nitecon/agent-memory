@@ -46,6 +46,7 @@ fn store_memory(data_dir: &std::path::Path, memory: &str, bin: &std::path::Path)
     let out = Command::new(bin)
         .args(["store", memory, "-m", "user", "-t", "probe"])
         .env("AGENT_MEMORY_DIR", data_dir)
+        .env("AGENT_MEMORY_NO_UPDATE", "1")
         .env("AGENT_MEMORY_GATEWAY_AUTO_SYNC", "false")
         .output()
         .expect("spawn memory store");
@@ -73,6 +74,7 @@ fn row_count(data_dir: &std::path::Path, bin: &std::path::Path) -> usize {
     let out = Command::new(bin)
         .args(["list", "-k", "100"])
         .env("AGENT_MEMORY_DIR", data_dir)
+        .env("AGENT_MEMORY_NO_UPDATE", "1")
         .env("AGENT_MEMORY_GATEWAY_AUTO_SYNC", "false")
         .output()
         .expect("spawn memory list");
@@ -140,6 +142,7 @@ fn run_probe() -> Result<(), String> {
             "echo '{prompt}'",
         ])
         .env("AGENT_MEMORY_DIR", data_dir.path())
+        .env("AGENT_MEMORY_NO_UPDATE", "1")
         .env("AGENT_MEMORY_GATEWAY_AUTO_SYNC", "false")
         .output()
         .expect("spawn memory-dream test");

@@ -894,6 +894,7 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 - **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
 - **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.
 - **Truthful review fallback**: every project-review inference or parse failure emits `review_failed`, increments the pass failure count, and still conservatively passes the affected memories to later stages.
+- **Independent processing progress**: successful per-memory condensation survives a failed project review. Ordinary retries revisit the pending review without repeating condensation; real condensation/dedup/gateway-write failures remain retryable. Same-content gateway reconciliation preserves freshness.
 - **Exact review coverage**: structured review output must contain exactly the real memory IDs in its batch. Missing or invented keys reject the whole response instead of turning constrained-but-incompetent JSON into a silent all-keep success.
 - **Idempotent gateway deletion**: a gateway response proving that a linked tombstone target is already absent is accepted as the desired end state; other conflicts and rejections remain hard failures.
 - **Headless prompt isolation**: Dream subprocesses disable automatic memory and agent-tools hooks, preventing recursive retrieval from being prepended to the curation prompt.
