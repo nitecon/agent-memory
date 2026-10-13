@@ -74,6 +74,8 @@ pub fn build_project_review_prompt(project: Option<&str>, memories: &[Memory]) -
 
     prompt.push_str("<<<END_MEMORIES>>>\n\n");
     let keys: Vec<_> = (1..=memories.len()).map(|n| format!("r{n}")).collect();
+    // Response transport hints do not change curation policy or invalidate
+    // completed condensation/review stamps from the preceding release.
     prompt.push_str(&format!("Allowed decision keys (cover each exactly once): {}. Use these review_key values for decisions and target_id; never copy or reconstruct UUIDs. Encode content and reasons as JSON strings with escaped quotes and newlines.\nRESPONSE:", keys.join(", ")));
     prompt
 }
@@ -97,9 +99,6 @@ markdown code fences, no commentary before or after. The exact shape:
     ...
   }
 }
-
-Decision keys and target_id MUST use the exact review_key values printed in INPUT
-(r1, r2, ...). Include EVERY key exactly once. Do not use UUIDs or example IDs.
 
 Every decision value is one of:
 

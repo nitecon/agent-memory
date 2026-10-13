@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.13.7 - 2026-10-13
+## v1.13.8 - 2026-10-13
 
 - Recover confirmed absent gateway counterparts and safely rebase mismatched
   revisions against acknowledged content or exact older retained history,
@@ -10,6 +10,8 @@
   references use the authorized wire type while retaining local/OKF semantics.
 - Persist and publish review replacements before retiring sources or applying
   dependent merges. Isolate failed decisions and retain their source memories.
+- Keep the existing curation policy hash for response transport changes so
+  completed and review-pending processing survive upgrades without re-condensing.
 - Use exact batch-local review keys to reduce UUID copying errors without fuzzy
   matching or relaxing fail-closed coverage, JSON validation, model or size limits.
 - Emit structured records for every counted review, deduplication and processing

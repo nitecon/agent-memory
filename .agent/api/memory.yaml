@@ -168,7 +168,7 @@ content:
           - Dream-created relationship producer and revision actor are both memory-dream.
           - A terminal summary with failed greater than zero is followed by a non-zero process exit.
           - Each project-review inference or parse fallback emits review_failed and increments failed while conservatively passing the affected memories onward.
-          - Structured project-review output must cover every memory in the batch exactly using exact batch-local keys (r1, r2, etc.) or canonical IDs; incomplete, unknown-key and duplicate-alias responses fail closed. UUIDs are never fuzzy-matched.
+          - Response-key transport instructions preserve the preceding curation policy hash, so completed and review-pending stamps survive upgrades. Structured project-review output must cover every memory in the batch exactly using exact batch-local keys (r1, r2, etc.) or canonical IDs; incomplete, unknown-key and duplicate-alias responses fail closed. UUIDs are never fuzzy-matched.
           - Stage B accepts KEEP_UNCHANGED as its no-op token and rejects the legacy skip token so a stuck model cannot report total non-response as successful curation.
       - name: memory okf
         purpose: Operate on SQLite-canonical OKF concepts through virtual Markdown document and bundle handlers.

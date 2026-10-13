@@ -56,6 +56,51 @@ fn revision(conn: &Connection, id: &str) -> i64 {
 }
 
 #[test]
+fn review_transport_keys_preserve_completed_and_review_pending_upgrade_stamps() {
+    // The preceding release's curation policy. Response transport changes must
+    // preserve these stamps; a deliberate curation policy change may revise it.
+    const PREVIOUS_STAMP: &str = "headless/codex/gpt-6-luna:31e6a11c";
+    for pending_review in [false, true] {
+        let mut conn = open_database(std::path::Path::new(":memory:")).unwrap();
+        insert(
+            &conn,
+            "upgrade",
+            "Prefer tabs because indentation width is configurable.",
+        );
+        let stamp = if pending_review {
+            format!("{PREVIOUS_STAMP}:review-pending")
+        } else {
+            PREVIOUS_STAMP.into()
+        };
+        q::set_dream_processed(&conn, "upgrade", Some(&stamp)).unwrap();
+        let inf = model(|prompt: &str| {
+            assert!(
+                prompt.contains("Memory count:"),
+                "completed condensation must survive upgrade"
+            );
+            keep_review(prompt)
+        });
+        let cache = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Apply, "headless/codex/gpt-6-luna", &cache);
+        let result = run(&mut conn, &inf, &cfg).unwrap();
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.total_walked, usize::from(pending_review));
+        assert_eq!(
+            inf.prompts.lock().unwrap().len(),
+            usize::from(pending_review)
+        );
+        assert_eq!(
+            q::get_memory_by_id(&conn, "upgrade")
+                .unwrap()
+                .condenser_version
+                .as_deref(),
+            Some(PREVIOUS_STAMP)
+        );
+        assert_eq!(run(&mut conn, &inf, &cfg).unwrap().total_walked, 0);
+    }
+}
+
+#[test]
 fn successful_keep_and_enrichment_skip_two_ordinary_passes_without_churn() {
     let mut conn = open_database(std::path::Path::new(":memory:")).unwrap();
     insert(
