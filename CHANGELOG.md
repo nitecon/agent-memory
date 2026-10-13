@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.13.5 - 2026-10-12
+
+- Correct the Codex Luna cron command with `--skip-git-repo-check` so inference
+  can run from the scheduled user's home outside a Git repository. Require
+  validation from the scheduler's actual working directory, PATH and auth;
+  verify both live stdin contracts there without production writes.
+- Align the end-to-end shell-injection probe with the current plain-text
+  rewrite growth limit, retaining its sentinel-file and no-write checks.
+
 ## v1.13.4 - 2026-10-12
 
 - Allow source-supported single-memory enrichment up to 150% of the original

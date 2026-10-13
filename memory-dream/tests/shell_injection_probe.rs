@@ -153,25 +153,18 @@ fn run_probe() -> Result<(), String> {
         "memory-dream test exited non-zero. stdout={stdout} stderr={stderr}"
     );
 
-    // Invariant #1: the `test_failed` surface fires as expected. The
-    // `echo '{prompt}'` override produces a plain-text dump of the prompt,
-    // which the condenser's JSON parser correctly rejects — that's the
-    // expected shape for this test. The stdout MUST contain a hint from
-    // the parse-failure path that includes the prompt text (so we know
-    // echo received the malicious payload and surfaced it faithfully
-    // rather than, say, being word-split by a shell).
-    //
-    // The condense layer truncates the parse-error detail at 120 chars,
-    // so we assert on the `test_failed` status token and one of the
-    // prompt-framing tokens that must be present regardless of truncation.
+    // Invariant #1: echo returns the entire prompt as a plain-text rewrite,
+    // which exceeds the short payload's 150% growth budget. Require that
+    // specific rejection, rather than accepting an arbitrary backend failure.
+    // Exact prompt transport is covered by HeadlessInference's unit tests;
+    // this probe checks the full CLI path and filesystem/DB invariants below.
     assert!(
         stdout.contains("status=\"test_failed\""),
         "expected test_failed result; got: {stdout}"
     );
     assert!(
-        stdout.contains("condensation assistant") || stdout.contains("condensed"),
-        "expected echo to have surfaced the prompt text or condenser envelope; \
-         got: {stdout}"
+        stdout.contains("rewritten text exceeds 150% of baseline"),
+        "expected echoed prompt to exceed the rewrite budget; got: {stdout}"
     );
 
     // Invariant #2 — the hard one: the sentinel file must NOT exist.
