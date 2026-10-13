@@ -20,6 +20,15 @@ provider `openai`. The following opt-in tests passed against that model:
 - The review applied its decisions in dry-run mode to an isolated in-memory
   fixture. The immutable revision count stayed unchanged; no gateway was used.
 
+On 2026-10-13, both tests also passed from `/home/whattingh`, confirmed outside
+a Git repository, using the scheduled wrapper's PATH
+(`/home/whattingh/.local/bin:/home/whattingh/bin:/usr/local/bin:/usr/bin:/bin`)
+and the same user's saved Codex authentication. With `--skip-git-repo-check`,
+Codex 0.162.1 returned all 70 review decisions from the 160,337-byte stdin prompt
+and satisfied the single-memory contract, without production database or
+gateway writes. The original repository-only validation missed this scheduler
+requirement.
+
 The production inference identity for this command is
 `headless/codex/gpt-6-luna`. Dream appends its policy hash to the processing
 stamp. Children receive `AGENT_MEMORY_HOOK=off`, `AGENT_TOOLS_HOOK=off`, and
@@ -46,12 +55,20 @@ mode = "headless"
 
 [headless]
 model = "gpt-6-luna"
-command = """codex exec --ignore-user-config --ephemeral --sandbox read-only -c project_doc_max_bytes=0 -c 'model_reasoning_effort="low"' -c 'developer_instructions="Classify only the supplied memories. Never call tools or inspect files. Return only the requested output."' --model {model} - {prompt_stdin}"""
+command = """codex exec --skip-git-repo-check --ignore-user-config --ephemeral --sandbox read-only -c project_doc_max_bytes=0 -c 'model_reasoning_effort="low"' -c 'developer_instructions="Classify only the supplied memories. Never call tools or inspect files. Return only the requested output."' --model {model} - {prompt_stdin}"""
 timeout_ms = 600000
 ```
 
-Before changing the schedule, verify the scheduled user's Codex authentication
-and PATH, then preview with `memory-dream --dry-run --backend headless
+`--skip-git-repo-check` is required when the scheduler starts outside a Git
+repository, such as the user's home directory. Without it, Codex rejects the
+command before inference. This flag permits that working directory while the
+read-only sandbox and no-tool instructions remain in effect; see the
+[official OpenAI documentation](https://learn.chatgpt.com/docs/non-interactive-mode#git-repository-required).
+
+Before changing the schedule, verify the scheduled user's Codex authentication,
+PATH, and actual working directory (`pwd`). Run the preview from that directory
+with the scheduler's PATH and authentication, rather than from this repository:
+`memory-dream --dry-run --backend headless
 --headless-model gpt-6-luna --command-override '<command above>'`. Use the full
 command string from the TOML snippet, without TOML delimiters. Verify complete
 review decisions and truthful failures on representative host memories. A model
@@ -67,6 +84,15 @@ To rerun the isolated live validation from this repository:
 ```bash
 cargo test -p memory-dream --test luna_validation -- --ignored --nocapture
 ```
+
+To validate a non-repository scheduler directory, first build the same test
+binary with `cargo test -p memory-dream --test luna_validation --no-run`.
+Then, as the scheduled user with its PATH and authentication, change to the
+scheduler's actual working directory and invoke the printed executable by its
+absolute path with `--ignored --nocapture`. Record `pwd` alongside the result.
+The single-memory test performs inference only; the review uses disposable
+in-memory fixture rows and applies decisions in dry-run mode, without production
+database or gateway writes.
 
 These tests require authenticated model access and incur model usage. They do
 not run in ordinary CI. Their synthetic evidence does not establish that Luna

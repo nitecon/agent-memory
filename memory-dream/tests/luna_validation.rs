@@ -3,7 +3,7 @@ use agent_memory::db::{models::Memory, open_database};
 use memory_dream::dream::{condense, project_review};
 use memory_dream::inference::HeadlessInference;
 
-const COMMAND: &str = "codex exec --ignore-user-config --ephemeral --sandbox read-only -c project_doc_max_bytes=0 -c 'model_reasoning_effort=\"low\"' -c 'developer_instructions=\"Classify only the supplied memories. Never call tools or inspect files. Return only the requested output.\"' --model {model} - {prompt_stdin}";
+const COMMAND: &str = "codex exec --skip-git-repo-check --ignore-user-config --ephemeral --sandbox read-only -c project_doc_max_bytes=0 -c 'model_reasoning_effort=\"low\"' -c 'developer_instructions=\"Classify only the supplied memories. Never call tools or inspect files. Return only the requested output.\"' --model {model} - {prompt_stdin}";
 
 #[test]
 #[ignore = "Requires authenticated Codex access to gpt-6-luna; incurs model usage"]

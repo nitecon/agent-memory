@@ -76,6 +76,7 @@ content:
         - Scheduled passes are unlimited by default so every eligible memory is considered; use memory-dream --limit N only when deliberately splitting coverage across multiple passes.
         - Treat dream_skipped reason=already_running as a healthy no-op and any non-zero process exit as a failed pass.
         - Ensure scheduled environments can resolve the configured headless binary; Dream suppresses automatic memory and agent-tools hooks in its child process.
+        - For Codex headless commands, include --skip-git-repo-check when the scheduler starts outside a Git repository; validate from the actual scheduler cwd with its PATH and authentication. See docs/dream-luna.md.
     - name: Clear a completed handoff
       steps:
         - Run memory working clear when the project thread completes or the user directs cleanup.
