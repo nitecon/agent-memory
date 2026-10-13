@@ -2063,6 +2063,8 @@ fn run_auto_push(
     project: &str,
     batch_size: usize,
 ) -> Result<AutoPushSummary, MemoryError> {
+    let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    crate::gateway_sync::ensure_gateway_identity(conn, &gateway, true)?;
     let candidates =
         build_push_candidates_with_okf(conn, project, config.gateway.okf_sync_enabled())?;
     let pending: Vec<&PushCandidate> = candidates
@@ -2075,11 +2077,9 @@ fn run_auto_push(
     let mut counts = PushResponseCounts::default();
 
     if !pending.is_empty() {
-        let gateway =
-            MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
         for batch in push_batches(&pending, batch_size) {
             let (request, hashes) = build_push_request(project, batch);
-            let response = gateway.push_memories(&request).map_err(map_gateway_error)?;
+            let response = crate::gateway_sync::push_reconciled(conn, &gateway, &request)?;
             apply_push_response(conn, project, &response, &hashes)?;
             for result in &response.results {
                 counts.record(&result.action);
@@ -2100,6 +2100,8 @@ fn run_auto_pull(
     config: &Config,
     project: &str,
 ) -> Result<AutoPullSummary, MemoryError> {
+    let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    crate::gateway_sync::ensure_gateway_identity(conn, &gateway, true)?;
     let state = queries::get_project_gateway_sync_state(conn, project)?;
     let request = PullMemoriesRequest {
         project: project.to_string(),
@@ -2108,10 +2110,7 @@ fn run_auto_pull(
         known_memories: Vec::new(),
         limit: Some(100),
     };
-    let response = MemoryGatewayClient::from_config(&config.gateway)
-        .map_err(map_gateway_error)?
-        .pull_memories(&request)
-        .map_err(map_gateway_error)?;
+    let response = gateway.pull_memories(&request).map_err(map_gateway_error)?;
     response.validate_project_scope().map_err(|err| {
         MemoryError::Config(format!(
             "gateway pull response failed scope validation: {err}"
@@ -2231,6 +2230,9 @@ fn run_push_project(
     status_only: bool,
     batch_size: usize,
 ) -> Result<PushProjectSummary, MemoryError> {
+    if let Some(gateway) = gateway {
+        crate::gateway_sync::ensure_gateway_identity(conn, gateway, !status_only)?;
+    }
     let candidates = build_push_candidates_with_okf(
         conn,
         project,
@@ -2277,7 +2279,7 @@ fn run_push_project(
             print_push_batch(batch_index + 1, total_batches, batch.len());
         }
         let (request, hashes) = build_push_request(project, batch);
-        let response = gateway.push_memories(&request).map_err(map_gateway_error)?;
+        let response = crate::gateway_sync::push_reconciled(conn, gateway, &request)?;
         apply_push_response(conn, project, &response, &hashes)?;
         print_push_results(&response, &mut counts);
     }
@@ -2389,6 +2391,7 @@ fn build_push_candidates_with_okf(
             None
         };
         let action = match (sync.as_ref(), duplicate_sync) {
+            (Some(record), _) if record.tombstone_deleted => "skipped",
             (Some(record), _) if sync_record_matches_hash(record, &gateway_memory.content_hash) => {
                 "skipped"
             }
@@ -2449,10 +2452,8 @@ fn gateway_memory_from_local(
             memory.id
         )));
     }
-    let memory_type = memory
-        .memory_type
-        .clone()
-        .unwrap_or_else(|| "user".to_string());
+    let memory_type =
+        crate::gateway_sync::wire_memory_type(project, memory.memory_type.as_deref()).to_string();
     let tags = memory.tags.clone().unwrap_or_default();
     let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
     let okf = okf_enabled
@@ -2762,6 +2763,7 @@ fn run_pull(
     all: bool,
 ) -> Result<(), MemoryError> {
     let gateway = MemoryGatewayClient::from_config(&config.gateway).map_err(map_gateway_error)?;
+    crate::gateway_sync::ensure_gateway_identity(conn, &gateway, !status_only)?;
     if all {
         return run_pull_all(conn, config, &gateway, status_only);
     }
@@ -2816,6 +2818,7 @@ fn run_pull_project(
     project: &str,
     status_only: bool,
 ) -> Result<PullProjectSummary, MemoryError> {
+    crate::gateway_sync::ensure_gateway_identity(conn, gateway, !status_only)?;
     let state = queries::get_project_gateway_sync_state(conn, project)?;
     let request = PullMemoriesRequest {
         project: project.to_string(),
@@ -3010,7 +3013,13 @@ fn apply_pull_plans(
                             local_id,
                             &plan.remote.content,
                             tags,
-                            Some(&plan.remote.memory_type),
+                            if project == GLOBAL_PROJECT_IDENT
+                                && plan.remote.memory_type == "global"
+                            {
+                                local.memory_type.as_deref()
+                            } else {
+                                Some(&plan.remote.memory_type)
+                            },
                         )?;
                         if changed {
                             reembed_memory(conn, config, local_id, &plan.remote.content)?;
@@ -3140,7 +3149,12 @@ fn normalize_remote_okf(
     } else {
         "project".to_string()
     });
-    metadata.memory_type = Some(remote.memory_type.clone());
+    if project != GLOBAL_PROJECT_IDENT
+        || remote.memory_type != "global"
+        || metadata.memory_type.is_none()
+    {
+        metadata.memory_type = Some(remote.memory_type.clone());
+    }
     metadata.revision = None;
     if let Some(target) = target {
         metadata.id = Some(target.to_string());
@@ -3210,10 +3224,11 @@ fn reembed_memory(
 
 fn local_memory_hash(memory: &Memory) -> String {
     let tags = memory.tags.clone().unwrap_or_default();
-    let memory_type = memory
-        .memory_type
-        .clone()
-        .unwrap_or_else(|| "user".to_string());
+    let memory_type = crate::gateway_sync::wire_memory_type(
+        memory.project.as_deref().unwrap_or(""),
+        memory.memory_type.as_deref(),
+    )
+    .to_string();
     memory_content_hash(&memory.content, &memory_type, &tags)
 }
 
@@ -4893,6 +4908,49 @@ mod tests {
     }
 
     #[test]
+    fn global_reference_wire_roundtrip_preserves_local_type_and_processing_freshness() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let memory = Memory::new(
+            "Useful global reference".into(),
+            None,
+            Some(GLOBAL_PROJECT_IDENT.into()),
+            None,
+            None,
+            Some("reference".into()),
+        );
+        queries::insert_memory(&conn, &memory).unwrap();
+        queries::set_dream_processed(&conn, &memory.id, Some("completed:stamp")).unwrap();
+        link_cli_test_memory(&conn, &memory, "global-ref", 9);
+        let mut remote =
+            gateway_memory_from_local(&conn, &memory, GLOBAL_PROJECT_IDENT, None, false).unwrap();
+        assert_eq!(remote.memory_type, "global");
+        remote.gateway_memory_id = Some("global-ref".into());
+        remote.server_revision = Some(10);
+        let plan = PullPlan {
+            action: "update",
+            remote: remote.clone(),
+            local_memory_id: Some(memory.id.clone()),
+            local_content_hash: Some(local_memory_hash(&memory)),
+        };
+        assert_eq!(
+            apply_pull_plans(&conn, &cli_test_config(), GLOBAL_PROJECT_IDENT, &[plan]).unwrap(),
+            0
+        );
+        let local = queries::get_memory_by_id(&conn, &memory.id).unwrap();
+        assert_eq!(local.memory_type.as_deref(), Some("reference"));
+        assert_eq!(local.updated_at, memory.updated_at);
+        assert_eq!(local.condenser_version.as_deref(), Some("completed:stamp"));
+        remote.okf = Some(gateway_okf_envelope(&conn, &local).unwrap());
+        let (parsed, _) =
+            normalize_remote_okf(GLOBAL_PROJECT_IDENT, &remote, Some(&local.id)).unwrap();
+        assert_eq!(
+            parsed.concept.agent_memory.unwrap().memory_type.as_deref(),
+            Some("reference")
+        );
+    }
+
+    #[test]
     fn gateway_okf_unknown_envelope_fields_survive_pull_noop_and_push() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         crate::db::run_migrations(&conn).expect("migrate");
@@ -5004,6 +5062,7 @@ mod tests {
                 cli_remote_memory("gw-conflict", "remote update", vec!["conflict"], 4),
             ],
             tombstones: vec![],
+            next_since_revision: None,
             next_cursor: Some("cursor-4".to_string()),
             server_revision: Some(4),
             has_more: false,
@@ -5064,6 +5123,7 @@ mod tests {
                 cli_remote_memory("gw-import", "global only content", vec!["global"], 11),
             ],
             tombstones: vec![],
+            next_since_revision: None,
             next_cursor: None,
             server_revision: Some(11),
             has_more: false,

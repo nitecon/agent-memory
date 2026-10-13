@@ -302,6 +302,16 @@ pub fn run(
                     if let Err(e) = q::set_dream_processed(conn, id, version) {
                         project_stats.failed += 1;
                         tracing::warn!(id = %id, error = %e, "failed to record Dream processing outcome");
+                        println!(
+                            "{}",
+                            render::render_action_result(
+                                "processing_failed",
+                                &[
+                                    ("id", render::short_id(id).to_string()),
+                                    ("reason", e.to_string()),
+                                ]
+                            )
+                        );
                     }
                 }
             }
@@ -590,6 +600,16 @@ fn run_stage_a_dedup(
                 retry_ids.insert(mem.id.clone());
                 tracing::warn!(id = %mem.id, error = %e,
                     "stage A dedup peer lookup failed; keeping memory");
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "dedup_failed",
+                        &[
+                            ("id", render::short_id(&mem.id).to_string()),
+                            ("reason", e.to_string()),
+                        ]
+                    )
+                );
                 survivors.push(mem.clone());
                 continue;
             }
@@ -615,6 +635,16 @@ fn run_stage_a_dedup(
                                 retry_ids.insert(older.id.clone());
                                 tracing::warn!(id = %older.id, error = %e,
                                     "stage A gateway tombstone failed; keeping memory");
+                                println!(
+                                    "{}",
+                                    render::render_action_result(
+                                        "dedup_gateway_sync_failed",
+                                        &[
+                                            ("id", render::short_id(&older.id).to_string()),
+                                            ("reason", e.to_string()),
+                                        ]
+                                    )
+                                );
                                 survivors.push(mem.clone());
                                 continue;
                             }
@@ -628,6 +658,16 @@ fn run_stage_a_dedup(
                                 retry_ids.insert(mem.id.clone());
                                 tracing::warn!(id = %older, error = %e,
                                     "stage A gateway sync cleanup failed");
+                                println!(
+                                    "{}",
+                                    render::render_action_result(
+                                        "dedup_gateway_sync_failed",
+                                        &[
+                                            ("id", render::short_id(&older).to_string()),
+                                            ("reason", e.to_string()),
+                                        ]
+                                    )
+                                );
                                 survivors.push(mem.clone());
                                 continue;
                             }
@@ -658,6 +698,16 @@ fn run_stage_a_dedup(
                             retry_ids.insert(mem.id.clone());
                             tracing::warn!(id = %mem.id, error = %e,
                                 "stage A apply_policy failed");
+                            println!(
+                                "{}",
+                                render::render_action_result(
+                                    "dedup_failed",
+                                    &[
+                                        ("id", render::short_id(&mem.id).to_string()),
+                                        ("reason", e.to_string()),
+                                    ]
+                                )
+                            );
                             survivors.push(mem.clone());
                         }
                     }
@@ -731,6 +781,16 @@ fn run_stage_b_condense(
                     stats.failed += 1;
                     tracing::warn!(id = %source.id, error = %e,
                         "condense skip confirmation failed");
+                    println!(
+                        "{}",
+                        render::render_action_result(
+                            "condense_failed",
+                            &[
+                                ("id", render::short_id(&source.id).to_string()),
+                                ("reason", e.to_string()),
+                            ]
+                        )
+                    );
                 }
             }
             println!(

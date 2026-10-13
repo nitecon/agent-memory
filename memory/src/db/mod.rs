@@ -356,6 +356,17 @@ fn run_migrations_inner(conn: &Connection) -> Result<(), MemoryError> {
     if version < 12 {
         migrate_v12_namespaced_dream_operations(conn)?;
     }
+    if version < 13 {
+        // Bind legacy mappings, delete queues and pull cursors together. Never
+        // reuse their IDs/revisions against another gateway endpoint.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gateway_sync_identity (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 endpoint TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO schema_version (version) VALUES (13);",
+        )?;
+    }
 
     Ok(())
 }
@@ -785,7 +796,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -828,7 +839,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
     }
 
     #[test]
@@ -893,7 +904,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
 
         // Existing memory row survived untouched.
         let existing: String = conn
@@ -972,7 +983,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
 
         let existing: String = conn
             .query_row(
@@ -1035,7 +1046,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
 
         let sync_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_gateway_sync", [], |row| {
@@ -1137,7 +1148,7 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 12);
+        assert_eq!(max_v, 13);
 
         conn.execute(
             "INSERT INTO memory_gateway_sync (
@@ -1215,7 +1226,7 @@ mod migration_tests {
              DROP TABLE memory_revisions;
              DROP TABLE memory_concepts;
              DROP TABLE memory_concept_tombstones;
-             DELETE FROM schema_version WHERE version IN (9, 10, 11, 12);
+             DELETE FROM schema_version WHERE version IN (9, 10, 11, 12, 13);
              INSERT INTO memories (
                  id, content, tags, project, agent, source_file,
                  created_at, updated_at, access_count, embedding, memory_type,
@@ -1375,7 +1386,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version IN (10, 11, 12);",
+             DELETE FROM schema_version WHERE version IN (10, 11, 12, 13);",
         )
         .expect("restore v9 state");
 
@@ -1407,7 +1418,7 @@ mod migration_tests {
         conn.execute_batch(
             "DROP TRIGGER memory_segments_fts_ad;
              DROP TABLE memory_segments_fts;
-             DELETE FROM schema_version WHERE version IN (10, 11, 12);
+             DELETE FROM schema_version WHERE version IN (10, 11, 12, 13);
              CREATE TABLE memory_segments_fts (wrong_column TEXT);",
         )
         .expect("construct incompatible v9 fixture");
@@ -1437,7 +1448,7 @@ mod migration_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]

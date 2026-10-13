@@ -91,7 +91,11 @@ impl MemoryGatewayClient {
         Ok(Self {
             base_url,
             api_key: api_key.to_string(),
-            http: reqwest::blocking::Client::new(),
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| GatewaySyncClientError::Transport(e.to_string()))?,
             okf_enabled: false,
         })
     }
@@ -164,6 +168,10 @@ impl MemoryGatewayClient {
 
     pub fn okf_enabled(&self) -> bool {
         self.okf_enabled
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.base_url
     }
 }
 
@@ -380,6 +388,8 @@ pub struct PullMemoriesResponse {
     pub tombstones: Vec<GatewayMemoryTombstoneRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_since_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_revision: Option<i64>,
     #[serde(default)]
@@ -445,7 +455,7 @@ pub struct GatewayMemory {
     pub local_memory_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "id", skip_serializing_if = "Option::is_none")]
     pub gateway_memory_id: Option<String>,
     #[serde(
         rename = "base_gateway_revision",

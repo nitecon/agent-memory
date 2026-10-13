@@ -1,6 +1,6 @@
 use std::env;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::GatewayConfig;
 use crate::db::models::{Memory, MemoryGatewaySync, MemoryGatewaySyncUpsert};
@@ -8,8 +8,8 @@ use crate::db::queries;
 use crate::error::MemoryError;
 use crate::sync::{
     gateway_okf_envelope, memory_content_hash, GatewayMemory, GatewayMemoryProvenance,
-    GatewayMemoryTombstone, GatewaySyncClientError, MemoryGatewayClient, PushMemoriesRequest,
-    PushMemoryAction, PushMemoryResult,
+    GatewayMemoryTombstone, GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest,
+    PushMemoriesRequest, PushMemoriesResponse, PushMemoryAction, PushMemoryResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,269 @@ impl GatewayMutationOutcome {
     }
 }
 
+/// The legacy tables have one mapping per local memory. Bind the entire sync
+/// state to its endpoint rather than silently using it on a different server.
+/// A different endpoint requires a separate database; no mappings are discarded.
+pub fn ensure_gateway_identity(
+    conn: &Connection,
+    client: &MemoryGatewayClient,
+    bind: bool,
+) -> Result<(), MemoryError> {
+    if bind {
+        conn.execute(
+            "INSERT OR IGNORE INTO gateway_sync_identity(singleton, endpoint) VALUES(1, ?1)",
+            [client.identity()],
+        )?;
+    }
+    let endpoint: Option<String> = conn
+        .query_row(
+            "SELECT endpoint FROM gateway_sync_identity WHERE singleton = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if endpoint.as_deref().is_some_and(|e| e != client.identity()) {
+        return Err(MemoryError::Config(
+            "gateway identity changed; use a separate memory database for this endpoint to preserve existing mappings and cursors".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Global scope has a restricted legacy wire type. The local concept and its
+/// OKF envelope retain their original type (including reference).
+pub fn wire_memory_type<'a>(project: &str, local_type: Option<&'a str>) -> &'a str {
+    if local_type == Some("working_context") {
+        "working_context"
+    } else if project == queries::GLOBAL_PROJECT_IDENT {
+        "global"
+    } else {
+        local_type.unwrap_or("user")
+    }
+}
+
+pub fn push_reconciled(
+    conn: &Connection,
+    client: &MemoryGatewayClient,
+    request: &PushMemoriesRequest,
+) -> Result<PushMemoriesResponse, MemoryError> {
+    ensure_gateway_identity(conn, client, true)?;
+    let mut response = client.push_memories(request).map_err(map_gateway_error)?;
+    if response.project != request.project {
+        return Err(MemoryError::Config(
+            "gateway push response project mismatch".into(),
+        ));
+    }
+    // Recovery is bounded to one verified retry per linked record. A conflict
+    // does not itself authorize overwriting data or resurrecting a tombstone.
+    for result in &mut response.results {
+        if !matches!(
+            result.action,
+            PushMemoryAction::Conflict | PushMemoryAction::Rejected
+        ) {
+            continue;
+        }
+        let Some(memory) = request.memories.iter().find(|m| {
+            m.local_memory_id
+                .as_ref()
+                .is_some_and(|id| result.local_memory_id.as_ref() == Some(id))
+                || m.client_id
+                    .as_ref()
+                    .is_some_and(|id| result.client_id.as_ref() == Some(id))
+                || m.gateway_memory_id
+                    .as_ref()
+                    .is_some_and(|id| result.gateway_memory_id.as_ref() == Some(id))
+        }) else {
+            continue;
+        };
+        if memory.gateway_memory_id.is_none() {
+            continue;
+        }
+        let deleting = memory.tombstone.as_ref().is_some_and(|t| t.deleted);
+        if deleting && tombstone_target_is_already_absent(result) {
+            continue;
+        }
+        // Validation errors unrelated to stale IDs/revisions are not retried.
+        if result.action != PushMemoryAction::Conflict
+            && !tombstone_target_is_already_absent(result)
+        {
+            continue;
+        }
+        let snapshot = remote_snapshot(client, &request.project)?;
+        let matches: Vec<_> = snapshot
+            .iter()
+            .filter(|r| {
+                r.gateway_memory_id == memory.gateway_memory_id
+                    || memory
+                        .client_id
+                        .as_ref()
+                        .is_some_and(|id| r.client_id.as_ref() == Some(id))
+            })
+            .collect();
+        let mut retry = memory.clone();
+        match matches.as_slice() {
+            [] if tombstone_target_is_already_absent(result) && !deleting => {
+                retry.gateway_memory_id = None;
+                retry.base_server_revision = None;
+            }
+            [remote] => {
+                let Some(revision) = remote.server_revision else {
+                    continue;
+                };
+                if remote.tombstone.as_ref().is_some_and(|t| t.deleted) {
+                    if deleting {
+                        result.action = PushMemoryAction::Tombstoned;
+                        result.gateway_memory_id = remote.gateway_memory_id.clone();
+                        result.server_revision = Some(revision);
+                        result.content_hash = Some(remote.content_hash.clone());
+                        result.conflict = None;
+                        result.error = None;
+                        result.errors.clear();
+                    }
+                    continue;
+                }
+                let sync = match memory.local_memory_id.as_deref() {
+                    Some(id) => queries::get_memory_gateway_sync(conn, id)?
+                        .or(queries::get_memory_gateway_delete_pending(conn, id)?),
+                    None => None,
+                };
+                let baseline_matches = sync.as_ref().is_some_and(|s| {
+                    s.last_pushed_content_hash.as_deref() == Some(&remote.content_hash)
+                        || s.last_pulled_content_hash.as_deref() == Some(&remote.content_hash)
+                });
+                let retained_ancestor = match sync.as_ref() {
+                    Some(sync) if revision < sync.last_seen_server_revision => {
+                        remote_matches_retained_history(conn, &sync.local_memory_id, remote)?
+                    }
+                    _ => false,
+                };
+                // With OKF enabled, legacy equality alone cannot prove that
+                // independently edited metadata is safe to replace.
+                let okf_matches = memory.okf.is_none()
+                    || (memory.concept_hash.is_some()
+                        && memory.concept_hash == remote.concept_hash);
+                if !okf_matches
+                    || (!baseline_matches
+                        && !retained_ancestor
+                        && memory.content_hash != remote.content_hash)
+                {
+                    continue;
+                }
+                retry.gateway_memory_id = remote.gateway_memory_id.clone();
+                retry.base_server_revision = Some(revision);
+            }
+            _ => continue, // ambiguous identity: leave the conflict intact
+        }
+        let retried = client
+            .push_memories(&PushMemoriesRequest {
+                project: request.project.clone(),
+                memories: vec![retry.clone()],
+            })
+            .map_err(map_gateway_error)?;
+        if retried.project != request.project || retried.results.len() != 1 {
+            return Err(MemoryError::Config(
+                "invalid gateway reconciliation response".into(),
+            ));
+        }
+        let replacement = &retried.results[0];
+        if replacement.local_memory_id != retry.local_memory_id
+            && replacement.client_id != retry.client_id
+        {
+            return Err(MemoryError::Config(
+                "gateway reconciliation result identity mismatch".into(),
+            ));
+        }
+        *result = replacement.clone();
+    }
+    Ok(response)
+}
+
+/// A lower remote revision may reflect an older retained body. Only exact
+/// retained content/type/tags in the same scope authorize advancing it again;
+/// an unseen remote edit or a newer remote revision is never overwritten here.
+fn remote_matches_retained_history(
+    conn: &Connection,
+    id: &str,
+    remote: &GatewayMemory,
+) -> Result<bool, MemoryError> {
+    if remote.content_hash
+        != memory_content_hash(&remote.content, &remote.memory_type, &remote.tags)
+    {
+        return Ok(false);
+    }
+    let mut statement =
+        conn.prepare("SELECT snapshot_json FROM memory_revisions WHERE memory_id = ?1")?;
+    let rows = statement.query_map([id], |r| r.get::<_, String>(0))?;
+    let mut remote_tags = remote.tags.clone();
+    remote_tags.sort();
+    remote_tags.dedup();
+    for row in rows {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&row?).map_err(|e| MemoryError::Config(e.to_string()))?;
+        let content_matches = snapshot["body"].as_str() == Some(&remote.content)
+            || snapshot["content_raw"].as_str() == Some(&remote.content);
+        let tags: Vec<String> = serde_json::from_value(snapshot["tags"].clone())
+            .map_err(|e| MemoryError::Config(e.to_string()))?;
+        if content_matches
+            && snapshot["project"].as_str() == Some(&remote.project)
+            && wire_memory_type(&remote.project, snapshot["memory_type"].as_str())
+                == remote.memory_type
+            && tags == remote_tags
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remote_snapshot(
+    client: &MemoryGatewayClient,
+    project: &str,
+) -> Result<Vec<GatewayMemory>, MemoryError> {
+    let mut cursor = None;
+    let mut since = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut memories = Vec::new();
+    loop {
+        let page = client
+            .pull_memories(&PullMemoriesRequest {
+                project: project.into(),
+                since_server_revision: since,
+                cursor: cursor.clone(),
+                known_memories: Vec::new(),
+                limit: Some(100),
+            })
+            .map_err(map_gateway_error)?;
+        page.validate_project_scope()
+            .map_err(|e| MemoryError::Config(e.to_string()))?;
+        if page.project != project {
+            return Err(MemoryError::Config(
+                "gateway snapshot project mismatch".into(),
+            ));
+        }
+        memories.extend(page.memories);
+        if !page.has_more {
+            return Ok(memories);
+        }
+        let position = if let Some(next) = page.next_cursor {
+            cursor = Some(next.clone());
+            format!("cursor:{next}")
+        } else if let Some(next) = page.next_since_revision.filter(|n| *n > since.unwrap_or(0)) {
+            since = Some(next);
+            format!("revision:{next}")
+        } else {
+            return Err(MemoryError::Config(
+                "gateway snapshot missing advancing continuation".into(),
+            ));
+        };
+        if !seen.insert(position) {
+            return Err(MemoryError::Config(
+                "gateway snapshot repeated continuation".into(),
+            ));
+        }
+    }
+}
+
 pub fn push_memory_update_if_configured(
     conn: &Connection,
     gateway_config: &GatewayConfig,
@@ -42,6 +305,11 @@ pub fn push_memory_update_if_configured(
     };
 
     let sync = queries::get_memory_gateway_sync(conn, &memory.id)?;
+    if sync.as_ref().is_some_and(|s| s.tombstone_deleted) {
+        return Err(MemoryError::Config(
+            "gateway update refused: linked memory is tombstoned".into(),
+        ));
+    }
     let gateway_memory = gateway_memory_from_local(
         conn,
         memory,
@@ -50,7 +318,7 @@ pub fn push_memory_update_if_configured(
         gateway_config.okf_sync_enabled(),
     )?;
     let content_hash = gateway_memory.content_hash.clone();
-    let result = push_single(gateway_config, gateway_memory)?;
+    let result = push_single(conn, gateway_config, gateway_memory)?;
 
     match result.action {
         PushMemoryAction::Created | PushMemoryAction::Updated | PushMemoryAction::Linked => {
@@ -91,27 +359,40 @@ pub fn tombstone_memory_before_local_removal(
             reason: "gateway auto-sync disabled or memory is unscoped",
         });
     };
-    let Some(sync) = queries::get_memory_gateway_sync(conn, &memory.id)? else {
+    let Some(sync) = queries::get_memory_gateway_sync(conn, &memory.id)?.or(
+        queries::get_memory_gateway_delete_pending(conn, &memory.id)?,
+    ) else {
         return Ok(GatewayMutationOutcome::Skipped {
             reason: "memory is not linked to gateway",
         });
     };
-    if sync.tombstone_deleted {
+    let client = MemoryGatewayClient::from_config(gateway_config).map_err(map_gateway_error)?;
+    ensure_gateway_identity(conn, &client, true)?;
+    if sync.tombstone_deleted && sync.sync_state != "delete_pending" {
         return Ok(GatewayMutationOutcome::Skipped {
             reason: "gateway tombstone already recorded",
         });
     }
 
-    let gateway_memory = gateway_tombstone_from_local(
-        conn,
-        memory,
-        project,
-        &sync,
-        reason,
-        gateway_config.okf_sync_enabled(),
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+        [&memory.id],
+        |r| r.get(0),
     )?;
+    let gateway_memory = if exists {
+        gateway_tombstone_from_local(
+            conn,
+            memory,
+            project,
+            &sync,
+            reason,
+            gateway_config.okf_sync_enabled(),
+        )?
+    } else {
+        gateway_tombstone_from_sync(&sync, reason)
+    };
     let content_hash = gateway_memory.content_hash.clone();
-    let result = push_single(gateway_config, gateway_memory)?;
+    let result = push_single(conn, gateway_config, gateway_memory)?;
 
     match result.action {
         PushMemoryAction::Updated | PushMemoryAction::Deleted | PushMemoryAction::Tombstoned => {
@@ -162,10 +443,7 @@ fn gateway_memory_from_local(
             memory.id
         )));
     }
-    let memory_type = memory
-        .memory_type
-        .clone()
-        .unwrap_or_else(|| "user".to_string());
+    let memory_type = wire_memory_type(project, memory.memory_type.as_deref()).to_string();
     let tags = memory.tags.clone().unwrap_or_default();
     let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
     let okf = okf_enabled
@@ -222,7 +500,7 @@ pub fn gateway_tombstone_from_sync(record: &MemoryGatewaySync, reason: &str) -> 
     GatewayMemory {
         project: record.project.clone(),
         content: String::new(),
-        memory_type: "project".to_string(),
+        memory_type: wire_memory_type(&record.project, Some("project")).to_string(),
         tags: Vec::new(),
         content_hash,
         concept_hash: None,
@@ -251,6 +529,7 @@ pub fn gateway_tombstone_from_sync(record: &MemoryGatewaySync, reason: &str) -> 
 }
 
 fn push_single(
+    conn: &Connection,
     gateway_config: &GatewayConfig,
     gateway_memory: GatewayMemory,
 ) -> Result<PushMemoryResult, MemoryError> {
@@ -262,10 +541,8 @@ fn push_single(
         project,
         memories: vec![gateway_memory],
     };
-    let response = MemoryGatewayClient::from_config(gateway_config)
-        .map_err(map_gateway_error)?
-        .push_memories(&request)
-        .map_err(map_gateway_error)?;
+    let client = MemoryGatewayClient::from_config(gateway_config).map_err(map_gateway_error)?;
+    let response = push_reconciled(conn, &client, &request)?;
 
     let mut results = response.results;
     if let Some(index) = results.iter().position(|result| {
@@ -280,9 +557,6 @@ fn push_single(
                 .is_some_and(|id| result.gateway_memory_id.as_deref() == Some(id))
     }) {
         return Ok(results.remove(index));
-    }
-    if results.len() == 1 {
-        return Ok(results.remove(0));
     }
     Err(MemoryError::Config(
         "gateway push response did not include a result for the memory".to_string(),
@@ -303,6 +577,16 @@ fn record_successful_push(
     let server_revision = result.server_revision.ok_or_else(|| {
         MemoryError::Config("gateway push response missing server_revision".to_string())
     })?;
+    if tombstone_deleted
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+            [local_memory_id],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        queries::clear_memory_gateway_delete_pending(conn, local_memory_id)?;
+        return Ok(());
+    }
     let content_hash = result.content_hash.clone().or(fallback_content_hash);
     let tombstone_at = if tombstone_deleted {
         Some(chrono::Utc::now().to_rfc3339())
@@ -380,6 +664,14 @@ fn record_already_absent_tombstone(
     conn: &Connection,
     sync: &MemoryGatewaySync,
 ) -> Result<(), MemoryError> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+        [&sync.local_memory_id],
+        |r| r.get::<_, bool>(0),
+    )? {
+        queries::clear_memory_gateway_delete_pending(conn, &sync.local_memory_id)?;
+        return Ok(());
+    }
     queries::upsert_memory_gateway_sync(
         conn,
         &MemoryGatewaySyncUpsert {
@@ -673,6 +965,310 @@ mod tests {
             capable.okf.as_ref().map(|okf| okf.semantic_hash.as_str())
         );
         assert_eq!(legacy.content_hash, capable.content_hash);
+    }
+
+    #[test]
+    fn absent_update_recreates_only_after_complete_paginated_snapshot() {
+        let conn = open_mem_db();
+        let old = insert_memory(&conn, "absent", "original body");
+        link_memory(&conn, &old, "stale-id", 235);
+        queries::update_content(&conn, &old.id, "valuable new body", None, None).unwrap();
+        let memory = queries::get_memory_by_id(&conn, &old.id).unwrap();
+        let before = local_history(&conn, &old.id);
+        let responses = vec![
+            rejected(&memory, "gateway_memory_id was not found for this project"),
+            json!({"project_ident":"agent-memory", "memories":[], "has_more":true, "next_since_revision":100}),
+            json!({"project_ident":"agent-memory", "memories":[], "has_more":false}),
+            success(&memory, "new-id", 9, "created"),
+        ];
+        let (url, server) = scripted_gateway(responses);
+        push_memory_update_if_configured(&conn, &gateway_config(url), &memory).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests[1]["since_revision"], Value::Null);
+        assert_eq!(requests[2]["since_revision"], 100);
+        assert_eq!(requests[3]["memories"][0]["gateway_memory_id"], Value::Null);
+        assert_eq!(
+            requests[3]["memories"][0]["base_gateway_revision"],
+            Value::Null
+        );
+        assert_eq!(
+            queries::get_memory_gateway_sync(&conn, &old.id)
+                .unwrap()
+                .unwrap()
+                .gateway_memory_id,
+            "new-id"
+        );
+        assert_eq!(local_history(&conn, &old.id), before);
+    }
+
+    #[test]
+    fn revision_rebase_requires_acknowledged_remote_content_for_updates_and_deletes() {
+        for revision in [173, 300] {
+            for deleting in [false, true] {
+                let conn = open_mem_db();
+                let old = insert_memory(&conn, "revision", "acknowledged body");
+                link_memory(&conn, &old, "same-id", 235);
+                queries::update_content(&conn, &old.id, "local edit", None, None).unwrap();
+                let memory = queries::get_memory_by_id(&conn, &old.id).unwrap();
+                let before = local_history(&conn, &old.id);
+                let responses = vec![
+                    conflict(&memory),
+                    snapshot(&old, revision, false),
+                    success(
+                        &memory,
+                        "same-id",
+                        revision + 1,
+                        if deleting { "tombstoned" } else { "updated" },
+                    ),
+                ];
+                let (url, server) = scripted_gateway(responses);
+                let config = gateway_config(url);
+                if deleting {
+                    tombstone_memory_before_local_removal(&conn, &config, &memory, "test").unwrap();
+                } else {
+                    push_memory_update_if_configured(&conn, &config, &memory).unwrap();
+                }
+                let requests = server.join().unwrap();
+                assert_eq!(
+                    requests[2]["memories"][0]["base_gateway_revision"],
+                    revision
+                );
+                assert_eq!(
+                    queries::get_memory_gateway_sync(&conn, &old.id)
+                        .unwrap()
+                        .unwrap()
+                        .last_seen_server_revision,
+                    revision + 1
+                );
+                assert_eq!(local_history(&conn, &old.id), before);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_behind_retained_base_rebases_exact_history_but_remote_ahead_does_not() {
+        for revision in [173, 300] {
+            let conn = open_mem_db();
+            let old = insert_memory(&conn, "history", "original retained guidance");
+            queries::update_content(&conn, &old.id, "acknowledged revision", None, None).unwrap();
+            let acknowledged = queries::get_memory_by_id(&conn, &old.id).unwrap();
+            link_memory(&conn, &acknowledged, "same-id", 235);
+            queries::update_content(&conn, &old.id, "new condensed guidance", None, None).unwrap();
+            let memory = queries::get_memory_by_id(&conn, &old.id).unwrap();
+            let before = local_history(&conn, &old.id);
+            let mut responses = vec![conflict(&memory), snapshot(&old, revision, false)];
+            if revision < 235 {
+                responses.push(success(&memory, "same-id", revision + 1, "updated"));
+            }
+            let (url, server) = scripted_gateway(responses);
+            let result = push_memory_update_if_configured(&conn, &gateway_config(url), &memory);
+            assert_eq!(result.is_ok(), revision < 235);
+            assert_eq!(
+                server.join().unwrap().len(),
+                if revision < 235 { 3 } else { 2 }
+            );
+            assert_eq!(local_history(&conn, &old.id), before);
+        }
+    }
+
+    #[test]
+    fn divergent_content_and_remote_tombstones_are_never_overwritten_or_resurrected() {
+        for revision in [173, 300] {
+            for tombstone in [false, true] {
+                let conn = open_mem_db();
+                let memory = insert_memory(&conn, "protected", "valuable local body");
+                link_memory(&conn, &memory, "same-id", 235);
+                let mut remote = memory.clone();
+                remote.content = "independent remote body".into();
+                let before = local_history(&conn, &memory.id);
+                let (url, server) = scripted_gateway(vec![
+                    conflict(&memory),
+                    snapshot(&remote, revision, tombstone),
+                ]);
+                assert!(
+                    push_memory_update_if_configured(&conn, &gateway_config(url), &memory).is_err()
+                );
+                assert_eq!(server.join().unwrap().len(), 2);
+                assert_eq!(
+                    queries::get_memory_gateway_sync(&conn, &memory.id)
+                        .unwrap()
+                        .unwrap()
+                        .last_seen_server_revision,
+                    235
+                );
+                assert_eq!(local_history(&conn, &memory.id), before);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_tombstone_delete_reconciles_without_a_second_write() {
+        let conn = open_mem_db();
+        let memory = insert_memory(&conn, "deleted", "valuable local body");
+        link_memory(&conn, &memory, "same-id", 103);
+        let (url, server) = scripted_gateway(vec![conflict(&memory), snapshot(&memory, 118, true)]);
+        tombstone_memory_before_local_removal(&conn, &gateway_config(url), &memory, "test")
+            .unwrap();
+        let sync = queries::get_memory_gateway_sync(&conn, &memory.id)
+            .unwrap()
+            .unwrap();
+        assert!(sync.tombstone_deleted);
+        assert_eq!(sync.last_seen_server_revision, 118);
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert!(queries::get_memory_by_id(&conn, &memory.id).is_ok());
+    }
+
+    #[test]
+    fn gateway_identity_guard_preserves_mappings_and_cursors_without_contacting_another_endpoint() {
+        let conn = open_mem_db();
+        let memory = insert_memory(&conn, "identity", "valuable body");
+        link_memory(&conn, &memory, "same-id", 9);
+        queries::upsert_project_gateway_sync_state(&conn, "agent-memory", Some(9), Some("cursor"))
+            .unwrap();
+        let original =
+            MemoryGatewayClient::from_parts("https://gateway.example.org/", "key").unwrap();
+        ensure_gateway_identity(&conn, &original, false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM gateway_sync_identity", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "status must not bind state");
+        ensure_gateway_identity(&conn, &original, true).unwrap();
+        ensure_gateway_identity(
+            &conn,
+            &MemoryGatewayClient::from_parts("https://gateway.example.org", "new-key").unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(push_memory_update_if_configured(
+            &conn,
+            &gateway_config("http://127.0.0.1:1".into()),
+            &memory
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("identity changed"));
+        assert_eq!(
+            queries::get_memory_gateway_sync(&conn, &memory.id)
+                .unwrap()
+                .unwrap()
+                .last_seen_server_revision,
+            9
+        );
+        assert_eq!(
+            queries::get_project_gateway_sync_state(&conn, "agent-memory")
+                .unwrap()
+                .unwrap()
+                .last_pull_cursor
+                .as_deref(),
+            Some("cursor")
+        );
+    }
+
+    #[test]
+    fn global_reference_uses_authorized_wire_type_and_keeps_local_and_okf_semantics() {
+        let conn = open_mem_db();
+        let memory = Memory::new(
+            "Reference guidance".into(),
+            None,
+            Some("__global__".into()),
+            None,
+            None,
+            Some("reference".into()),
+        );
+        queries::insert_memory(&conn, &memory).unwrap();
+        let wire = gateway_memory_from_local(&conn, &memory, "__global__", None, true).unwrap();
+        assert_eq!(wire.memory_type, "global");
+        assert!(wire.okf.unwrap().document.contains("reference"));
+        assert_eq!(
+            queries::get_memory_by_id(&conn, &memory.id)
+                .unwrap()
+                .memory_type
+                .as_deref(),
+            Some("reference")
+        );
+        let mut response = success(&memory, "global-id", 1, "created");
+        response["project_ident"] = json!("__global__");
+        let (url, server) = scripted_gateway(vec![response]);
+        push_memory_update_if_configured(&conn, &gateway_config(url), &memory).unwrap();
+        assert_eq!(
+            server.join().unwrap()[0]["memories"][0]["memory_type"],
+            "global"
+        );
+        assert_eq!(
+            queries::get_memory_by_id(&conn, &memory.id)
+                .unwrap()
+                .memory_type
+                .as_deref(),
+            Some("reference")
+        );
+    }
+
+    fn local_history(conn: &Connection, id: &str) -> (String, Option<String>, i64) {
+        conn.query_row("SELECT content, content_raw, current_revision FROM memories JOIN memory_concepts ON memories.id = memory_id WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+    }
+    fn rejected(memory: &Memory, reason: &str) -> Value {
+        json!({"project_ident":"agent-memory", "results":[{"local_memory_id":memory.id,"gateway_memory_id":"same-id","action":"rejected","error":reason}]})
+    }
+    fn conflict(memory: &Memory) -> Value {
+        json!({"project_ident":"agent-memory", "results":[{"local_memory_id":memory.id,"gateway_memory_id":"same-id","action":"conflict","conflict":{"reason":"base revision mismatch"}}]})
+    }
+    fn success(memory: &Memory, id: &str, revision: i64, action: &str) -> Value {
+        json!({"project_ident":"agent-memory", "results":[{"local_memory_id":memory.id,"gateway_memory_id":id,"server_revision":revision,"action":action}]})
+    }
+    fn snapshot(memory: &Memory, revision: i64, tombstone: bool) -> Value {
+        let hash = memory_content_hash(&memory.content, "project", &[]);
+        if tombstone {
+            json!({"project_ident":"agent-memory", "tombstones":[{"project_ident":"agent-memory","gateway_memory_id":"same-id","server_revision":revision,"content_hash":hash}]})
+        } else {
+            // Actual server shape uses `id`, not `gateway_memory_id`.
+            json!({"project_ident":"agent-memory", "memories":[{"project_ident":"agent-memory","id":"same-id","server_revision":revision,"content":memory.content,"content_hash":hash,"memory_type":"project","tags":memory.tags.clone().unwrap_or_default()}]})
+        }
+    }
+    fn scripted_gateway(responses: Vec<Value>) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while buf.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                requests
+                    .push(serde_json::from_slice(&buf[header_end..header_end + length]).unwrap());
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            requests
+        });
+        (format!("http://{addr}"), server)
     }
 
     fn spawn_gateway<F>(handler: F) -> (String, std::thread::JoinHandle<Value>)

@@ -442,8 +442,9 @@ fn invoke_review_with_context(
     let mut prompt_text = prompt::build_project_review_prompt(project, batch);
     let pending: Vec<_> = batch
         .iter()
-        .filter(|m| pending_ids.contains(&m.id))
-        .map(|m| m.id.as_str())
+        .enumerate()
+        .filter(|(_, m)| pending_ids.contains(&m.id))
+        .map(|(index, _)| format!("r{}", index + 1))
         .collect();
     prompt_text.push_str(&format!(
         "\n\nRUN HINT: pending memory ids: {}. Other memories were already successfully processed. \
@@ -770,16 +771,9 @@ fn persist_replacement(
 /// Parse a raw JSON response from the model, validate every referenced
 /// id, and return a map of id → decision.
 ///
-/// Validation rules:
-///   * Every id in the response must match a memory in `batch`. Unknown
-///     ids are dropped with a tracing::warn so the caller sees the
-///     miscue but the pass still makes progress.
-///   * `MergeInto { target_id }` with a target that doesn't appear in
-///     `batch` (or itself maps to `Drop`) is downgraded to `Keep` with a
-///     warning — we refuse to orphan data.
-///   * Memories present in `batch` but missing from the response default
-///     to `Keep` (defensive: the model mis-classifies absent rows as
-///     garbage more often than it drops them on purpose).
+/// Exact batch-local review keys and canonical IDs are accepted; unknown keys,
+/// duplicate aliases and incomplete coverage fail the entire batch closed.
+/// Dangling merge/contradiction targets are conservatively downgraded to Keep.
 pub fn parse_response(
     raw: &str,
     batch: &[Memory],
@@ -806,13 +800,38 @@ pub fn parse_response(
     let mut out: HashMap<String, Decision> = HashMap::new();
 
     let response_count = parsed.decisions.len();
-    for (id, raw_d) in parsed.decisions {
+    let aliases: HashMap<_, _> = batch
+        .iter()
+        .enumerate()
+        .map(|(index, memory)| (format!("r{}", index + 1), memory.id.clone()))
+        .collect();
+    for (key, raw_d) in parsed.decisions {
+        let id = if known_ids.contains(&key) {
+            key.clone()
+        } else {
+            aliases.get(&key).cloned().unwrap_or(key)
+        };
         if !known_ids.contains(&id) {
             return Err(ProjectReviewError::Parse(format!(
                 "response referenced unknown memory id {id}"
             )));
         }
-        out.insert(id, raw_d.into());
+        let mut decision: Decision = raw_d.into();
+        match &mut decision {
+            Decision::MergeInto { target_id } | Decision::Contradiction { target_id, .. }
+                if !known_ids.contains(target_id) =>
+            {
+                if let Some(full) = aliases.get(target_id) {
+                    *target_id = full.clone();
+                }
+            }
+            _ => {}
+        }
+        if out.insert(id.clone(), decision).is_some() {
+            return Err(ProjectReviewError::Parse(format!(
+                "duplicate decision for memory id {id}"
+            )));
+        }
     }
 
     if out.len() != batch.len() {
@@ -925,22 +944,11 @@ impl From<RawDecision> for Decision {
 
 /// Persist decisions for a batch and push the survivors into `survivors`.
 ///
-/// Runs in two phases so the DB write lock is held only for the brief
-/// window needed to apply the writes:
-///
-/// 1. **Lock-free pre-materialization.** For every `SupersedeBy` /
-///    `Extract` decision we build the replacement [`Memory`] (including
-///    its embedding via fastembed) BEFORE touching sqlite. Previously
-///    this ran inside the batch's `BEGIN IMMEDIATE` tx and held a
-///    RESERVED write lock for the full embedding duration × every
-///    materialization in the batch. On a dense DB that stalled
-///    concurrent `memory store`/`update`/`forget` for minutes per batch.
-///
-/// 2. **Short tx for writes.** Once all replacements are materialized
-///    (or their failures recorded), we open a single `BEGIN IMMEDIATE`
-///    and apply only the fast DB statements. A delete+insert failure
-///    inside a `SupersedeBy` / `Extract` still rolls the whole batch
-///    back rather than leaving orphaned state.
+/// Materialize embeddings without a database lock, then apply replacement
+/// decisions before their dependent merges. Each decision has its own immediate
+/// transaction. Local writes are attempted before remote removal, and gateway
+/// failures roll back that decision. Gateway calls inside these transactions
+/// have a bounded transport timeout; previously committed decisions survive.
 #[allow(clippy::too_many_arguments)]
 fn apply_decisions(
     conn: &mut Connection,
@@ -957,12 +965,8 @@ fn apply_decisions(
     pending_ids: &HashSet<String>,
     retry_ids: &mut HashSet<String>,
 ) -> Result<(), ProjectReviewError> {
-    let project_label = project.unwrap_or("(null)");
-
-    // Phase 1 — pre-materialize replacement memories for SupersedeBy /
-    // Extract decisions with NO sqlite lock held.
-    let mut materialized: HashMap<String, Memory> = HashMap::new();
-    let mut materialize_failed: HashSet<String> = HashSet::new();
+    let mut materialized = HashMap::new();
+    let mut failed = HashSet::new();
     for mem in batch {
         let (content, tags) = match decisions.get(&mem.id) {
             Some(Decision::SupersedeBy { content, tags })
@@ -974,383 +978,328 @@ fn apply_decisions(
                 materialized.insert(mem.id.clone(), new_mem);
             }
             Err(e) => {
-                stats.failed += 1;
-                retry_ids.insert(mem.id.clone());
-                tracing::warn!(id = %mem.id, error = %e,
-                    "review materialize failed; keeping source memory alive");
-                materialize_failed.insert(mem.id.clone());
+                record_apply_failure(
+                    stats,
+                    retry_ids,
+                    project,
+                    &mem.id,
+                    "materialize",
+                    &e.to_string(),
+                );
+                failed.insert(mem.id.clone());
             }
         }
     }
+    apply_materialized_decisions(
+        conn,
+        project,
+        batch,
+        &decisions,
+        model_name,
+        gateway_config,
+        apply,
+        stats,
+        survivors,
+        contradiction_ids,
+        pending_ids,
+        retry_ids,
+        &materialized,
+        failed,
+    )
+}
 
-    let mut gateway_creates: Vec<Memory> = Vec::new();
-    let replacement_ids: HashMap<_, _> = materialized
-        .iter()
-        .map(|(old, new)| (old.clone(), new.id.clone()))
-        .collect();
+fn record_apply_failure(
+    stats: &mut ProjectReviewStats,
+    retry_ids: &mut HashSet<String>,
+    project: Option<&str>,
+    id: &str,
+    operation: &str,
+    reason: &str,
+) {
+    stats.failed += 1;
+    retry_ids.insert(id.to_string());
+    println!("{}", apply_failure_record(project, id, operation, reason));
+}
 
-    let mut gateway_blocked: HashMap<String, String> = HashMap::new();
-    if apply {
-        for mem in batch {
-            let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
-            let removes_or_hides = match &decision {
-                Decision::Keep => false,
-                Decision::Contradiction { .. } => false,
-                // Deprecation retires a memory without deleting it, so the
-                // remote row must survive too — it is pushed as an update
-                // below, not tombstoned.
-                Decision::Deprecate { .. } => false,
-                Decision::Drop => true,
-                Decision::MergeInto { target_id } => !materialize_failed.contains(target_id),
-                Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
-                    !materialize_failed.contains(&mem.id)
-                }
-            };
-            if !removes_or_hides {
-                continue;
-            }
-            let Some(gateway_config) = gateway_config else {
-                continue;
-            };
-            if let Err(e) = agent_memory::gateway_sync::tombstone_memory_before_local_removal(
-                conn,
-                gateway_config,
-                mem,
-                "memory-dream project review removed memory",
-            ) {
-                stats.failed += 1;
-                retry_ids.insert(mem.id.clone());
-                tracing::warn!(id = %mem.id, error = %e,
-                    "review gateway tombstone failed; keeping source memory alive");
-                gateway_blocked.insert(mem.id.clone(), e.to_string());
-            }
-        }
-    }
+fn apply_failure_record(project: Option<&str>, id: &str, operation: &str, reason: &str) -> String {
+    render::render_action_result(
+        "review_apply_failed",
+        &[
+            ("id", render::short_id(id).to_string()),
+            ("project", project.unwrap_or("(null)").to_string()),
+            ("operation", operation.to_string()),
+            ("reason", reason.to_string()),
+        ],
+    )
+}
 
-    // Never remove merge sources if their canonical target could not be
-    // materialized or its gateway removal failed.
-    for mem in batch {
-        if let Some(Decision::MergeInto { target_id }) = decisions.get(&mem.id) {
-            if materialize_failed.contains(target_id) || gateway_blocked.contains_key(target_id) {
-                gateway_blocked.insert(mem.id.clone(), "merge target replacement failed".into());
-                retry_ids.insert(mem.id.clone());
-            }
-        }
-    }
-
-    // Phase 2 — apply writes inside a short `BEGIN IMMEDIATE` tx.
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-
-    for mem in batch {
+#[allow(clippy::too_many_arguments)]
+fn apply_materialized_decisions(
+    conn: &mut Connection,
+    project: Option<&str>,
+    batch: &[Memory],
+    decisions: &HashMap<String, Decision>,
+    model_name: &str,
+    gateway_config: Option<&GatewayConfig>,
+    apply: bool,
+    stats: &mut ProjectReviewStats,
+    survivors: &mut Vec<Memory>,
+    contradiction_ids: &mut HashSet<String>,
+    pending_ids: &HashSet<String>,
+    retry_ids: &mut HashSet<String>,
+    materialized: &HashMap<String, Memory>,
+    mut failed: HashSet<String>,
+) -> Result<(), ProjectReviewError> {
+    // Persist replacements first, then other decisions, then merges. A merge
+    // may only refer to a replacement whose entire operation succeeded.
+    let mut ordered: Vec<_> = batch.iter().collect();
+    ordered.sort_by_key(|m| match decisions.get(&m.id) {
+        Some(Decision::SupersedeBy { .. } | Decision::Extract { .. }) => 0,
+        Some(Decision::MergeInto { .. }) => 2,
+        _ => 1,
+    });
+    for mem in ordered {
         let decision = decisions.get(&mem.id).cloned().unwrap_or(Decision::Keep);
-        if let Some(reason) = gateway_blocked.get(&mem.id) {
+        if failed.contains(&mem.id) {
             survivors.push(mem.clone());
-            println!(
-                "{}",
-                render::render_action_result(
-                    "review_gateway_sync_failed",
-                    &[
-                        ("id", render::short_id(&mem.id).to_string()),
-                        ("project", project_label.to_string()),
-                        ("reason", reason.clone()),
-                    ]
-                )
-            );
             continue;
         }
-
-        match decision {
-            Decision::Keep => {
-                stats.kept += 1;
-                if apply && pending_ids.contains(&mem.id) {
-                    // The model read this memory and stood by it. Recording
-                    // that lifts it out of "nothing has ever checked this",
-                    // which is the only signal separating an unreviewed note
-                    // from a curated one.
-                    if let Err(e) = record_curation_review(&tx, &mem.id, model_name) {
-                        stats.failed += 1;
-                        retry_ids.insert(mem.id.clone());
-                        tracing::warn!(id = %mem.id, error = %e,
-                            "review keep confirmation failed");
-                    }
-                }
-                survivors.push(mem.clone());
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        "review_keep",
-                        &[
-                            ("id", render::short_id(&mem.id).to_string()),
-                            ("project", project_label.to_string()),
-                        ]
-                    )
+        if let Decision::MergeInto { target_id } = &decision {
+            if failed.contains(target_id) {
+                record_apply_failure(
+                    stats,
+                    retry_ids,
+                    project,
+                    &mem.id,
+                    "merge",
+                    "merge target replacement failed",
                 );
-            }
-            Decision::Contradiction { target_id, reason } => {
-                stats.contradictions += 1;
-                contradiction_ids.insert(mem.id.clone());
-                contradiction_ids.insert(target_id.clone());
-                if apply {
-                    // Contradictions are surfaced, never silently resolved —
-                    // and a line on stdout is not surfacing. Persisting the
-                    // edge is what lets the conflict be found again later.
-                    if let Err(e) =
-                        record_contradiction(&tx, &mem.id, &target_id, &reason, model_name)
-                    {
-                        stats.failed += 1;
-                        retry_ids.insert(mem.id.clone());
-                        tracing::warn!(id = %mem.id, target = %target_id, error = %e,
-                            "review contradiction edge failed");
-                    }
-                }
+                failed.insert(mem.id.clone());
                 survivors.push(mem.clone());
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        "review_contradiction",
-                        &[
-                            ("id", render::short_id(&mem.id).to_string()),
-                            ("target", render::short_id(&target_id).to_string()),
-                            ("project", project_label.to_string()),
-                            ("reason", reason),
-                        ]
-                    )
-                );
+                continue;
             }
-            Decision::Deprecate { reason } => {
-                stats.deprecated += 1;
-                if apply {
-                    match set_deprecated(&tx, &mem.id, &reason, model_name) {
-                        Ok(()) => gateway_creates.push(mem.clone()),
-                        Err(e) => {
-                            stats.failed += 1;
-                            retry_ids.insert(mem.id.clone());
-                            tracing::warn!(id = %mem.id, error = %e, "review deprecate failed");
-                            continue;
+        }
+        let target_id = match &decision {
+            Decision::MergeInto { target_id } => Some(
+                materialized
+                    .get(target_id)
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| target_id.clone()),
+            ),
+            _ => None,
+        };
+        let replacement = materialized.get(&mem.id);
+        let operation = match &decision {
+            Decision::Keep => "keep",
+            Decision::Drop => "drop",
+            Decision::MergeInto { .. } => "merge",
+            Decision::SupersedeBy { .. } => "supersede",
+            Decision::Extract { .. } => "extract",
+            Decision::Contradiction { .. } => "contradiction",
+            Decision::Deprecate { .. } => "deprecate",
+        };
+        if apply {
+            // Each decision owns a transaction. Prove the local operation can
+            // succeed before sending a remote tombstone; any local or gateway
+            // error rolls back this decision and preserves its source. Earlier
+            // successful decisions are not rolled back by a later failure.
+            let result = (|| -> Result<(), ProjectReviewError> {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                match &decision {
+                    Decision::Keep => {
+                        if pending_ids.contains(&mem.id) {
+                            record_curation_review(&tx, &mem.id, model_name)?;
+                        }
+                    }
+                    Decision::Contradiction { target_id, reason } => {
+                        record_contradiction(&tx, &mem.id, target_id, reason, model_name)?;
+                    }
+                    Decision::Deprecate { reason } => {
+                        set_deprecated(&tx, &mem.id, reason, model_name)?;
+                    }
+                    Decision::Drop => {
+                        q::delete_memory_with_actor(
+                            &tx,
+                            &mem.id,
+                            Some("memory-dream"),
+                            Some("project review drop"),
+                        )?;
+                    }
+                    Decision::MergeInto { .. } => {
+                        q::mark_superseded(&tx, &mem.id, target_id.as_deref().unwrap())?;
+                    }
+                    Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
+                        let new_mem = replacement.ok_or_else(|| {
+                            ProjectReviewError::Parse("missing materialized replacement".into())
+                        })?;
+                        let supersedes = matches!(decision, Decision::SupersedeBy { .. });
+                        persist_replacement(
+                            &tx,
+                            mem,
+                            new_mem,
+                            if supersedes {
+                                "dream_supersede"
+                            } else {
+                                "dream_extract"
+                            },
+                            supersedes,
+                            model_name,
+                        )?;
+                        let sources: Vec<_> = batch.iter().filter(|source| {
+                            matches!(decisions.get(&source.id), Some(Decision::MergeInto { target_id }) if target_id == &mem.id)
+                        }).collect();
+                        if !sources.is_empty() {
+                            agent_memory::concepts::mutate(
+                                &tx,
+                                &new_mem.id,
+                                "dream_merge_sources",
+                                Some("memory-dream"),
+                                None,
+                                false,
+                                |revision| {
+                                    for source in &sources {
+                                        let uri = agent_memory::concepts::canonical_uri(
+                                            &source.id,
+                                            source.project.as_deref(),
+                                        );
+                                        agent_memory::concepts::insert_relationship_with_producer(
+                                            &tx,
+                                            &new_mem.id,
+                                            None,
+                                            &uri,
+                                            "derived_from",
+                                            "memory-dream",
+                                            revision,
+                                            Some(0),
+                                        )?;
+                                    }
+                                    Ok(())
+                                },
+                            )?;
                         }
                     }
                 }
-                // Retired, so it does not flow into Stage A/B — but it is not
-                // gone, and its history and body remain readable.
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        if apply {
-                            "review_deprecate"
-                        } else {
-                            "review_would_deprecate"
-                        },
-                        &[
-                            ("id", render::short_id(&mem.id).to_string()),
-                            ("project", project_label.to_string()),
-                            ("reason", reason),
-                        ]
-                    )
+                if let (Some(config), Some(new_mem)) = (gateway_config, replacement) {
+                    // Confirm the replacement is available remotely before
+                    // retiring its source. Failure rolls back the local rewrite.
+                    agent_memory::gateway_sync::push_memory_update_if_configured(
+                        &tx, config, new_mem,
+                    )?;
+                }
+                if matches!(
+                    decision,
+                    Decision::Drop
+                        | Decision::MergeInto { .. }
+                        | Decision::SupersedeBy { .. }
+                        | Decision::Extract { .. }
+                ) {
+                    // Supersede/drop have a pending-delete queue after their
+                    // local mutation; merge still has its live sync mapping.
+                    if let Some(config) = gateway_config {
+                        agent_memory::gateway_sync::tombstone_memory_before_local_removal(
+                            &tx,
+                            config,
+                            mem,
+                            "memory-dream project review removed memory",
+                        )?;
+                    }
+                    if matches!(decision, Decision::MergeInto { .. }) {
+                        q::prepare_memory_gateway_sync_for_delete(&tx, &mem.id)?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                record_apply_failure(
+                    stats,
+                    retry_ids,
+                    project,
+                    &mem.id,
+                    operation,
+                    &e.to_string(),
                 );
+                failed.insert(mem.id.clone());
+                survivors.push(mem.clone());
+                continue;
+            }
+        }
+        match &decision {
+            Decision::Keep => {
+                stats.kept += 1;
+                survivors.push(mem.clone());
             }
             Decision::Drop => {
                 stats.dropped += 1;
-                if apply {
-                    if let Err(e) = q::delete_memory_with_actor(
-                        &tx,
-                        &mem.id,
-                        Some("memory-dream"),
-                        Some("project review drop"),
-                    ) {
-                        stats.failed += 1;
-                        retry_ids.insert(mem.id.clone());
-                        tracing::warn!(id = %mem.id, error = %e, "review drop failed");
-                        continue;
-                    }
-                }
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        if apply {
-                            "review_drop"
-                        } else {
-                            "review_would_drop"
-                        },
-                        &[
-                            ("id", render::short_id(&mem.id).to_string()),
-                            ("project", project_label.to_string()),
-                        ]
-                    )
-                );
             }
-            Decision::MergeInto { target_id } => {
-                let target_id = replacement_ids
-                    .get(&target_id)
-                    .cloned()
-                    .unwrap_or(target_id);
+            Decision::MergeInto { .. } => {
                 stats.merged += 1;
-                if apply {
-                    if let Err(e) = q::mark_superseded(&tx, &mem.id, &target_id) {
-                        stats.failed += 1;
-                        retry_ids.insert(mem.id.clone());
-                        tracing::warn!(id = %mem.id, target = %target_id, error = %e,
-                            "review merge failed");
-                        continue;
-                    }
-                    if let Err(e) = q::prepare_memory_gateway_sync_for_delete(&tx, &mem.id) {
-                        stats.failed += 1;
-                        retry_ids.insert(mem.id.clone());
-                        tracing::warn!(id = %mem.id, error = %e,
-                            "review merge gateway sync cleanup failed");
-                        continue;
-                    }
-                }
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        if apply {
-                            "review_merge"
-                        } else {
-                            "review_would_merge"
-                        },
-                        &[
-                            ("id", render::short_id(&mem.id).to_string()),
-                            ("target", render::short_id(&target_id).to_string()),
-                            ("project", project_label.to_string()),
-                        ]
-                    )
-                );
             }
-            Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
-                // Materialization ran in Phase 1; if it failed we kept
-                // the source alive and already charged `stats.failed`.
-                if materialize_failed.contains(&mem.id) {
-                    survivors.push(mem.clone());
-                    continue;
-                }
-                let new_mem = materialized
-                    .remove(&mem.id)
-                    .expect("pre-materialized in phase 1");
-                let is_supersede = matches!(decision, Decision::SupersedeBy { .. });
-                if is_supersede {
-                    stats.superseded += 1;
-                } else {
-                    stats.extracted += 1;
-                }
-                // Revision operations are namespaced so an audit filter can
-                // select everything a curation pass did without enumerating
-                // bare verbs that other writers could also use.
-                let label_action = if is_supersede {
-                    "dream_supersede"
-                } else {
-                    "dream_extract"
-                };
-
-                if apply {
-                    // Delete the old row and insert the new one as a
-                    // distinct memory so provenance stays audit-friendly.
-                    if let Err(e) = persist_replacement(
-                        &tx,
-                        mem,
-                        &new_mem,
-                        label_action,
-                        is_supersede,
-                        model_name,
-                    ) {
-                        stats.failed += 1;
-                        retry_ids.extend(batch.iter().map(|m| m.id.clone()));
-                        tracing::warn!(id = %new_mem.id, error = %e,
-                            "review {label_action} replacement failed");
-                        let _ = tx.rollback();
-                        return Ok(());
-                    }
-                    // Every merged source remains discoverable as derivation
-                    // provenance, including when the target itself was replaced.
-                    let merged_sources: Vec<_> = batch.iter().filter(|source| {
-                        matches!(decisions.get(&source.id), Some(Decision::MergeInto { target_id }) if target_id == &mem.id)
-                    }).collect();
-                    if !merged_sources.is_empty() {
-                        agent_memory::concepts::mutate(
-                            &tx,
-                            &new_mem.id,
-                            "dream_merge_sources",
-                            Some("memory-dream"),
-                            None,
-                            false,
-                            |revision| {
-                                for source in &merged_sources {
-                                    let uri = agent_memory::concepts::canonical_uri(
-                                        &source.id,
-                                        source.project.as_deref(),
-                                    );
-                                    agent_memory::concepts::insert_relationship_with_producer(
-                                        &tx,
-                                        &new_mem.id,
-                                        None,
-                                        &uri,
-                                        "derived_from",
-                                        "memory-dream",
-                                        revision,
-                                        Some(0),
-                                    )?;
-                                }
-                                Ok(())
-                            },
-                        )?;
-                    }
-                    gateway_creates.push(new_mem.clone());
-                }
-                survivors.push(new_mem.clone());
-                let tag = if apply {
-                    if is_supersede {
-                        "review_supersede"
-                    } else {
-                        "review_extract"
-                    }
-                } else if is_supersede {
-                    "review_would_supersede"
-                } else {
-                    "review_would_extract"
-                };
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        tag,
-                        &[
-                            ("old_id", render::short_id(&mem.id).to_string()),
-                            ("new_id", render::short_id(&new_mem.id).to_string()),
-                            ("project", project_label.to_string()),
-                        ]
-                    )
-                );
+            Decision::SupersedeBy { .. } => {
+                stats.superseded += 1;
+                survivors.push(replacement.unwrap().clone());
+            }
+            Decision::Extract { .. } => {
+                stats.extracted += 1;
+                survivors.push(replacement.unwrap().clone());
+            }
+            Decision::Deprecate { .. } => {
+                stats.deprecated += 1;
+            }
+            Decision::Contradiction { target_id, .. } => {
+                stats.contradictions += 1;
+                contradiction_ids.insert(mem.id.clone());
+                contradiction_ids.insert(target_id.clone());
+                survivors.push(mem.clone());
             }
         }
-    }
-
-    if apply {
-        tx.commit()?;
-        if let Some(gateway_config) = gateway_config {
-            for mem in &gateway_creates {
+        let mut attrs = vec![
+            ("id", render::short_id(&mem.id).to_string()),
+            ("project", project.unwrap_or("(null)").to_string()),
+        ];
+        if let Some(target) = &target_id {
+            attrs.push(("target", render::short_id(target).to_string()));
+        }
+        if let Some(new_mem) = replacement {
+            attrs.push(("old_id", render::short_id(&mem.id).to_string()));
+            attrs.push(("new_id", render::short_id(&new_mem.id).to_string()));
+        }
+        if let Decision::Contradiction { target_id, reason } = &decision {
+            attrs.push(("target", render::short_id(target_id).to_string()));
+            attrs.push(("reason", reason.clone()));
+        }
+        if let Decision::Deprecate { reason } = &decision {
+            attrs.push(("reason", reason.clone()));
+        }
+        let status = if apply || matches!(decision, Decision::Keep | Decision::Contradiction { .. })
+        {
+            format!("review_{operation}")
+        } else {
+            format!("review_would_{operation}")
+        };
+        println!("{}", render::render_action_result(&status, &attrs));
+        if apply {
+            let push = if matches!(decision, Decision::Deprecate { .. }) {
+                Some(mem)
+            } else {
+                None
+            };
+            if let (Some(config), Some(memory)) = (gateway_config, push) {
                 if let Err(e) = agent_memory::gateway_sync::push_memory_update_if_configured(
-                    conn,
-                    gateway_config,
-                    mem,
+                    conn, config, memory,
                 ) {
-                    stats.failed += 1;
-                    retry_ids.insert(mem.id.clone());
-                    tracing::warn!(id = %mem.id, error = %e,
-                        "review replacement gateway push failed");
-                    println!(
-                        "{}",
-                        render::render_action_result(
-                            "review_gateway_sync_failed",
-                            &[
-                                ("id", render::short_id(&mem.id).to_string()),
-                                ("project", project_label.to_string()),
-                                ("reason", format!("{e}")),
-                            ]
-                        )
+                    record_apply_failure(
+                        stats,
+                        retry_ids,
+                        project,
+                        &memory.id,
+                        "gateway_update",
+                        &e.to_string(),
                     );
                 }
             }
         }
-    } else {
-        tx.rollback()?;
     }
     Ok(())
 }
@@ -1400,6 +1349,247 @@ fn materialize_new_memory(
 mod tests {
     use super::*;
     use crate::inference::FixedInference;
+
+    #[test]
+    fn exact_review_keys_resolve_without_fuzzy_uuid_matching_and_remain_fail_closed() {
+        let batch = vec![
+            mk_memory(
+                "409e0000-0000-0000-0000-00000000b07e",
+                "source",
+                &[],
+                "2026-04-20T00:00:00Z",
+            ),
+            mk_memory("target-uuid", "target", &[], "2026-04-20T00:00:00Z"),
+        ];
+        let parsed = parse_response(r#"{"decisions":{"r1":{"action":"merge_into","target_id":"r2"},"r2":{"action":"keep"}}}"#, &batch).unwrap();
+        assert_eq!(
+            parsed[&batch[0].id],
+            Decision::MergeInto {
+                target_id: batch[1].id.clone()
+            }
+        );
+        for response in [
+            r#"{"decisions":{"r1":{"action":"keep"}}}"#,
+            r#"{"decisions":{"r01":{"action":"keep"},"r2":{"action":"keep"}}}"#,
+            r#"{"decisions":{"409e0000-0000-0000-0000-00000000b07c":{"action":"keep"},"r2":{"action":"keep"}}}"#,
+            r#"{"decisions":{"r1":{"action":"keep"},"409e0000-0000-0000-0000-00000000b07e":{"action":"keep"}}}"#,
+            r#"{"decisions":{"r1":{"action":"keep"},"r2":{"action":"extract","content":"unescaped "quote""}}}"#,
+        ] {
+            assert!(parse_response(response, &batch).is_err(), "{response}");
+        }
+    }
+
+    fn apply_fixture(
+        conn: &mut Connection,
+        batch: &[Memory],
+        decisions: &HashMap<String, Decision>,
+        replacements: &HashMap<String, Memory>,
+        config: Option<&GatewayConfig>,
+    ) -> (ProjectReviewStats, Vec<Memory>, HashSet<String>) {
+        let mut stats = ProjectReviewStats::default();
+        let mut survivors = Vec::new();
+        let mut retry = HashSet::new();
+        apply_materialized_decisions(
+            conn,
+            Some("proj"),
+            batch,
+            decisions,
+            "test-model",
+            config,
+            true,
+            &mut stats,
+            &mut survivors,
+            &mut HashSet::new(),
+            &batch.iter().map(|m| m.id.clone()).collect(),
+            &mut retry,
+            replacements,
+            HashSet::new(),
+        )
+        .unwrap();
+        (stats, survivors, retry)
+    }
+
+    #[test]
+    fn source_preceding_replaced_target_merges_after_replacement_is_persisted() {
+        let mut conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let batch = vec![
+            mk_memory("source", "important source", &[], "2026-04-20T00:00:00Z"),
+            mk_memory("target", "important target", &[], "2026-04-20T00:00:00Z"),
+        ];
+        for m in &batch {
+            q::insert_memory(&conn, m).unwrap();
+        }
+        let replacement = mk_memory(
+            "replacement",
+            "combined guidance",
+            &[],
+            "2026-04-20T00:00:00Z",
+        );
+        let decisions = HashMap::from([
+            (
+                "source".into(),
+                Decision::MergeInto {
+                    target_id: "target".into(),
+                },
+            ),
+            (
+                "target".into(),
+                Decision::SupersedeBy {
+                    content: replacement.content.clone(),
+                    tags: None,
+                },
+            ),
+        ]);
+        let (stats, survivors, retry) = apply_fixture(
+            &mut conn,
+            &batch,
+            &decisions,
+            &HashMap::from([("target".into(), replacement)]),
+            None,
+        );
+        assert_eq!((stats.failed, stats.merged, stats.superseded), (0, 1, 1));
+        assert!(retry.is_empty());
+        assert_eq!(survivors[0].id, "replacement");
+        assert_eq!(
+            q::get_memory_by_id(&conn, "source")
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some("replacement")
+        );
+        assert!(q::get_memory_by_id(&conn, "target").is_err());
+        let provenance: i64 = conn.query_row("SELECT COUNT(*) FROM memory_relationships WHERE src_memory_id='replacement' AND relation='derived_from'", [], |r| r.get(0)).unwrap();
+        assert_eq!(provenance, 2);
+    }
+
+    #[test]
+    fn replacement_insert_failure_keeps_target_and_dependent_source_and_counts_both() {
+        let mut conn = agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+        let batch = vec![
+            mk_memory("source", "important source", &[], "2026-04-20T00:00:00Z"),
+            mk_memory("target", "important target", &[], "2026-04-20T00:00:00Z"),
+        ];
+        for m in &batch {
+            q::insert_memory(&conn, m).unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER fail_replacement BEFORE INSERT ON memories WHEN NEW.id='replacement' BEGIN SELECT RAISE(ABORT, 'replacement insert failed'); END;").unwrap();
+        let replacement = mk_memory(
+            "replacement",
+            "combined guidance",
+            &[],
+            "2026-04-20T00:00:00Z",
+        );
+        let decisions = HashMap::from([
+            (
+                "source".into(),
+                Decision::MergeInto {
+                    target_id: "target".into(),
+                },
+            ),
+            (
+                "target".into(),
+                Decision::SupersedeBy {
+                    content: replacement.content.clone(),
+                    tags: None,
+                },
+            ),
+        ]);
+        let (stats, survivors, retry) = apply_fixture(
+            &mut conn,
+            &batch,
+            &decisions,
+            &HashMap::from([("target".into(), replacement)]),
+            Some(&GatewayConfig {
+                base_url: Some("http://127.0.0.1:1".into()),
+                api_key: Some("fixture".into()),
+                auto_sync: Some(true),
+                ..Default::default()
+            }),
+        );
+        assert_eq!((stats.failed, stats.merged, stats.superseded), (2, 0, 0));
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(retry.len(), 2);
+        for m in &batch {
+            let local = q::get_memory_by_id(&conn, &m.id).unwrap();
+            assert_eq!(local.content, m.content);
+            assert!(local.superseded_by.is_none());
+            assert_eq!(revision_of(&conn, &m.id), 1);
+        }
+        let bindings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM gateway_sync_identity", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(bindings, 0, "no gateway write before failed local insert");
+    }
+
+    #[test]
+    fn local_merge_failure_does_not_tombstone_gateway_source_and_gateway_failure_rolls_back_merge()
+    {
+        for local_failure in [true, false] {
+            let mut conn =
+                agent_memory::db::open_database(std::path::Path::new(":memory:")).unwrap();
+            let batch = vec![
+                mk_memory("source", "important source", &[], "2026-04-20T00:00:00Z"),
+                mk_memory("target", "important target", &[], "2026-04-20T00:00:00Z"),
+            ];
+            for m in &batch {
+                q::insert_memory(&conn, m).unwrap();
+            }
+            q::upsert_memory_gateway_sync(
+                &conn,
+                &agent_memory::db::models::MemoryGatewaySyncUpsert {
+                    local_memory_id: "source".into(),
+                    project: "proj".into(),
+                    gateway_memory_id: "remote-source".into(),
+                    last_seen_server_revision: 9,
+                    last_pushed_content_hash: Some("acknowledged".into()),
+                    last_pulled_content_hash: None,
+                    sync_state: "linked".into(),
+                    tombstone_deleted: false,
+                    tombstone_at: None,
+                },
+            )
+            .unwrap();
+            if local_failure {
+                conn.execute_batch("CREATE TRIGGER fail_merge BEFORE UPDATE OF superseded_by ON memories WHEN NEW.id='source' BEGIN SELECT RAISE(ABORT, 'merge write failed'); END;").unwrap();
+            }
+            let decisions = HashMap::from([
+                (
+                    "source".into(),
+                    Decision::MergeInto {
+                        target_id: "target".into(),
+                    },
+                ),
+                ("target".into(), Decision::Keep),
+            ]);
+            let (stats, survivors, retry) = apply_fixture(
+                &mut conn,
+                &batch,
+                &decisions,
+                &HashMap::new(),
+                Some(&GatewayConfig {
+                    base_url: Some("http://127.0.0.1:1".into()),
+                    api_key: Some("fixture".into()),
+                    auto_sync: Some(true),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!((stats.failed, stats.merged), (1, 0));
+            assert_eq!(survivors.len(), 2);
+            assert!(retry.contains("source"));
+            assert!(q::get_memory_by_id(&conn, "source")
+                .unwrap()
+                .superseded_by
+                .is_none());
+            assert_eq!(revision_of(&conn, "source"), 1);
+            let sync = q::get_memory_gateway_sync(&conn, "source")
+                .unwrap()
+                .unwrap();
+            assert!(!sync.tombstone_deleted);
+            assert_eq!(sync.last_seen_server_revision, 9);
+        }
+    }
 
     fn mk_memory(id: &str, content: &str, tags: &[&str], updated_at: &str) -> Memory {
         Memory {

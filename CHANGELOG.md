@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.13.7 - 2026-10-13
+
+- Recover confirmed absent gateway counterparts and safely rebase mismatched
+  revisions against acknowledged content or exact older retained history,
+  preserving local content and history.
+  Protect divergent remote content and tombstones; bind sync state to its endpoint.
+- Accept gateway record IDs and revision pagination during recovery. Global
+  references use the authorized wire type while retaining local/OKF semantics.
+- Persist and publish review replacements before retiring sources or applying
+  dependent merges. Isolate failed decisions and retain their source memories.
+- Use exact batch-local review keys to reduce UUID copying errors without fuzzy
+  matching or relaxing fail-closed coverage, JSON validation, model or size limits.
+- Emit structured records for every counted review, deduplication and processing
+  failure, with CLI accounting and storage safety regressions.
+
 ## v1.13.6 - 2026-10-13
 
 - Retain successful condensation when project review fails. Ordinary passes

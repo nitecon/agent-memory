@@ -62,7 +62,10 @@ content:
         - memory update <id> --content ... rewrites the local row first, then pushes that single updated memory to the gateway; on gateway failure the local update remains and memory push is the retry surface.
         - memory forget --id or --query pushes a gateway tombstone before deleting a linked local row; if the gateway explicitly reports that the linked target is already absent, that is accepted as an idempotent success, while all other failures keep the local row for a safe retry.
         - If a linked row is deleted locally without a successful direct gateway tombstone, memory records a pending delete queue item so the next memory push or memory push --all can tombstone the gateway record.
-        - memory-dream uses the same direct gateway write helpers for condense rewrites, forget/drop decisions, and superseded memories when gateway auto-sync is enabled.
+        - memory-dream uses the same gateway write helpers for condense rewrites, forget/drop decisions, and superseded memories when gateway auto-sync is enabled. Review decisions attempt local writes inside individual transactions before remote removal, rolling back failed decisions; replacement gateway pushes precede source tombstones.
+        - Stale-ID/revision recovery reads a complete paginated remote snapshot, then retries once only for confirmed absent counterparts or content equal to acknowledged/desired state or exact retained body/type/tags for a remote revision older than the retained base. Unseen remote content and remote tombstones remain protected; OKF rebases additionally require equal semantic hashes.
+        - Sync mappings, pending deletes and pull cursors bind to the normalized endpoint on first synchronization. A different endpoint requires a separate database; state is never silently reused or discarded.
+        - Global records use the global legacy wire type while retaining local reference semantics and optional OKF memory_type metadata.
     - name: Recover an incompatible Linux binary
       steps:
         - Recognize a startup error naming a missing GLIBC version as a release ABI incompatibility; the in-process memory update command cannot run in this state.
@@ -165,7 +168,7 @@ content:
           - Dream-created relationship producer and revision actor are both memory-dream.
           - A terminal summary with failed greater than zero is followed by a non-zero process exit.
           - Each project-review inference or parse fallback emits review_failed and increments failed while conservatively passing the affected memories onward.
-          - Structured project-review output must cover every memory in the batch exactly and may not invent IDs; incomplete or unknown-key responses fail closed to the visible all-keep fallback.
+          - Structured project-review output must cover every memory in the batch exactly using exact batch-local keys (r1, r2, etc.) or canonical IDs; incomplete, unknown-key and duplicate-alias responses fail closed. UUIDs are never fuzzy-matched.
           - Stage B accepts KEEP_UNCHANGED as its no-op token and rejects the legacy skip token so a stuck model cannot report total non-response as successful curation.
       - name: memory okf
         purpose: Operate on SQLite-canonical OKF concepts through virtual Markdown document and bundle handlers.
@@ -557,11 +560,12 @@ content:
             - concept_hash
             - okf
           compatibility:
-            - memory accepts project as an alias for project_ident on responses.
+            - memory accepts project as an alias for project_ident and id as an alias for gateway_memory_id on responses.
+            - Recovery follows next_since_revision or next_cursor through all pages before concluding a counterpart is absent.
             - memory accepts base_server_revision as an alias for base_gateway_revision on responses.
             - content_hash is the gateway-compatible lowercase SHA-256 hex digest of content bytes, with no sha256: prefix.
             - memory serializes created_at and updated_at to the gateway as Unix epoch milliseconds, and accepts either epoch milliseconds or RFC3339 strings on responses.
-            - Direct forget/supersede flows send tombstone.deleted=true with gateway_memory_id and base_gateway_revision before hiding or deleting the local row.
+            - Direct forget sends a tombstone with gateway_memory_id and base_gateway_revision before local deletion. Dream review attempts local mutations transactionally, publishes replacements, then tombstones sources before committing. Failed decisions retain sources and emit review_apply_failed.
             - Deferred delete pushes synthesize tombstone.deleted=true from memory_gateway_delete_queue after the local row has been deleted or superseded.
             - OKF fields are omitted unless AGENT_MEMORY_GATEWAY_OKF or MEMORY_GATEWAY_OKF is explicitly true.
             - A capable payload retains legacy content/content_hash and adds concept_hash plus an okf envelope with version=1, format=okf-markdown, revision, semantic_hash, canonical document text, and extension fields.
@@ -587,7 +591,7 @@ content:
             - Use source_system for the memory client/system.
             - Use pushed_at for the gateway push timestamp.
       deconfliction:
-        push: Client sends base_server_revision when linked; gateway returns conflict for stale updates.
+        push: Client sends base_gateway_revision when linked. Stale IDs/revisions trigger complete remote snapshot verification and at most one safe retry; different content/tombstones remain protected. Sync state binds to the endpoint.
         pull: Client updates only when local content hash matches last_pulled_content_hash or last_pushed_content_hash.
     durable_memory:
       scopes:

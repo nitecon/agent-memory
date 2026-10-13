@@ -294,6 +294,25 @@ status contacts the gateway in both modes; with `--all` it first discovers
 remote project idents, then prints each per-project plan without writing local
 memory rows, sync metadata, or pull cursors.
 
+Sync mappings, pending deletes and pull cursors are bound to the normalized
+gateway endpoint on first synchronization. A different endpoint requires a
+separate memory database; the client refuses to reuse existing state there.
+It does not change the configured gateway URL.
+
+For stale IDs and revision conflicts, the client reads every remote page before
+attempting one verified retry. A confirmed absent counterpart can be recreated.
+A divergent revision can be rebased when remote content matches the last
+acknowledged content or the desired body. An older remote revision can also be
+advanced when its body, type and tags exactly match retained local history.
+Unseen remote content stays in
+conflict; remote tombstones are never resurrected by recovery. With OKF enabled,
+semantic hashes must also match before rebasing. Recovery preserves local
+content, raw content and immutable history.
+
+Global memories use the authorized `global` legacy wire type. Local reference
+semantics remain intact, including in the optional OKF envelope and existing
+local rows reconciled by pull.
+
 Push outcomes are `created`, `updated`, `linked`, `conflict`, or `rejected`.
 Pull outcomes are `import`, `update`, `link`, `tombstone`, `conflict`,
 `skipped`, or `rejected`. Semantic near-duplicates are not silently merged
@@ -895,7 +914,8 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 - **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.
 - **Truthful review fallback**: every project-review inference or parse failure emits `review_failed`, increments the pass failure count, and still conservatively passes the affected memories to later stages.
 - **Independent processing progress**: successful per-memory condensation survives a failed project review. Ordinary retries revisit the pending review without repeating condensation; real condensation/dedup/gateway-write failures remain retryable. Same-content gateway reconciliation preserves freshness.
-- **Exact review coverage**: structured review output must contain exactly the real memory IDs in its batch. Missing or invented keys reject the whole response instead of turning constrained-but-incompetent JSON into a silent all-keep success.
+- **Exact review coverage**: the prompt assigns exact batch-local keys (`r1`, `r2`, etc.) to reduce UUID copying errors. Every key must appear once; canonical IDs remain accepted. Missing, invented or duplicate aliases reject the batch. No fuzzy ID matching is used.
+- **Replacement dependencies**: replacements are persisted before dependent merges, and local mutations are attempted before remote tombstones. A replacement gateway push must succeed before its source is retired. Each failed decision preserves its source, stays retryable and emits `review_apply_failed`; counted processing and deduplication errors also emit structured failure records.
 - **Idempotent gateway deletion**: a gateway response proving that a linked tombstone target is already absent is accepted as the desired end state; other conflicts and rejections remain hard failures.
 - **Headless prompt isolation**: Dream subprocesses disable automatic memory and agent-tools hooks, preventing recursive retrieval from being prepended to the curation prompt.
 - **Single-pass lock**: overlapping cron/manual invocations skip cleanly instead of curating the same rows concurrently.

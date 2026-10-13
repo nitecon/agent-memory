@@ -49,7 +49,7 @@ pub fn build_project_review_prompt(project: Option<&str>, memories: &[Memory]) -
         count = memories.len(),
     ));
 
-    for mem in memories {
+    for (index, mem) in memories.iter().enumerate() {
         let tags = mem
             .tags
             .as_ref()
@@ -57,7 +57,8 @@ pub fn build_project_review_prompt(project: Option<&str>, memories: &[Memory]) -
             .unwrap_or_else(|| "-".to_string());
         let mtype = mem.memory_type.as_deref().unwrap_or("-");
         prompt.push_str(&format!(
-            "---\nid: {id}\ntype: {mtype}\ntags: {tags}\ncreated_at: {created}\nupdated_at: {updated}\ncharacters: {chars}\nsingle_rewrite_max_characters: {maximum}\n<<<CONTENT>>>\n{content}\n<<<END_CONTENT>>>\n",
+            "---\nreview_key: {key}\nid: {id}\ntype: {mtype}\ntags: {tags}\ncreated_at: {created}\nupdated_at: {updated}\ncharacters: {chars}\nsingle_rewrite_max_characters: {maximum}\n<<<CONTENT>>>\n{content}\n<<<END_CONTENT>>>\n",
+            key = format_args!("r{}", index + 1),
             id = mem.id,
             mtype = mtype,
             tags = tags,
@@ -72,7 +73,8 @@ pub fn build_project_review_prompt(project: Option<&str>, memories: &[Memory]) -
     }
 
     prompt.push_str("<<<END_MEMORIES>>>\n\n");
-    prompt.push_str("RESPONSE:");
+    let keys: Vec<_> = (1..=memories.len()).map(|n| format!("r{n}")).collect();
+    prompt.push_str(&format!("Allowed decision keys (cover each exactly once): {}. Use these review_key values for decisions and target_id; never copy or reconstruct UUIDs. Encode content and reasons as JSON strings with escaped quotes and newlines.\nRESPONSE:", keys.join(", ")));
     prompt
 }
 
@@ -95,6 +97,9 @@ markdown code fences, no commentary before or after. The exact shape:
     ...
   }
 }
+
+Decision keys and target_id MUST use the exact review_key values printed in INPUT
+(r1, r2, ...). Include EVERY key exactly once. Do not use UUIDs or example IDs.
 
 Every decision value is one of:
 
