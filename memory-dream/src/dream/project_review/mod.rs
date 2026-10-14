@@ -124,6 +124,8 @@ pub enum ProjectReviewError {
 pub enum Decision {
     /// Leave the memory in place; it flows into Stage A / B unchanged.
     Keep,
+    /// Reject an over-budget proposal while preserving all of its sources.
+    KeepOriginal { reason: String },
     /// Delete the memory outright (reconstructable from git, pure noise,
     /// etc.). No replacement is created.
     Drop,
@@ -872,6 +874,7 @@ pub fn parse_response(
     // Validate output lengths before embeddings, gateway calls or DB writes.
     // A merged target's budget includes its incoming sources; single rewrites
     // retain the original raw baseline so refreshes cannot compound growth.
+    let mut budget_keeps = Vec::new();
     for mem in batch {
         let incoming: Vec<_> = batch.iter().filter(|source| {
             matches!(out.get(&source.id), Some(Decision::MergeInto { target_id }) if target_id == &mem.id)
@@ -900,12 +903,25 @@ pub fn parse_response(
                 combined.saturating_mul(3) / 4,
             )
         };
-        if body.trim().is_empty() || body.trim().chars().count() > maximum {
+        if body.trim().is_empty() {
             return Err(ProjectReviewError::Parse(format!(
                 "replacement length outside allowed budget for {}: characters={}, maximum={maximum}",
                 mem.id, body.trim().chars().count()
             )));
         }
+        if body.trim().chars().count() > maximum {
+            let reason = format!(
+                "replacement length exceeds allowed budget for {}: characters={}, maximum={maximum}; original sources retained",
+                mem.id, body.trim().chars().count()
+            );
+            budget_keeps.push((mem.id.clone(), reason.clone()));
+            budget_keeps.extend(incoming.iter().map(|m| (m.id.clone(), reason.clone())));
+        }
+    }
+    // Validate the complete proposal before changing it: every source feeding
+    // an over-cap target must survive, regardless of batch iteration order.
+    for (id, reason) in budget_keeps {
+        out.insert(id, Decision::KeepOriginal { reason });
     }
 
     Ok(out)
@@ -1091,6 +1107,7 @@ fn apply_materialized_decisions(
         let replacement = materialized.get(&mem.id);
         let operation = match &decision {
             Decision::Keep => "keep",
+            Decision::KeepOriginal { .. } => "converged",
             Decision::Drop => "drop",
             Decision::MergeInto { .. } => "merge",
             Decision::SupersedeBy { .. } => "supersede",
@@ -1107,7 +1124,7 @@ fn apply_materialized_decisions(
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 match &decision {
-                    Decision::Keep => {
+                    Decision::Keep | Decision::KeepOriginal { .. } => {
                         if pending_ids.contains(&mem.id) {
                             record_curation_review(&tx, &mem.id, model_name)?;
                         }
@@ -1226,7 +1243,7 @@ fn apply_materialized_decisions(
             }
         }
         match &decision {
-            Decision::Keep => {
+            Decision::Keep | Decision::KeepOriginal { .. } => {
                 stats.kept += 1;
                 survivors.push(mem.clone());
             }
@@ -1270,6 +1287,9 @@ fn apply_materialized_decisions(
             attrs.push(("reason", reason.clone()));
         }
         if let Decision::Deprecate { reason } = &decision {
+            attrs.push(("reason", reason.clone()));
+        }
+        if let Decision::KeepOriginal { reason } = &decision {
             attrs.push(("reason", reason.clone()));
         }
         let status = if apply || matches!(decision, Decision::Keep | Decision::Contradiction { .. })

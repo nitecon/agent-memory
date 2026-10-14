@@ -636,7 +636,11 @@ fn push_result_error(operation: &str, result: &PushMemoryResult) -> MemoryError 
         message.push_str(": ");
         message.push_str(&error.message);
     }
-    MemoryError::Config(message)
+    if result.action == PushMemoryAction::Conflict {
+        MemoryError::GatewayConflict(message)
+    } else {
+        MemoryError::Config(message)
+    }
 }
 
 fn tombstone_target_is_already_absent(result: &PushMemoryResult) -> bool {

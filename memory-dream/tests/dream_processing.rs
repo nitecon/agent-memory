@@ -457,25 +457,26 @@ fn gateway_rejected_rewrite_remains_unstamped_and_retries_after_reopening() {
     let mut conn = open_database(&path).unwrap();
     let original = "Pin cu128 explicitly on sm_120 to avoid fallback kernels.";
     let first_body = "Pin cu128 on sm_120 to avoid fallback kernels.";
-    let final_body = "Avoid fallback kernels on sm_120 by explicitly pinning cu128.";
     insert(&conn, "rewrite", original);
     let (gateway, server) = fixture_gateway(vec![
         push_reply("rejected", first_body, 1),
-        push_reply("created", final_body, 2),
+        push_reply("created", first_body, 2),
     ]);
     let inf = model(|prompt: &str| {
         if prompt.contains("Memory count:") {
             keep_review(prompt)
-        } else if prompt.contains(&format!("<<<MEMORY>>>\n{original}\n<<<END>>>")) {
-            first_body.into()
         } else {
-            final_body.into()
+            first_body.into()
         }
     });
     let cache = std::env::temp_dir();
     let mut cfg = DreamConfig::new(DreamMode::Apply, "test:model", &cache);
     cfg.gateway_config = Some(&gateway);
     assert_eq!(run(&mut conn, &inf, &cfg).unwrap().failed, 1);
+    assert_eq!(
+        q::get_memory_by_id(&conn, "rewrite").unwrap().content,
+        original
+    );
     assert!(q::get_memory_by_id(&conn, "rewrite")
         .unwrap()
         .condenser_version
@@ -492,7 +493,7 @@ fn gateway_rejected_rewrite_remains_unstamped_and_retries_after_reopening() {
     );
     assert_eq!(
         q::get_memory_by_id(&conn, "rewrite").unwrap().content,
-        final_body
+        first_body
     );
     assert_eq!(run(&mut conn, &inf, &cfg).unwrap().total_walked, 0);
     assert_eq!(server.join().unwrap().len(), 2);
@@ -654,19 +655,30 @@ fn merge_budget_is_three_quarters_of_combined_unicode_characters() {
     let mut right = left.clone();
     left.id = "left".into();
     right.id = "right".into();
-    for (length, accepted) in [(15, true), (16, false)] {
+    for length in [15, 16] {
         let reply = serde_json::json!({"decisions": {
             "left": {"action": "merge_into", "target_id": "right"},
             "right": {"action": "supersede_by", "content": "é".repeat(length)}
         }})
         .to_string();
         let result = parse_response(&reply, &[left.clone(), right.clone()]);
-        assert_eq!(result.is_ok(), accepted);
-        if let Ok(decisions) = result {
+        let decisions = result.unwrap();
+        if length == 15 {
             assert!(matches!(
                 decisions.get("left"),
                 Some(Decision::MergeInto { .. })
             ));
+            assert!(matches!(
+                decisions.get("right"),
+                Some(Decision::SupersedeBy { .. })
+            ));
+        } else {
+            for id in ["left", "right"] {
+                assert!(matches!(
+                    decisions.get(id),
+                    Some(Decision::KeepOriginal { .. })
+                ));
+            }
         }
     }
 }
@@ -741,4 +753,152 @@ fn failed_removal_of_processed_context_remains_retryable() {
     assert_eq!(run(&mut conn, &drop, &cfg).unwrap().total_walked, 1);
     assert!(q::get_memory_by_id(&conn, "old").is_err());
     assert_eq!(run(&mut conn, &keep, &cfg).unwrap().total_walked, 0);
+}
+
+#[test]
+fn over_budget_review_keeps_all_merge_sources_and_condensation_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let mut conn = open_database(&path).unwrap();
+    let bodies = [
+        ("source", "Supported source guidance."),
+        ("target", "Supported target guidance."),
+    ];
+    for (id, body) in bodies {
+        insert(&conn, id, body);
+    }
+    let inf = model(|prompt: &str| {
+        if prompt.contains("Memory count:") {
+            serde_json::json!({"decisions": {
+                "source": {"action":"merge_into", "target_id":"target"},
+                "target": {"action":"supersede_by", "content":"é".repeat(100)}
+            }})
+            .to_string()
+        } else {
+            "é".repeat(100)
+        }
+    });
+    let cache = std::env::temp_dir();
+    let mut cfg = DreamConfig::new(DreamMode::Dry, "test:model", &cache);
+    let dry = run(&mut conn, &inf, &cfg).unwrap();
+    assert_eq!((dry.failed, dry.kept, dry.review_kept), (0, 2, 2));
+    for (id, body) in bodies {
+        let m = q::get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(m.content, body);
+        assert!(m.condenser_version.is_none());
+        assert_eq!(revision(&conn, id), 1);
+    }
+    cfg.mode = DreamMode::Apply;
+    let first = run(&mut conn, &inf, &cfg).unwrap();
+    assert_eq!((first.failed, first.kept, first.review_kept), (0, 2, 2));
+    assert_eq!(
+        q::list_dream_candidates(&conn, Some("test"), None, None, 0)
+            .unwrap()
+            .len(),
+        2
+    );
+    let calls = inf.prompts.lock().unwrap().len();
+    for _ in 0..2 {
+        drop(conn);
+        conn = open_database(&path).unwrap();
+        assert_eq!(run(&mut conn, &inf, &cfg).unwrap().total_walked, 0);
+        for (id, body) in bodies {
+            let m = q::get_memory_by_id(&conn, id).unwrap();
+            assert_eq!(m.content, body);
+            assert!(m.content_raw.is_none());
+            assert!(m.superseded_by.is_none());
+            assert!(m.condenser_version.is_some());
+        }
+    }
+    assert_eq!(inf.prompts.lock().unwrap().len(), calls);
+}
+
+#[test]
+fn persistent_gateway_conflict_rolls_back_rewrite_and_converges_but_rejection_retries() {
+    use agent_memory::db::models::MemoryGatewaySyncUpsert;
+    for action in ["conflict", "rejected"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        let mut conn = open_database(&path).unwrap();
+        let original = "Pin cu128 explicitly on sm_120 to avoid fallback kernels.";
+        let rewritten = "Pin cu128 on sm_120 to avoid fallback kernels.";
+        insert(&conn, "rewrite", original);
+        q::upsert_memory_gateway_sync(
+            &conn,
+            &MemoryGatewaySyncUpsert {
+                local_memory_id: "rewrite".into(),
+                project: "test".into(),
+                gateway_memory_id: "gw-rewrite".into(),
+                last_seen_server_revision: 5,
+                last_pushed_content_hash: Some(agent_memory::sync::memory_content_hash(
+                    original,
+                    "user",
+                    &[],
+                )),
+                last_pulled_content_hash: None,
+                sync_state: "linked".into(),
+                tombstone_deleted: false,
+                tombstone_at: None,
+            },
+        )
+        .unwrap();
+        let mut responses = vec![
+            serde_json::json!({"project_ident":"test", "server_revision":6, "results":[{
+                "local_memory_id":"rewrite", "gateway_memory_id":"gw-rewrite", "server_revision":6,
+                "action":action, "error":"fixture policy or revision conflict"
+            }]}),
+        ];
+        if action == "conflict" {
+            responses.push(serde_json::json!({"project_ident":"test", "server_revision":6, "memories":[{
+                "project_ident":"test", "gateway_memory_id":"gw-rewrite", "server_revision":6,
+                "content":"independent remote edit", "memory_type":"user",
+                "content_hash":agent_memory::sync::memory_content_hash("independent remote edit", "user", &[])
+            }]}));
+        }
+        let (gateway, server) = fixture_gateway(responses);
+        let inf = model(|prompt: &str| {
+            if prompt.contains("Memory count:") {
+                keep_review(prompt)
+            } else {
+                rewritten.into()
+            }
+        });
+        let cache = std::env::temp_dir();
+        let mut cfg = DreamConfig::new(DreamMode::Apply, "test:model", &cache);
+        cfg.gateway_config = Some(&gateway);
+        let result = run(&mut conn, &inf, &cfg).unwrap();
+        assert_eq!(result.rewritten, 0);
+        assert_eq!(result.failed, usize::from(action == "rejected"));
+        assert_eq!(result.kept, usize::from(action == "conflict"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), if action == "conflict" { 2 } else { 1 });
+        let m = q::get_memory_by_id(&conn, "rewrite").unwrap();
+        assert_eq!(m.content, original);
+        assert!(m.content_raw.is_none());
+        assert_eq!(m.condenser_version.is_some(), action == "conflict");
+        let rewrite_revisions: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memory_revisions WHERE operation = 'dream_condense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rewrite_revisions, 0);
+        assert_eq!(
+            q::get_memory_gateway_sync(&conn, "rewrite")
+                .unwrap()
+                .unwrap()
+                .last_seen_server_revision,
+            5
+        );
+        if action == "conflict" {
+            let calls = inf.prompts.lock().unwrap().len();
+            for _ in 0..2 {
+                drop(conn);
+                conn = open_database(&path).unwrap();
+                assert_eq!(run(&mut conn, &inf, &cfg).unwrap().total_walked, 0);
+            }
+            assert_eq!(inf.prompts.lock().unwrap().len(), calls);
+        }
+    }
 }

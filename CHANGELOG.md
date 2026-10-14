@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.13.9 - 2026-10-14
+
+- Converge over-budget Dream proposals by retaining and stamping original
+  memories, including every source of a rejected merge. Preserve the 150% raw
+  baseline and 75% combined-source limits and emit structured convergence records.
+- Roll back condensation rewrites when bounded safe gateway reconciliation
+  still conflicts, preserving both sides and marking the optimization processed.
+  Rejections, transport errors and persistence failures remain retryable failures.
+- Verify ordinary repeat passes, dry-run preservation, exact failure accounting,
+  Unicode limits and conflict rollback with persistent database and CLI regressions.
+
 ## v1.13.8 - 2026-10-13
 
 - Recover confirmed absent gateway counterparts and safely rebase mismatched

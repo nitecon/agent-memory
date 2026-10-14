@@ -23,6 +23,9 @@ pub enum MemoryError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("{0}")]
+    GatewayConflict(String),
+
     #[error("Update error: {0}")]
     Update(String),
 

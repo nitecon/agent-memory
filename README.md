@@ -908,7 +908,7 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 ### Safety nets
 
 - **Prompt injection defense**: the condensation prompt wraps memory content in `<<<MEMORY>>> ... <<<END>>>` and explicitly instructs the model to treat anything inside as data, not instructions. The no-op response is the explicit token `KEEP_UNCHANGED`; the legacy `skip` response is rejected so a model stuck on that generic fallback cannot masquerade as a successful curation pass.
-- **Bounded growth**: source-supported single-memory rewrites may grow by at most 50% of their original baseline. Merged output must fit within 75% of the combined source lengths. Limits count Unicode characters; rejected output leaves the sources available for retry.
+- **Bounded growth**: source-supported single-memory rewrites may grow by at most 50% of their original baseline. Merged output must fit within 75% of the combined source lengths. Limits count Unicode characters. Over-budget proposals keep every original source and stamp the work processed; they emit `condense_converged` or `review_converged` and do not fail the pass. Edits, new evidence and `--refresh` still trigger re-evaluation.
 - **Refusal detection**: responses matching `I cannot`, `I'm sorry, but`, `as a language model`, etc. fall back to the raw memory.
 - **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
 - **Truthful process status**: the terminal summary includes the inference identity and elapsed time, and the process exits non-zero when any operations failed.
@@ -917,6 +917,7 @@ Dedup candidates must share the same `project` AND same `memory_type` AND same `
 - **Exact review coverage**: the prompt assigns exact batch-local keys (`r1`, `r2`, etc.) to reduce UUID copying errors. Every key must appear once; canonical IDs remain accepted. Missing, invented or duplicate aliases reject the batch. No fuzzy ID matching is used.
 - **Replacement dependencies**: replacements are persisted before dependent merges, and local mutations are attempted before remote tombstones. A replacement gateway push must succeed before its source is retired. Each failed decision preserves its source, stays retryable and emits `review_apply_failed`; counted processing and deduplication errors also emit structured failure records.
 - **Idempotent gateway deletion**: a gateway response proving that a linked tombstone target is already absent is accepted as the desired end state; other conflicts and rejections remain hard failures.
+- **Conservative rewrite conflicts**: after bounded safe gateway reconciliation, a remaining condensation conflict rolls back the proposed rewrite, preserves both local and remote content, and emits `condense_converged`. It is stamped as processed so ordinary passes do not repeat the same optimization. Gateway rejections and transport errors remain counted, retryable failures.
 - **Headless prompt isolation**: Dream subprocesses disable automatic memory and agent-tools hooks, preventing recursive retrieval from being prepended to the curation prompt.
 - **Single-pass lock**: overlapping cron/manual invocations skip cleanly instead of curating the same rows concurrently.
 - **`--dry-run` writes nothing**: row counts are identical before/after a dry-run pass.

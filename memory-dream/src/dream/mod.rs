@@ -753,7 +753,7 @@ fn dedup_superseded_memory(source: &Memory, decision: &dedup::DedupDecision<'_>)
 /// trip and stalled concurrent `memory store`/`update`/`forget` for the
 /// entire pass. See Issue: DB-lock-during-dream.
 fn run_stage_b_condense(
-    conn: &Connection,
+    conn: &mut Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
     source: &Memory,
@@ -771,35 +771,10 @@ fn run_stage_b_condense(
 
     match outcome {
         Ok(condense::Decision::Skip) => {
-            stats.kept += 1;
-            if cfg.mode == DreamMode::Apply {
-                // A skip is the condenser reading the body and finding nothing
-                // to improve — the same confirmation the review pass records.
-                if let Err(e) =
-                    project_review::record_curation_review(conn, &source.id, cfg.model_name)
-                {
-                    stats.failed += 1;
-                    tracing::warn!(id = %source.id, error = %e,
-                        "condense skip confirmation failed");
-                    println!(
-                        "{}",
-                        render::render_action_result(
-                            "condense_failed",
-                            &[
-                                ("id", render::short_id(&source.id).to_string()),
-                                ("reason", e.to_string()),
-                            ]
-                        )
-                    );
-                }
-            }
-            println!(
-                "{}",
-                render::render_action_result(
-                    "kept",
-                    &[("id", render::short_id(&source.id).to_string())]
-                )
-            );
+            keep_condense_original(conn, cfg, source, stats, None);
+        }
+        Err(e @ condense::CondenseError::TooLong { .. }) => {
+            keep_condense_original(conn, cfg, source, stats, Some(&e.to_string()));
         }
         Ok(condense::Decision::Forget) => {
             if cfg.mode == DreamMode::Apply {
@@ -896,41 +871,42 @@ fn run_stage_b_condense(
                 // Preserve the ORIGINAL raw body: update_content uses
                 // COALESCE(content_raw, content) so a re-condensation
                 // never chains through an intermediate condensed form.
-                match q::update_condensation(
-                    conn,
-                    &source.id,
-                    &text,
-                    source.content_raw.as_deref().unwrap_or(&source.content),
-                    &prompt::condenser_version_stamp(cfg.model_name),
-                    &generated_by(cfg.model_name),
-                    &new_emb,
-                    EMBEDDING_MODEL_NAME,
-                ) {
+                // A rejected optimization must not leave a new local body
+                // behind. Roll back the rewrite and sync metadata together.
+                let result = (|| {
+                    let tx = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(|e| {
+                            ("condense_failed", agent_memory::error::MemoryError::from(e))
+                        })?;
+                    q::update_condensation(
+                        &tx,
+                        &source.id,
+                        &text,
+                        source.content_raw.as_deref().unwrap_or(&source.content),
+                        &prompt::condenser_version_stamp(cfg.model_name),
+                        &generated_by(cfg.model_name),
+                        &new_emb,
+                        EMBEDDING_MODEL_NAME,
+                    )
+                    .map_err(|e| ("condense_failed", e))?;
+                    if let Some(gateway_config) = cfg.gateway_config {
+                        let memory = q::get_memory_by_id(&tx, &source.id)
+                            .map_err(|e| ("condense_failed", e))?;
+                        agent_memory::gateway_sync::push_memory_update_if_configured(
+                            &tx,
+                            gateway_config,
+                            &memory,
+                        )
+                        .map_err(|e| ("condense_gateway_sync_failed", e))?;
+                    }
+                    tx.commit().map_err(|e| {
+                        ("condense_failed", agent_memory::error::MemoryError::from(e))
+                    })?;
+                    Ok::<_, (&str, agent_memory::error::MemoryError)>(())
+                })();
+                match result {
                     Ok(()) => {
-                        if let Some(gateway_config) = cfg.gateway_config {
-                            match q::get_memory_by_id(conn, &source.id).and_then(|memory| {
-                                agent_memory::gateway_sync::push_memory_update_if_configured(
-                                    conn,
-                                    gateway_config,
-                                    &memory,
-                                )
-                            }) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    stats.failed += 1;
-                                    println!(
-                                        "{}",
-                                        render::render_action_result(
-                                            "condense_gateway_sync_failed",
-                                            &[
-                                                ("id", render::short_id(&source.id).to_string()),
-                                                ("reason", format!("{e}")),
-                                            ]
-                                        )
-                                    );
-                                }
-                            }
-                        }
                         stats.rewritten += 1;
                         println!(
                             "{}",
@@ -940,20 +916,25 @@ fn run_stage_b_condense(
                                     ("id", render::short_id(&source.id).to_string()),
                                     ("bytes_before", bytes_before.to_string()),
                                     ("bytes_after", bytes_after.to_string()),
-                                ]
+                                ],
                             )
                         );
                     }
-                    Err(e) => {
+                    Err((_, agent_memory::error::MemoryError::GatewayConflict(reason))) => {
+                        // Reconciliation has already made its bounded safe
+                        // retry. Keep both sides rather than force an overwrite.
+                        keep_condense_original(conn, cfg, source, stats, Some(&reason));
+                    }
+                    Err((status, e)) => {
                         stats.failed += 1;
                         println!(
                             "{}",
                             render::render_action_result(
-                                "condense_failed",
+                                status,
                                 &[
                                     ("id", render::short_id(&source.id).to_string()),
-                                    ("reason", format!("update: {e}")),
-                                ]
+                                    ("reason", e.to_string()),
+                                ],
                             )
                         );
                     }
@@ -988,6 +969,44 @@ fn run_stage_b_condense(
             );
         }
     }
+}
+
+// Conservative terminal outcomes use the same processing stamp as an explicit
+// keep. Inference, parsing, persistence and transport errors remain retryable.
+fn keep_condense_original(
+    conn: &Connection,
+    cfg: &DreamConfig<'_>,
+    source: &Memory,
+    stats: &mut ProjectStats,
+    reason: Option<&str>,
+) {
+    if cfg.mode == DreamMode::Apply {
+        if let Err(e) = project_review::record_curation_review(conn, &source.id, cfg.model_name) {
+            stats.failed += 1;
+            println!(
+                "{}",
+                render::render_action_result(
+                    "condense_failed",
+                    &[
+                        ("id", render::short_id(&source.id).to_string()),
+                        ("reason", e.to_string()),
+                    ],
+                )
+            );
+            return;
+        }
+    }
+    stats.kept += 1;
+    let mut attrs = vec![("id", render::short_id(&source.id).to_string())];
+    if let Some(reason) = reason {
+        attrs.push(("reason", reason.to_string()));
+    }
+    let status = match (reason.is_some(), cfg.mode) {
+        (true, DreamMode::Apply) => "condense_converged",
+        (true, DreamMode::Dry) => "condense_would_keep_original",
+        (false, _) => "kept",
+    };
+    println!("{}", render::render_action_result(status, &attrs));
 }
 
 #[cfg(test)]
@@ -1500,17 +1519,14 @@ mod tests {
         assert!(ts.is_none(), "dry-run must not stamp project_state");
     }
 
-    /// A malformed response (neither `KEEP_UNCHANGED`/`forget` nor shorter than
-    /// input) lands in the failed bucket and the row survives unchanged.
+    /// Malformed marker output remains retryable and preserves the original.
     #[test]
     fn malformed_response_is_counted_as_failed() {
         let mut conn = open_mem_db();
         let id = "aaaaaaaa-0000-1111-2222-000000000001";
         insert(&conn, id, "short", Some("p1"));
 
-        // Inference stub returns a string LONGER than the input — the
-        // length-guard in condense should reject it.
-        let inf = FixedInference::new("this is a much longer response than the raw input");
+        let inf = FixedInference::new("KEEP_UNCHANGED followed by malformed extra text");
         let tmp = std::env::temp_dir();
         let cfg = DreamConfig::new(DreamMode::Apply, "sonnet", &tmp);
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
