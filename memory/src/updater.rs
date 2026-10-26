@@ -365,8 +365,9 @@ fn extract_from_zip(data: &[u8], binary_name: &str) -> Result<Vec<u8>, MemoryErr
 /// where the target doesn't exist yet (Release 2: `memory-dream` may not
 /// be installed when a user runs `memory update` for the first time).
 ///
-/// - Unix: writes to `{exe_path}.new`, sets executable permissions, then
-///   renames over the target. Atomic on the same filesystem; works when
+/// - Unix: writes to `{exe_path}.new`, sets executable permissions, runs
+///   it with `--version` to prove it loads on this host, then renames over
+///   the target. Atomic on the same filesystem; works when
 ///   `exe_path` is missing because `fs::rename` handles both overwrite
 ///   and create-new.
 /// - Windows: when the target exists, renames it to `.old` first so the
@@ -382,6 +383,22 @@ fn replace_binary(exe_path: &Path, new_binary: &[u8]) -> Result<(), MemoryError>
             .map_err(|e| MemoryError::Update(format!("failed to write new binary: {e}")))?;
         fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755))
             .map_err(|e| MemoryError::Update(format!("failed to set permissions: {e}")))?;
+        // Execute the staged binary before it replaces a working install so
+        // a host-incompatible build (e.g. newer GLIBC) is rejected here.
+        let probe = std::process::Command::new(&new_path)
+            .arg("--version")
+            .output();
+        if !matches!(&probe, Ok(o) if o.status.success()) {
+            let _ = fs::remove_file(&new_path);
+            let detail = match probe {
+                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            return Err(MemoryError::Update(format!(
+                "downloaded {} cannot run on this host; existing install unchanged: {detail}",
+                exe_path.display()
+            )));
+        }
         fs::rename(&new_path, exe_path)
             .map_err(|e| MemoryError::Update(format!("failed to replace binary: {e}")))?;
     }
@@ -571,5 +588,18 @@ mod tests {
             "memory-dream"
         };
         assert!(names.contains(&companion));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replace_binary_rejects_unrunnable_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("memory");
+        fs::write(&target, b"working").unwrap();
+
+        let err = replace_binary(&target, b"not an executable").unwrap_err();
+        assert!(err.to_string().contains("cannot run on this host"));
+        assert_eq!(fs::read(&target).unwrap(), b"working");
+        assert!(!target.with_extension("new").exists());
     }
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `memory update` now runs each downloaded binary with `--version` before
+  replacing the installed one on Unix, so a host-incompatible build (e.g. a
+  newer GLIBC requirement) leaves the working installation unchanged.
+
 ## v1.13.9 - 2026-10-14
 
 - Converge over-budget Dream proposals by retaining and stamping original
