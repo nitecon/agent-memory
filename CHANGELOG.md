@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.13.11 - 2026-11-09
 
 - Retained rows with a deleted gateway identity are reported only as a
   `blocked` count. `memory push` no longer fails for them, `push --all`
