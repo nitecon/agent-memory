@@ -591,6 +591,12 @@ where
     let savepoint = savepoint_name();
     conn.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
     let result = (|| {
+        // Check inside the write savepoint, before the callback can reactivate
+        // a superseded row or replace an OKF document. This also protects callers
+        // with auto-sync disabled and the amux CLI-backed memory_update surface.
+        if matches!(operation, "update" | "put") {
+            crate::gateway_sync::ensure_memory_update_allowed(conn, memory_id)?;
+        }
         let revision = current_revision(conn, memory_id)?;
         if let Some(expected) = expected_revision {
             if expected != revision {

@@ -293,6 +293,23 @@ fn remote_snapshot(
     }
 }
 
+/// A deleted gateway identity is immutable. Keep its local audit copy intact;
+/// deliberate recovery uses the existing copy command to mint a new identity.
+pub fn ensure_memory_update_allowed(conn: &Connection, id: &str) -> Result<(), MemoryError> {
+    if queries::get_memory_gateway_sync(conn, id)?.is_some_and(|s| s.tombstone_deleted) {
+        return Err(tombstoned_memory_error(id));
+    }
+    Ok(())
+}
+
+pub fn tombstoned_memory_error(id: &str) -> MemoryError {
+    MemoryError::Config(format!(
+        "memory {id} has a tombstoned gateway identity; its local content and history are retained. \
+         To recover intentionally, run `memory copy --id {id} --to <project>` (use the original project), \
+         edit the returned new_id, then run `memory push`. Retrying push on the original ID cannot restore it."
+    ))
+}
+
 pub fn push_memory_update_if_configured(
     conn: &Connection,
     gateway_config: &GatewayConfig,
@@ -304,12 +321,8 @@ pub fn push_memory_update_if_configured(
         });
     };
 
+    ensure_memory_update_allowed(conn, &memory.id)?;
     let sync = queries::get_memory_gateway_sync(conn, &memory.id)?;
-    if sync.as_ref().is_some_and(|s| s.tombstone_deleted) {
-        return Err(MemoryError::Config(
-            "gateway update refused: linked memory is tombstoned".into(),
-        ));
-    }
     let gateway_memory = gateway_memory_from_local(
         conn,
         memory,
@@ -803,6 +816,64 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn tombstone_copy_recovery_survives_failed_push_and_retries_with_fresh_identity() {
+        let conn = open_mem_db();
+        let old = insert_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000390",
+            "retained local lesson",
+        );
+        link_memory(&conn, &old, "gw-deleted", 10);
+        conn.execute("UPDATE memory_gateway_sync SET tombstone_deleted = 1, sync_state = 'tombstone' WHERE local_memory_id = ?1", [&old.id]).unwrap();
+        let before = local_history(&conn, &old.id);
+        let error = push_memory_update_if_configured(
+            &conn,
+            &gateway_config("http://127.0.0.1:1".into()),
+            &old,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("memory copy --id"));
+        let copy_id = queries::copy_memory_by_id(&conn, &old.id, Some("agent-memory")).unwrap();
+        queries::update_content(&conn, &copy_id, "recovered guidance", None, None).unwrap();
+        let copy = queries::get_memory_by_id(&conn, &copy_id).unwrap();
+        let (url, server) = scripted_gateway(vec![
+            rejected(&copy, "temporary failure"),
+            success(&copy, "gw-new", 11, "created"),
+        ]);
+        let config = gateway_config(url);
+        assert!(push_memory_update_if_configured(&conn, &config, &copy).is_err());
+        assert!(queries::get_memory_gateway_sync(&conn, &copy.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            queries::get_memory_by_id(&conn, &copy.id).unwrap().content,
+            "recovered guidance"
+        );
+        assert!(push_memory_update_if_configured(&conn, &config, &copy)
+            .unwrap()
+            .was_synced());
+        for request in server.join().unwrap() {
+            assert!(request["memories"][0].get("gateway_memory_id").is_none());
+            assert_eq!(request["memories"][0]["client_id"], copy.id);
+        }
+        assert_eq!(local_history(&conn, &old.id), before);
+        assert!(
+            queries::get_memory_gateway_sync(&conn, &old.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+        assert_eq!(
+            queries::get_memory_gateway_sync(&conn, &copy.id)
+                .unwrap()
+                .unwrap()
+                .gateway_memory_id,
+            "gw-new"
+        );
     }
 
     #[test]

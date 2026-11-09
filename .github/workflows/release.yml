@@ -142,6 +142,10 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Compute release checksums
+        working-directory: artifacts
+        run: sha256sum agent-memory-* > SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:

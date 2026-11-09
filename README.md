@@ -309,6 +309,29 @@ conflict; remote tombstones are never resurrected by recovery. With OKF enabled,
 semantic hashes must also match before rebasing. Recovery preserves local
 content, raw content and immutable history.
 
+A retained local memory can still be read after its gateway identity is
+tombstoned (for example after Dream supersedes it). Content edits and OKF
+replacements of a known tombstoned identity fail before changing the local
+row, even with auto-sync disabled. Push status reports these active local
+copies as `blocked_tombstone`, with a separate `blocked` count; they are never
+sent as updates or counted as synchronized skips. Store auto-sync continues
+to push healthy rows and reports `push_blocked` separately.
+
+To recover guidance intentionally, including edits saved locally by an older
+client, inspect `memory get <id>`, then use the existing copy command:
+
+```bash
+memory copy --id <id> --to <original-project>
+# Use the new_id returned by copy, which has a fresh local/gateway identity.
+memory update <new_id> --content "recovered guidance"
+memory push
+```
+
+The original content, raw content, revision history and tombstone mapping stay
+intact. Retrying push on the original ID cannot restore it. Pull never relinks
+a retained tombstoned row to a live record by content hash or silently clears
+its tombstone; conflicting live records require deliberate recovery.
+
 Global memories use the authorized `global` legacy wire type. Local reference
 semantics remain intact, including in the optional OKF envelope and existing
 local rows reconciled by pull.

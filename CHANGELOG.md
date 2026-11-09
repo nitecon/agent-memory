@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v1.13.10 - 2026-11-09
+
+- Known tombstoned gateway identities now reject content and OKF edits before
+  local mutation. Push reports blocked rows and explicit copy recovery instead
+  of silently skipping them; healthy stores still sync. Pull protects retained
+  tombstone identities from automatic relinking and ignores stale tombstones.
+- Release archives now include a published SHA256SUMS checksum manifest.
 
 - `memory update` now runs each downloaded binary with `--version` before
   replacing the installed one on Unix, so a host-incompatible build (e.g. a

@@ -1951,6 +1951,7 @@ struct AutoPushSummary {
     candidates: usize,
     pending: usize,
     skipped: usize,
+    blocked: usize,
     counts: PushResponseCounts,
 }
 
@@ -2069,10 +2070,11 @@ fn run_auto_push(
         build_push_candidates_with_okf(conn, project, config.gateway.okf_sync_enabled())?;
     let pending: Vec<&PushCandidate> = candidates
         .iter()
-        .filter(|candidate| candidate.action != "skipped")
+        .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
         .collect();
     let pending_count = pending.len();
-    let skipped = candidates.len().saturating_sub(pending_count);
+    let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
+    let blocked = report_blocked_push_candidates(&candidates);
     let batch_size = validate_push_batch_size(batch_size)?;
     let mut counts = PushResponseCounts::default();
 
@@ -2091,6 +2093,7 @@ fn run_auto_push(
         candidates: candidates.len(),
         pending: pending_count,
         skipped,
+        blocked,
         counts,
     })
 }
@@ -2145,6 +2148,7 @@ fn print_auto_sync_complete(project: &str, push: &AutoPushSummary, pull: &AutoPu
                 ("push_candidates", push.candidates.to_string()),
                 ("push_pending", push.pending.to_string()),
                 ("push_skipped", push.skipped.to_string()),
+                ("push_blocked", push.blocked.to_string()),
                 ("push_created", push.counts.created.to_string()),
                 ("push_updated", push.counts.updated.to_string()),
                 ("push_linked", push.counts.linked.to_string()),
@@ -2240,9 +2244,10 @@ fn run_push_project(
     )?;
     let pending: Vec<&PushCandidate> = candidates
         .iter()
-        .filter(|candidate| candidate.action != "skipped")
+        .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
         .collect();
-    let skipped = candidates.len().saturating_sub(pending.len());
+    let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
+    let blocked = report_blocked_push_candidates(&candidates);
 
     print_push_status(project, &candidates);
     if status_only {
@@ -2250,11 +2255,17 @@ fn run_push_project(
             candidates: candidates.len(),
             pending: pending.len(),
             skipped,
-            counts: PushResponseCounts::default(),
+            counts: PushResponseCounts {
+                rejected: blocked,
+                ..Default::default()
+            },
         });
     }
 
     if pending.is_empty() {
+        if blocked > 0 {
+            return Err(MemoryError::Config(format!("{blocked} memories blocked by gateway tombstones; use the recovery instructions above")));
+        }
         println!(
             "{}",
             render::render_action_result("push_complete", &[("sent", "0".to_string())])
@@ -2272,7 +2283,10 @@ fn run_push_project(
     })?;
     let batches = push_batches(&pending, batch_size);
     let total_batches = batches.len();
-    let mut counts = PushResponseCounts::default();
+    let mut counts = PushResponseCounts {
+        rejected: blocked,
+        ..Default::default()
+    };
 
     for (batch_index, batch) in batches.into_iter().enumerate() {
         if total_batches > 1 {
@@ -2391,7 +2405,7 @@ fn build_push_candidates_with_okf(
             None
         };
         let action = match (sync.as_ref(), duplicate_sync) {
-            (Some(record), _) if record.tombstone_deleted => "skipped",
+            (Some(record), _) if record.tombstone_deleted => "blocked_tombstone",
             (Some(record), _) if sync_record_matches_hash(record, &gateway_memory.content_hash) => {
                 "skipped"
             }
@@ -2597,12 +2611,34 @@ fn apply_push_response(
     Ok(())
 }
 
+fn report_blocked_push_candidates(candidates: &[PushCandidate]) -> usize {
+    let mut blocked = 0;
+    for candidate in candidates
+        .iter()
+        .filter(|c| c.action == "blocked_tombstone")
+    {
+        blocked += 1;
+        println!(
+            "{}",
+            render::render_hint(
+                &crate::gateway_sync::tombstoned_memory_error(&candidate.local_memory_id,)
+                    .to_string()
+            )
+        );
+    }
+    blocked
+}
+
 fn print_push_status(project: &str, candidates: &[PushCandidate]) {
     let pending = candidates
         .iter()
-        .filter(|candidate| candidate.action != "skipped")
+        .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
         .count();
-    let skipped = candidates.len().saturating_sub(pending);
+    let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
+    let blocked = candidates
+        .iter()
+        .filter(|c| c.action == "blocked_tombstone")
+        .count();
     println!(
         "{}",
         render::render_action_result(
@@ -2612,6 +2648,7 @@ fn print_push_status(project: &str, candidates: &[PushCandidate]) {
                 ("candidates", candidates.len().to_string()),
                 ("pending", pending.to_string()),
                 ("skipped", skipped.to_string()),
+                ("blocked", blocked.to_string()),
             ],
         )
     );
@@ -2883,7 +2920,11 @@ fn plan_pull_actions(
     let local_memories = queries::list_memories_by_project(conn, Some(project))?;
     let mut local_hashes: HashMap<String, String> = HashMap::new();
     for memory in &local_memories {
-        local_hashes.insert(memory.id.clone(), local_memory_hash(memory));
+        if !queries::get_memory_gateway_sync(conn, &memory.id)?
+            .is_some_and(|sync| sync.tombstone_deleted)
+        {
+            local_hashes.insert(memory.id.clone(), local_memory_hash(memory));
+        }
     }
 
     let mut plans = Vec::new();
@@ -2901,7 +2942,13 @@ fn plan_pull_actions(
             .unwrap_or(false)
         {
             plans.push(PullPlan {
-                action: if existing.is_some() {
+                action: if existing.as_ref().is_some_and(|record| {
+                    remote
+                        .server_revision
+                        .is_some_and(|rev| rev < record.last_seen_server_revision)
+                }) {
+                    "skipped"
+                } else if existing.is_some() {
                     "tombstone"
                 } else {
                     "tombstone_unknown"
@@ -2938,7 +2985,9 @@ fn plan_pull_actions(
                 .last_pulled_content_hash
                 .as_ref()
                 .or(record.last_pushed_content_hash.as_ref());
-            let action = if record.last_seen_server_revision >= remote_revision {
+            let action = if record.tombstone_deleted {
+                "conflict"
+            } else if record.last_seen_server_revision >= remote_revision {
                 "skipped"
             } else if local_hash.as_ref() == base_hash {
                 "update"
@@ -3780,6 +3829,292 @@ mod tests {
 
     /// `memory hook --agent codex` parses to `Cli::Hook` with the chosen agent
     /// and the default limit of 5.
+    fn mark_cli_tombstone(conn: &Connection, memory: &Memory) {
+        link_cli_test_memory(conn, memory, "gw-deleted", 10);
+        conn.execute("UPDATE memory_gateway_sync SET tombstone_deleted = 1, sync_state = 'tombstone' WHERE local_memory_id = ?1", [&memory.id]).unwrap();
+    }
+
+    #[test]
+    fn tombstone_update_fails_before_embedding_or_local_mutation() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let old = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000901",
+            "old guidance",
+            vec![],
+            "agent-memory",
+        );
+        let replacement = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000902",
+            "replacement",
+            vec![],
+            "agent-memory",
+        );
+        queries::mark_superseded(&conn, &old.id, &replacement.id).unwrap();
+        mark_cli_tombstone(&conn, &old);
+        let revision = crate::concepts::current_revision(&conn, &old.id).unwrap();
+        // Default config has no model cache or gateway: neither is needed to reject.
+        let error = run_update_content(
+            &conn,
+            &cli_test_config(),
+            &old.id,
+            "new guidance",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("memory copy --id"), "{error}");
+        assert!(error.contains("Retrying push on the original ID cannot restore"));
+        let retained = queries::get_memory_by_id(&conn, &old.id).unwrap();
+        assert_eq!(retained.content, old.content);
+        assert_eq!(
+            retained.superseded_by.as_deref(),
+            Some(replacement.id.as_str())
+        );
+        assert_eq!(
+            crate::concepts::current_revision(&conn, &old.id).unwrap(),
+            revision
+        );
+        assert!(
+            queries::get_memory_gateway_sync(&conn, &old.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+    }
+
+    #[test]
+    fn stranded_edit_is_blocked_and_explicit_copy_is_a_new_push_candidate() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        // Represents a row edited by the old client after it was tombstoned.
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000903",
+            "saved local undo transactions guidance",
+            vec!["undo"],
+            "agent-memory",
+        );
+        mark_cli_tombstone(&conn, &memory);
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].action, "blocked_tombstone");
+        let preview = run_push_project(&conn, None, "agent-memory", true, 450).unwrap();
+        assert_eq!(preview.pending, 0);
+        assert_eq!(preview.skipped, 0);
+        assert_eq!(preview.counts.rejected, 1);
+        assert!(run_push_project(&conn, None, "agent-memory", false, 450).is_err());
+        let copy = queries::copy_memory_by_id(&conn, &memory.id, Some("agent-memory")).unwrap();
+        let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
+        let copied = candidates
+            .iter()
+            .find(|c| c.local_memory_id == copy)
+            .unwrap();
+        assert_eq!(copied.action, "create");
+        assert!(copied.gateway_memory.gateway_memory_id.is_none());
+        assert_eq!(
+            copied.gateway_memory.client_id.as_deref(),
+            Some(copy.as_str())
+        );
+        assert_eq!(copied.gateway_memory.content, memory.content);
+        assert!(
+            queries::get_memory_gateway_sync(&conn, &memory.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+        assert!(crate::search::bm25::search_bm25(&conn, "transactions", 10)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &copy));
+    }
+
+    #[test]
+    fn store_auto_sync_pushes_healthy_rows_and_reports_existing_tombstone_block() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let deleted = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000904",
+            "retained deleted",
+            vec![],
+            "agent-memory",
+        );
+        mark_cli_tombstone(&conn, &deleted);
+        let healthy = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000905",
+            "new store",
+            vec![],
+            "agent-memory",
+        );
+        let (url, server) = spawn_auto_sync_gateway();
+        let mut config = cli_test_config_with_gateway(None);
+        config.gateway.base_url = Some(url);
+        let (push, _) = run_auto_sync_after_store(&conn, &config, "agent-memory").unwrap();
+        assert_eq!(push.blocked, 1);
+        assert_eq!(push.skipped, 0);
+        assert_eq!(push.counts.created, 1);
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].1["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[0].1["memories"][0]["local_memory_id"], healthy.id);
+        assert!(
+            queries::get_memory_gateway_sync(&conn, &deleted.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+    }
+
+    #[test]
+    fn pull_cannot_relink_or_update_a_retained_tombstone_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000906",
+            "retained guidance",
+            vec![],
+            "agent-memory",
+        );
+        mark_cli_tombstone(&conn, &memory);
+        let response = |remote| PullMemoriesResponse {
+            project: "agent-memory".into(),
+            server_revision: Some(11),
+            memories: vec![remote],
+            tombstones: vec![],
+            next_cursor: None,
+            next_since_revision: None,
+            has_more: false,
+        };
+        // Same body under a different live identity must import a new local row.
+        let plans = plan_pull_actions(
+            &conn,
+            "agent-memory",
+            &response(cli_remote_memory("gw-live", &memory.content, vec![], 11)),
+        )
+        .unwrap();
+        assert_eq!(plans[0].action, "import");
+        let plans = plan_pull_actions(
+            &conn,
+            "agent-memory",
+            &response(cli_remote_memory(
+                "gw-deleted",
+                "divergent remote",
+                vec![],
+                11,
+            )),
+        )
+        .unwrap();
+        assert_eq!(plans[0].action, "conflict");
+        assert_eq!(
+            apply_pull_plans(&conn, &cli_test_config(), "agent-memory", &plans).unwrap(),
+            1
+        );
+        assert_eq!(
+            queries::get_memory_by_id(&conn, &memory.id)
+                .unwrap()
+                .content,
+            memory.content
+        );
+        assert!(
+            queries::get_memory_gateway_sync(&conn, &memory.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+    }
+
+    #[test]
+    fn genuine_pull_tombstone_retains_unsynced_content_and_history_for_recovery() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000908",
+            "original guidance",
+            vec![],
+            "agent-memory",
+        );
+        link_cli_test_memory(&conn, &memory, "gw-live", 10);
+        queries::update_content(&conn, &memory.id, "unsynced transaction lesson", None, None)
+            .unwrap();
+        let revision = crate::concepts::current_revision(&conn, &memory.id).unwrap();
+        let mut remote = cli_remote_memory("gw-live", "", vec![], 11);
+        remote.tombstone = Some(GatewayMemoryTombstone {
+            deleted: true,
+            deleted_at: None,
+            reason: None,
+        });
+        let response = PullMemoriesResponse {
+            project: "agent-memory".into(),
+            server_revision: Some(11),
+            memories: vec![remote],
+            tombstones: vec![],
+            next_cursor: None,
+            next_since_revision: None,
+            has_more: false,
+        };
+        for _ in 0..2 {
+            let plans = plan_pull_actions(&conn, "agent-memory", &response).unwrap();
+            assert_eq!(plans[0].action, "tombstone");
+            apply_pull_plans(&conn, &cli_test_config(), "agent-memory", &plans).unwrap();
+        }
+        let retained = queries::get_memory_by_id(&conn, &memory.id).unwrap();
+        assert_eq!(retained.content, "unsynced transaction lesson");
+        assert_eq!(retained.content_raw.as_deref(), Some("original guidance"));
+        assert_eq!(
+            crate::concepts::current_revision(&conn, &memory.id).unwrap(),
+            revision
+        );
+        assert_eq!(
+            build_push_candidates(&conn, "agent-memory").unwrap()[0].action,
+            "blocked_tombstone"
+        );
+        assert!(queries::update_content(&conn, &memory.id, "another edit", None, None).is_err());
+    }
+
+    #[test]
+    fn stale_pull_tombstone_does_not_block_a_newer_live_mapping() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let memory = insert_cli_test_memory(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000907",
+            "live guidance",
+            vec![],
+            "agent-memory",
+        );
+        link_cli_test_memory(&conn, &memory, "gw-live", 10);
+        let mut remote = cli_remote_memory("gw-live", "", vec![], 9);
+        remote.tombstone = Some(GatewayMemoryTombstone {
+            deleted: true,
+            deleted_at: None,
+            reason: None,
+        });
+        let response = PullMemoriesResponse {
+            project: "agent-memory".into(),
+            server_revision: Some(10),
+            memories: vec![remote],
+            tombstones: vec![],
+            next_cursor: None,
+            next_since_revision: None,
+            has_more: false,
+        };
+        let plans = plan_pull_actions(&conn, "agent-memory", &response).unwrap();
+        assert_eq!(plans[0].action, "skipped");
+        apply_pull_plans(&conn, &cli_test_config(), "agent-memory", &plans).unwrap();
+        assert!(
+            !queries::get_memory_gateway_sync(&conn, &memory.id)
+                .unwrap()
+                .unwrap()
+                .tombstone_deleted
+        );
+    }
+
     #[test]
     fn parse_hook_agent_and_default_limit() {
         let cli = Cli::try_parse_from(["memory", "hook", "--agent", "codex"]).unwrap();
@@ -4359,7 +4694,7 @@ mod tests {
         let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
         let pending: Vec<&PushCandidate> = candidates
             .iter()
-            .filter(|candidate| candidate.action != "skipped")
+            .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
             .collect();
         let batches = push_batches(&pending, 2);
         assert_eq!(batches.len(), 2);
@@ -4400,7 +4735,7 @@ mod tests {
             .action;
         let remaining_pending: Vec<&PushCandidate> = resumed
             .iter()
-            .filter(|candidate| candidate.action != "skipped")
+            .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
             .collect();
 
         assert_eq!(first_action, "skipped");
