@@ -314,7 +314,9 @@ tombstoned (for example after Dream supersedes it). Content edits and OKF
 replacements of a known tombstoned identity fail before changing the local
 row, even with auto-sync disabled. Push status reports these active local
 copies as `blocked_tombstone`, with a separate `blocked` count; they are never
-sent as updates or counted as synchronized skips. Store auto-sync continues
+sent as updates or counted as synchronized skips or rejections. They are
+normal after a pulled deletion, so `memory push` and `memory push --all` still
+exit successfully and continue to the next project. Store auto-sync continues
 to push healthy rows and reports `push_blocked` separately.
 
 To recover guidance intentionally, including edits saved locally by an older

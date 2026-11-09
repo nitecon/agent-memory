@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Retained rows with a deleted gateway identity are reported only as a
+  `blocked` count. `memory push` no longer fails for them, `push --all`
+  continues past them, and pushes no longer print a recovery hint per row.
+
 ## v1.13.10 - 2026-11-09
 
 - Known tombstoned gateway identities now reject content and OKF edits before

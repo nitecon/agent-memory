@@ -2077,7 +2077,7 @@ fn run_auto_push(
         .collect();
     let pending_count = pending.len();
     let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
-    let blocked = report_blocked_push_candidates(&candidates);
+    let blocked = count_blocked_push_candidates(&candidates);
     let batch_size = validate_push_batch_size(batch_size)?;
     let mut counts = PushResponseCounts::default();
 
@@ -2218,6 +2218,7 @@ fn run_push_all(
                 ("candidates", total.candidates.to_string()),
                 ("pending", total.pending.to_string()),
                 ("skipped", total.skipped.to_string()),
+                ("blocked", total.blocked.to_string()),
                 ("created", total.counts.created.to_string()),
                 ("updated", total.counts.updated.to_string()),
                 ("linked", total.counts.linked.to_string()),
@@ -2250,7 +2251,7 @@ fn run_push_project(
         .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
         .collect();
     let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
-    let blocked = report_blocked_push_candidates(&candidates);
+    let blocked = count_blocked_push_candidates(&candidates);
 
     print_push_status(project, &candidates);
     if status_only {
@@ -2258,17 +2259,12 @@ fn run_push_project(
             candidates: candidates.len(),
             pending: pending.len(),
             skipped,
-            counts: PushResponseCounts {
-                rejected: blocked,
-                ..Default::default()
-            },
+            blocked,
+            counts: PushResponseCounts::default(),
         });
     }
 
     if pending.is_empty() {
-        if blocked > 0 {
-            return Err(MemoryError::Config(format!("{blocked} memories blocked by gateway tombstones; use the recovery instructions above")));
-        }
         println!(
             "{}",
             render::render_action_result("push_complete", &[("sent", "0".to_string())])
@@ -2277,6 +2273,7 @@ fn run_push_project(
             candidates: candidates.len(),
             pending: 0,
             skipped,
+            blocked,
             counts: PushResponseCounts::default(),
         });
     }
@@ -2286,10 +2283,7 @@ fn run_push_project(
     })?;
     let batches = push_batches(&pending, batch_size);
     let total_batches = batches.len();
-    let mut counts = PushResponseCounts {
-        rejected: blocked,
-        ..Default::default()
-    };
+    let mut counts = PushResponseCounts::default();
 
     for (batch_index, batch) in batches.into_iter().enumerate() {
         if total_batches > 1 {
@@ -2306,6 +2300,7 @@ fn run_push_project(
         candidates: candidates.len(),
         pending: pending.len(),
         skipped,
+        blocked,
         counts,
     })
 }
@@ -2551,22 +2546,13 @@ fn apply_push_response(
     Ok(())
 }
 
-fn report_blocked_push_candidates(candidates: &[PushCandidate]) -> usize {
-    let mut blocked = 0;
-    for candidate in candidates
+/// Retained rows whose gateway identity was deleted are normal state after a
+/// pulled deletion, so they are reported as a count, never as a push failure.
+fn count_blocked_push_candidates(candidates: &[PushCandidate]) -> usize {
+    candidates
         .iter()
         .filter(|c| c.action == "blocked_tombstone")
-    {
-        blocked += 1;
-        println!(
-            "{}",
-            render::render_hint(
-                &crate::gateway_sync::tombstoned_memory_error(&candidate.local_memory_id,)
-                    .to_string()
-            )
-        );
-    }
-    blocked
+        .count()
 }
 
 fn print_push_status(project: &str, candidates: &[PushCandidate]) {
@@ -2575,10 +2561,7 @@ fn print_push_status(project: &str, candidates: &[PushCandidate]) {
         .filter(|candidate| matches!(candidate.action, "create" | "update" | "delete"))
         .count();
     let skipped = candidates.iter().filter(|c| c.action == "skipped").count();
-    let blocked = candidates
-        .iter()
-        .filter(|c| c.action == "blocked_tombstone")
-        .count();
+    let blocked = count_blocked_push_candidates(candidates);
     println!(
         "{}",
         render::render_action_result(
@@ -2617,6 +2600,7 @@ struct PushProjectSummary {
     candidates: usize,
     pending: usize,
     skipped: usize,
+    blocked: usize,
     counts: PushResponseCounts,
 }
 
@@ -2625,6 +2609,7 @@ impl PushProjectSummary {
         self.candidates += other.candidates;
         self.pending += other.pending;
         self.skipped += other.skipped;
+        self.blocked += other.blocked;
         self.counts.add_assign(&other.counts);
     }
 }
@@ -3845,8 +3830,11 @@ mod tests {
         let preview = run_push_project(&conn, None, "agent-memory", true, 450).unwrap();
         assert_eq!(preview.pending, 0);
         assert_eq!(preview.skipped, 0);
-        assert_eq!(preview.counts.rejected, 1);
-        assert!(run_push_project(&conn, None, "agent-memory", false, 450).is_err());
+        assert_eq!(preview.blocked, 1);
+        assert_eq!(preview.counts.rejected, 0);
+        let pushed = run_push_project(&conn, None, "agent-memory", false, 450).unwrap();
+        assert_eq!(pushed.blocked, 1);
+        assert_eq!(pushed.counts.rejected, 0);
         let copy = queries::copy_memory_by_id(&conn, &memory.id, Some("agent-memory")).unwrap();
         let candidates = build_push_candidates(&conn, "agent-memory").unwrap();
         let copied = candidates
@@ -3870,6 +3858,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(id, _)| id == &copy));
+    }
+
+    #[test]
+    fn push_all_continues_past_projects_with_only_retained_tombstones() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        for (id, project) in [
+            ("aaaaaaaa-0000-1111-2222-000000000906", "deleted-a"),
+            ("aaaaaaaa-0000-1111-2222-000000000907", "deleted-b"),
+        ] {
+            let memory = insert_cli_test_memory(&conn, id, "retained deleted", vec![], project);
+            mark_cli_tombstone(&conn, &memory);
+        }
+        // Only blocked rows: no request is sent, so the unreachable gateway is never contacted.
+        run_push_all(&conn, &cli_test_config_with_gateway(None), false, 450).unwrap();
     }
 
     #[test]
