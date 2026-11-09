@@ -443,7 +443,9 @@ fn gateway_project_for_memory<'a>(
     memory.project.as_deref().filter(|p| !p.trim().is_empty())
 }
 
-fn gateway_memory_from_local(
+/// Shared wire projection for bulk push, auto-sync, and local-memory tombstones.
+/// Callers retain responsibility for capability gating and lifecycle decisions.
+pub(crate) fn gateway_memory_from_local(
     conn: &Connection,
     memory: &Memory,
     project: &str,

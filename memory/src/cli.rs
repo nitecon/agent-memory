@@ -16,14 +16,17 @@ use crate::db::models::{
 use crate::db::queries::{self, ResolvedId};
 use crate::embedding;
 use crate::error::MemoryError;
+use crate::gateway_sync::gateway_memory_from_local;
 use crate::project;
 use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
 use crate::setup::{gateway, hooks, menu, rules, skill};
+#[cfg(test)]
+use crate::sync::gateway_okf_envelope;
 use crate::sync::{
-    gateway_okf_envelope, memory_content_hash, GatewayMemory, GatewayMemoryProvenance,
-    GatewayMemoryTombstone, GatewaySyncClientError, MemoryGatewayClient, PullMemoriesRequest,
-    PullMemoriesResponse, PushMemoriesRequest, PushMemoriesResponse, PushMemoryAction,
+    memory_content_hash, GatewayMemory, GatewayMemoryTombstone, GatewaySyncClientError,
+    MemoryGatewayClient, PullMemoriesRequest, PullMemoriesResponse, PushMemoriesRequest,
+    PushMemoriesResponse, PushMemoryAction,
 };
 
 /// Score multiplier applied to memories tagged with the current project.
@@ -2451,69 +2454,6 @@ fn sync_content_hash(record: &MemoryGatewaySync) -> Option<&str> {
 fn sync_record_matches_hash(record: &MemoryGatewaySync, content_hash: &str) -> bool {
     record.last_pushed_content_hash.as_deref() == Some(content_hash)
         || record.last_pulled_content_hash.as_deref() == Some(content_hash)
-}
-
-fn gateway_memory_from_local(
-    conn: &Connection,
-    memory: &Memory,
-    project: &str,
-    sync: Option<&MemoryGatewaySync>,
-    okf_enabled: bool,
-) -> Result<GatewayMemory, MemoryError> {
-    if memory.project.as_deref() != Some(project) {
-        return Err(MemoryError::Config(format!(
-            "memory {} is not scoped to project {project}",
-            memory.id
-        )));
-    }
-    let memory_type =
-        crate::gateway_sync::wire_memory_type(project, memory.memory_type.as_deref()).to_string();
-    let tags = memory.tags.clone().unwrap_or_default();
-    let content_hash = memory_content_hash(&memory.content, &memory_type, &tags);
-    let okf = okf_enabled
-        .then(|| gateway_okf_envelope(conn, memory))
-        .transpose()?;
-    let concept_hash = okf.as_ref().map(|envelope| envelope.semantic_hash.clone());
-    Ok(GatewayMemory {
-        project: project.to_string(),
-        content: memory.content.clone(),
-        memory_type,
-        tags,
-        content_hash,
-        concept_hash,
-        okf,
-        local_memory_id: Some(memory.id.clone()),
-        client_id: Some(memory.id.clone()),
-        gateway_memory_id: sync.map(|record| record.gateway_memory_id.clone()),
-        base_server_revision: sync.map(|record| record.last_seen_server_revision),
-        server_revision: None,
-        created_at: Some(memory.created_at.clone()),
-        updated_at: Some(memory.updated_at.clone()),
-        provenance: Some(gateway_provenance_from_local(memory)),
-        tombstone: None,
-    })
-}
-
-fn gateway_provenance_from_local(memory: &Memory) -> GatewayMemoryProvenance {
-    GatewayMemoryProvenance {
-        source_agent_id: memory.agent.clone(),
-        source_machine_id: local_host_alias(),
-        source_os: Some(env::consts::OS.to_string()),
-        source_arch: Some(env::consts::ARCH.to_string()),
-        source_system: Some("agent-memory".to_string()),
-        pushed_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
-fn local_host_alias() -> Option<String> {
-    ["AGENT_MEMORY_HOST", "HOSTNAME", "COMPUTERNAME"]
-        .iter()
-        .find_map(|key| {
-            env::var(key)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
 }
 
 fn apply_push_response(
@@ -5239,6 +5179,67 @@ mod tests {
             updated_at: None,
             provenance: None,
             tombstone: None,
+        }
+    }
+
+    #[test]
+    fn bulk_and_single_memory_projections_match() {
+        for project in ["agent-memory", GLOBAL_PROJECT_IDENT] {
+            for linked in [false, true] {
+                let conn = Connection::open_in_memory().unwrap();
+                crate::db::run_migrations(&conn).unwrap();
+                let memory = Memory::new(
+                    "Projection equivalence".into(),
+                    Some(vec!["gateway".into()]),
+                    Some(project.into()),
+                    Some("projection-agent".into()),
+                    None,
+                    Some("reference".into()),
+                );
+                queries::insert_memory(&conn, &memory).unwrap();
+                if linked {
+                    link_cli_test_memory(&conn, &memory, "gw-projection", 7);
+                }
+                let sync = queries::get_memory_gateway_sync(&conn, &memory.id).unwrap();
+                for okf_enabled in [false, true] {
+                    let candidates =
+                        build_push_candidates_with_okf(&conn, project, okf_enabled).unwrap();
+                    assert_eq!(candidates.len(), 1);
+                    assert_eq!(
+                        candidates[0].action,
+                        if linked { "skipped" } else { "create" }
+                    );
+                    let mut bulk = candidates[0].gateway_memory.clone();
+                    let single = gateway_memory_from_local(
+                        &conn,
+                        &memory,
+                        project,
+                        sync.as_ref(),
+                        okf_enabled,
+                    )
+                    .unwrap();
+                    assert_eq!(bulk.okf.is_some(), okf_enabled);
+                    assert_eq!(bulk.concept_hash.is_some(), okf_enabled);
+                    assert_eq!(
+                        bulk.gateway_memory_id.as_deref(),
+                        linked.then_some("gw-projection")
+                    );
+                    assert_eq!(bulk.base_server_revision, linked.then_some(7));
+                    assert_eq!(
+                        bulk.provenance.as_ref().unwrap().source_agent_id.as_deref(),
+                        Some("projection-agent")
+                    );
+                    // Each projection timestamps the push independently.
+                    let bulk_provenance = bulk.provenance.as_mut().unwrap();
+                    chrono::DateTime::parse_from_rfc3339(
+                        bulk_provenance.pushed_at.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    bulk_provenance.pushed_at =
+                        single.provenance.as_ref().unwrap().pushed_at.clone();
+                    assert_eq!(bulk, single);
+                }
+            }
         }
     }
 
